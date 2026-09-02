@@ -50,17 +50,19 @@ OBSERVATION_DEFS = [
 
 
 def wait_for_fhir(max_retries: int = 60, delay: float = 2.0) -> None:
-    """等待 FHIR endpoint 就绪（探测 /metadata，匿名可访问）。
+    """等待 FHIR endpoint 就绪（探测 /metadata，带认证）。
 
     参数:
         max_retries: 最大重试次数。
         delay: 每次重试间隔（秒）。
     """
+    creds = base64.b64encode(f"{FHIRConfig.USERNAME}:{FHIRConfig.PASSWORD}".encode()).decode("ascii")
     for attempt in range(1, max_retries + 1):
         try:
             req = urllib.request.Request(FHIRConfig.BASE_URL + "metadata")
             # 注意：必须显式设置 Accept 头，否则 IRIS FHIR Server 返回 406
             req.add_header("Accept", "application/fhir+json")
+            req.add_header("Authorization", f"Basic {creds}")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status == 200:
                     logger.info("FHIR endpoint 已就绪（第 %d 次尝试成功）", attempt)

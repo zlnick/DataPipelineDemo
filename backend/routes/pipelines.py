@@ -89,13 +89,16 @@ def build_pipeline_topology(mappings: list[dict], source_type: str = "FHIR",
         if c["type"] == "SQLService":
             # SQL 源：用 source_config 填充 DSN（Adapter）/ Query、KeyFieldName（Host）
             cfg = source_config or {}
+            query_val = cfg.get("query") or "SELECT * FROM SQLUser.Patient"
+            key_field_val = cfg.get("key_field") or "ID"
+            dsn_val = cfg.get("dsn") or "localTarget"
             components.append({
                 "type": "SQLService", "name": "SQLService",
                 "className": c["className"], "comment": c["comment"],
                 "settings": [
-                    _s("Adapter", "DSN", cfg.get("dsn", "localTarget")),
-                    _s("Host", "Query", cfg.get("query", "")),
-                    _s("Host", "KeyFieldName", cfg.get("key_field", "")),
+                    _s("Adapter", "DSN", dsn_val),
+                    _s("Host", "Query", query_val),
+                    _s("Host", "KeyFieldName", key_field_val),
                 ],
             })
         else:
@@ -136,17 +139,28 @@ def build_pipeline_topology(mappings: list[dict], source_type: str = "FHIR",
             # SOAP 目标（WSDL 导入型）：先导入 WSDL 生成 BO，再用 BO 类作为 Operation 组件
             wsdl = (target_config or {}).get("wsdl", "")
             service = (target_config or {}).get("service", "default")
-            imp = wsdl_importer.import_soap_operation(
-                wsdl, service, (target_config or {}).get("packages"))
-            if imp.get("ok"):
+            bo_class = (target_config or {}).get("bo_class", "")
+
+            imp = {}
+            if wsdl:
+                imp = wsdl_importer.import_soap_operation(
+                    wsdl, service, (target_config or {}).get("packages"))
+
+            if imp.get("ok") and imp.get("boClass"):
+                bo_class = imp["boClass"]
+            elif not bo_class:
+                bo_class = wsdl_importer.get_bo_class(service)
+
+            if bo_class:
+                wsdl_importer._save_bo_mapping(service, bo_class)
                 components.append({
                     "type": "SOAPOperation", "name": f"SOAPOp_{service}",
-                    "className": imp["boClass"],
+                    "className": bo_class,
                     "comment": f"SOAP 调用 {service}（WSDL 导入 BO）",
                     "settings": [],
                 })
             else:
-                logger.warning("SOAP 目标 WSDL 导入失败: %s", imp.get("message"))
+                logger.warning("SOAP 目标 WSDL 导入失败或未找到 bo_class: %s", imp.get("message"))
         else:
             components.append(_from_template(c, c["type"]))
 
@@ -175,43 +189,212 @@ def generate():
     if not mappings:
         mappings = plan.get("mappings") or []
     config = body.get("config")
-    source_type = body.get("source_type") or "FHIR"
-    target_type = body.get("target_type") or "DB"
+    source_type = body.get("source_type") or ""
+    target_type = body.get("target_type") or ""
     source_config = body.get("source_config") or {}
     target_config = body.get("target_config") or {}
     source_models = body.get("source_models") or plan.get("source_models") or []
     target_models = body.get("target_models") or plan.get("target_models") or []
-    if source_models and not body.get("source_type"):
-        source_type = "SQL" if any(
-            m.get("type") == "SQL_TABLE" for m in source_models
-        ) else source_type
-    if target_models and not body.get("target_type"):
-        target_type = "SOAP" if any(
-            m.get("type") == "SOAP" for m in target_models
-        ) else target_type
-    # 便捷：传 source_id / target_id 时，从登记的数据源/目标读取类型与配置
-    if body.get("source_id"):
-        ds = repository.get_datasource(body["source_id"])
-        if ds:
-            source_type = ds.get("type") or source_type
-            if not source_config:
-                cfg = ds.get("config") or {}
-                source_config = {
-                    "dsn": cfg.get("dsn") or cfg.get("jdbc_url", ""),
-                    "query": cfg.get("query", ""),
-                    "key_field": cfg.get("key_field", ""),
-                }
-    if body.get("target_id"):
-        tg = repository.get_target(body["target_id"])
+
+    # 1. 自动推导/提取 target_type, target_id, target_config
+    target_id = body.get("target_id")
+    if not target_id and target_models:
+        target_id = target_models[0].get("target_id") or target_models[0].get("id")
+
+    for m in mappings:
+        if isinstance(m, dict):
+            if m.get("target_type") == "SOAP":
+                target_type = "SOAP"
+                break
+            tbl = m.get("target_table") or ""
+            for tg in repository.list_targets():
+                if tg.get("type") == "SOAP":
+                    for tb in (tg.get("tables") or []):
+                        if tb.get("table") == tbl or tb.get("entity_name") == tbl or tb.get("name") == tbl:
+                            target_type = "SOAP"
+                            if not target_id:
+                                target_id = tg.get("id")
+                            break
+
+    if not target_type and target_models:
+        if any(m.get("type") == "SOAP" for m in target_models if isinstance(m, dict)):
+            target_type = "SOAP"
+
+    if target_type == "SOAP" and not target_id:
+        for tg in repository.list_targets():
+            if tg.get("type") == "SOAP":
+                target_id = tg.get("id")
+                break
+
+    if not target_type:
+        target_type = "DB"
+
+    if target_id:
+        tg = repository.get_target(target_id)
         if tg:
             target_type = tg.get("type") or target_type
-            if not target_config:
+            conn = tg.get("connection") or {}
+            target_config = {
+                "wsdl": target_config.get("wsdl") or conn.get("wsdl", ""),
+                "service": target_config.get("service") or conn.get("service", "default"),
+                "packages": target_config.get("packages") or conn.get("packages") or {},
+                "bo_class": target_config.get("bo_class") or conn.get("bo_class") or conn.get("boClass") or tg.get("bo_class", ""),
+            }
+
+    if target_type == "SOAP" and not target_config.get("bo_class"):
+        for tg in repository.list_targets():
+            if tg.get("type") == "SOAP":
                 conn = tg.get("connection") or {}
-                target_config = {
-                    "wsdl": conn.get("wsdl", ""),
-                    "service": conn.get("service", "default"),
-                    "packages": conn.get("packages") or {},
-                }
+                bo_c = conn.get("bo_class") or conn.get("boClass") or tg.get("bo_class") or ""
+                if bo_c:
+                    target_config["bo_class"] = bo_c
+                    if not target_config.get("wsdl"):
+                        target_config["wsdl"] = conn.get("wsdl", "")
+                    if not target_config.get("service"):
+                        target_config["service"] = conn.get("service", "default")
+                    break
+
+    # 2. 自动推导/提取 source_type, source_id, source_config
+    source_id = body.get("source_id")
+    if not source_id and source_models:
+        source_id = source_models[0].get("source_id") or source_models[0].get("id")
+
+    # 提取全部涉及的源资产标识（映射/模型）
+    mapped_sources = []
+    for m in mappings:
+        if isinstance(m, dict):
+            if m.get("source"):
+                mapped_sources.append(m["source"])
+            for sa in (m.get("source_assets") or []):
+                mapped_sources.append(sa)
+            if m.get("source_type") == "SQL" or m.get("asset_type") == "SQL_TABLE":
+                source_type = "SQL"
+    for sm in source_models:
+        if isinstance(sm, dict):
+            if sm.get("name"):
+                mapped_sources.append(sm["name"])
+            if sm.get("id"):
+                mapped_sources.append(sm["id"])
+            struct = sm.get("structure") or {}
+            if struct.get("table"):
+                mapped_sources.append(struct.get("table"))
+                if struct.get("schema"):
+                    mapped_sources.append(f"{struct['schema']}.{struct['table']}")
+            if sm.get("type") == "SQL_TABLE" or sm.get("asset_type") == "SQL_TABLE":
+                source_type = "SQL"
+
+    all_datasources = repository.list_datasources()
+    all_assets = repository.list_assets()
+
+    # 从映射名/资产匹配判断 SQL 数据源
+    for src_name in mapped_sources:
+        for ds in all_datasources:
+            if ds.get("type") == "SQL":
+                for a in all_assets:
+                    if a.get("source_id") == ds.get("id"):
+                        if a.get("name") == src_name or a.get("id") == src_name or a.get("name") in src_name:
+                            source_type = "SQL"
+                            if not source_id:
+                                source_id = ds.get("id")
+                            break
+
+    if source_type == "SQL" and not source_id:
+        for ds in all_datasources:
+            if ds.get("type") == "SQL":
+                source_id = ds.get("id")
+                break
+
+    if not source_type and all_datasources:
+        for ds in all_datasources:
+            if ds.get("type") == "SQL":
+                source_type = "SQL"
+                source_id = ds.get("id")
+                break
+
+    if not source_type:
+        source_type = "FHIR"
+
+    ds_obj = repository.get_datasource(source_id) if source_id else None
+    if ds_obj:
+        source_type = ds_obj.get("type") or source_type
+        cfg = ds_obj.get("config") or {}
+        source_config = {
+            "dsn": source_config.get("dsn") or cfg.get("dsn") or "localTarget",
+            "query": source_config.get("query") or "",
+            "key_field": source_config.get("key_field") or cfg.get("key_field", "ID"),
+        }
+
+    if source_type == "SQL":
+        if not source_config.get("dsn") or source_config.get("dsn").startswith("jdbc:"):
+            source_config["dsn"] = "localTarget"
+
+        user_explicit_query = (body.get("source_config") or {}).get("query")
+        user_explicit_key = (body.get("source_config") or {}).get("key_field")
+
+        query_built = ""
+        key_field_built = ""
+
+        # 精确依据 mapped_sources 匹配 DataAsset 或 DataSource tables
+        for ms in mapped_sources:
+            # 1. 匹配 DataAsset
+            for a in all_assets:
+                if a.get("id") == ms or a.get("name") == ms:
+                    struct = a.get("structure") or {}
+                    sch = struct.get("schema") or "SQLUser"
+                    tbl = struct.get("table") or a.get("name")
+                    if tbl:
+                        query_built = f"SELECT * FROM {sch}.{tbl}" if sch else f"SELECT * FROM {tbl}"
+                        cols = struct.get("columns") or a.get("fields") or []
+                        if cols:
+                            c0 = cols[0]
+                            key_field_built = c0.get("name") if isinstance(c0, dict) else str(c0)
+                        break
+            if query_built:
+                break
+
+            # 2. 匹配 DataSource 表
+            for ds in all_datasources:
+                if ds.get("type") == "SQL":
+                    for tb in (ds.get("tables") or []):
+                        tbl_name = tb.get("table") or ""
+                        schema_tbl = f"{tb.get('schema', '')}.{tbl_name}"
+                        if ms == tbl_name or ms == schema_tbl or ms.endswith(f".{tbl_name}") or tbl_name.endswith(f".{ms}"):
+                            sch = tb.get("schema") or "SQLUser"
+                            query_built = f"SELECT * FROM {sch}.{tbl_name}" if sch else f"SELECT * FROM {tbl_name}"
+                            cols = tb.get("columns") or []
+                            if cols:
+                                c0 = cols[0]
+                                key_field_built = c0.get("name") if isinstance(c0, dict) else str(c0)
+                            break
+                    if query_built:
+                        break
+
+        if not query_built and mapped_sources:
+            for ms in mapped_sources:
+                if not ms.startswith("DS") and not ms.startswith("M") and not ms.startswith("TG"):
+                    schema_prefix = "SQLUser." if "." not in ms else ""
+                    query_built = f"SELECT * FROM {schema_prefix}{ms}"
+                    break
+
+        if user_explicit_query:
+            source_config["query"] = user_explicit_query
+        elif query_built:
+            source_config["query"] = query_built
+        elif ds_obj and (ds_obj.get("config") or {}).get("query"):
+            source_config["query"] = ds_obj["config"]["query"]
+        else:
+            source_config["query"] = "SELECT * FROM SQLUser.Patient"
+
+        if user_explicit_key:
+            source_config["key_field"] = user_explicit_key
+        elif key_field_built:
+            source_config["key_field"] = key_field_built
+        elif ds_obj and (ds_obj.get("config") or {}).get("key_field"):
+            source_config["key_field"] = ds_obj["config"]["key_field"]
+        else:
+            source_config["key_field"] = "ID"
+    if not mappings:
+        mappings = repository.list_mappings()
     if not mappings:
         return error("缺少 mappings"), 400
 

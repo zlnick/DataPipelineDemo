@@ -21,44 +21,23 @@ sh /shared/init-password.sh
 # 注意（已确认方案 A）：IRIS FHIR Server 对资源读写默认要求认证（Basic Auth: superuser/SYS），
 #       仅 /metadata（CapabilityStatement）匿名公开；Demo 中数据源访问一律携带认证。
 echo "=== [setup] 搭建 FHIR Server（FHIRSERVER namespace + 核心 R4 endpoint）==="
-/usr/irissys/bin/iris session "$instance" -U %SYS <<'EOF'
+cat << 'EOF' > /tmp/setup_fhir.os
 zn "%SYS"
-
-// 创建 FHIRSERVER Foundation namespace（幂等）
 set ns = "FHIRSERVER"
-if '##class(%SYS.Namespace).Exists(ns) {
-    zn "HSLIB"
-    do ##class(HS.Util.Installer.Foundation).Install(ns)
-}
-
+if '##class(%SYS.Namespace).Exists(ns) zn "HSLIB" do ##class(HS.Util.Installer.Foundation).Install(ns)
 zn ns
-
-// 安装 FHIR 命名空间所需元素
 do ##class(HS.FHIRServer.Installer).InstallNamespace()
-
-// 安装 FHIR 服务实例（核心 R4，不导入自定义 profile）
-// Try/Catch 保证幂等：endpoint 已存在时忽略"已存在"错误（容器重启后不会重复安装）
 set appKey = "/csp/healthshare/fhirserver/fhir/r4"
 set strategyClass = "HS.FHIRServer.Storage.JsonAdvSQL.InteractionsStrategy"
 set metadataPackages = $lb("hl7.fhir.r4.core@4.0.1")
-try {
-    do ##class(HS.FHIRServer.Installer).InstallInstance(appKey, strategyClass, metadataPackages)
-    write "INSTALL_INSTANCE_OK", !
-} catch ex {
-    write "INSTALL_INSTANCE_SKIPPED: ", $system.Status.GetErrorText(ex.AsStatus()), !
-}
-
-// 确保 Web Application 开启 Basic Password 认证与 %All 角色权限，解决 HTTP 401/404 认证匹配异常
+try { do ##class(HS.FHIRServer.Installer).InstallInstance(appKey, strategyClass, metadataPackages) write "INSTALL_INSTANCE_OK",! } catch ex { write "INSTALL_INSTANCE_SKIPPED",! }
 zn "%SYS"
-if ##class(Security.Applications).Get(appKey, .props) {
-    set props("AutheEnabled") = 8288
-    set props("MatchRoles") = ":%All"
-    do ##class(Security.Applications).Modify(appKey, .props)
-}
-
+if ##class(Security.Applications).Get(appKey, .props) { set props("AutheEnabled") = 8288 set props("MatchRoles") = ":%All" do ##class(Security.Applications).Modify(appKey, .props) }
 write "FHIR_SERVER_SETUP_DONE", !
 halt
 EOF
+
+/usr/irissys/bin/iris session "$instance" -U %SYS < /tmp/setup_fhir.os
 
 # 3. 编译 Production 组件类（按依赖顺序逐个编译，避免 LoadDir 的编译顺序竞态）
 echo "=== [setup] 编译 Production 组件类 ==="

@@ -169,6 +169,11 @@ def list_assets(ds_id: str | None = None) -> list[dict]:
     return assets
 
 
+def get_asset(asset_id: str) -> dict | None:
+    """按 ID 获取数据资产。"""
+    return get_json("^demo.DataAsset", asset_id)
+
+
 # ---------------- 转换关系 ----------------
 
 def save_mappings(mappings: list[dict]) -> int:

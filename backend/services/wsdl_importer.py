@@ -95,6 +95,11 @@ def _ensure_wsdl_in_iris(wsdl: str) -> str:
     若为本地文件路径或 XML 文本，将内容同步保存到 IRIS 容器。
     """
     wsdl_clean = wsdl.strip()
+    if wsdl_clean.lower().startswith("file://"):
+        wsdl_clean = wsdl_clean[7:]
+    elif wsdl_clean.lower().startswith("file:"):
+        wsdl_clean = wsdl_clean[5:]
+
     if wsdl_clean.lower().startswith(("http://", "https://")):
         return wsdl_clean
 
@@ -215,6 +220,8 @@ def import_soap_operation(wsdl: str, service: str = "default",
     """
     if not wsdl:
         return {"ok": False, "boClass": "", "entities": [], "message": "SOAP 目标需要提供 WSDL 地址"}
+    if isinstance(packages, str):
+        packages = {"client_package": packages, "bo_package": packages, "msg_package": packages}
     pkgs = {**DEFAULT_PACKAGES, **(packages or {})}
     iris_wsdl_path = _ensure_wsdl_in_iris(wsdl)
     try:

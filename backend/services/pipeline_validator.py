@@ -172,6 +172,11 @@ def check_pipeline_topology(topology: dict | None, source_type: str,
         if not c.get("className"):
             issues.append({"severity": "error", "item": ctype,
                            "message": f"组件 {ctype} 缺少 className"})
+        if ctype == "SQLService":
+            query_setting = next((s for s in c.get("settings", []) if s.get("name") == "Query"), None)
+            if not query_setting or not query_setting.get("value"):
+                issues.append({"severity": "error", "item": "SQLService.Query",
+                               "message": "SQLService 缺少 SQL 查询语句 Query"})
         seen.add(ctype)
     for req in ("TransformProcess", "JavaGateway"):
         if req not in seen:
