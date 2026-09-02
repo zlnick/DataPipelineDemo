@@ -1,0 +1,76 @@
+# =====================================================================
+# AI 数据自动化转换 Demo - 一键启动编排文件
+# 服务构成：InterSystems IRIS for Health（FHIR 数据源 + 转换平台）
+#         + Flask 后端（API + AI 推荐）+ Vue 前端（nginx 部署）
+# =====================================================================
+
+services:
+  # ---------- InterSystems IRIS for Health（FHIR Server + Production + 目标表） ----------
+  iris:
+    # for Health 社区版镜像：自带 FHIR Server 能力（数据源）与互操作性 Production（转换平台）
+    image: containers.intersystems.com/intersystems/irishealth-community:2026.1
+    container_name: dataflow-iris
+    # -a: IRIS 启动后执行统一初始化脚本（凭据 + FHIR Server 搭建 + 编译 + 启动 Production）
+    command: ["-a", "/shared/setup.sh"]
+    ports:
+      - "52773:52773"   # 管理门户 / Web 网关 / FHIR endpoint
+      - "1972:1972"     # 超级服务器端口（Native SDK 连接使用）
+    environment:
+      IRIS_PASSWORD: SYS   # 约定：所有 Demo 统一使用 superuser / SYS 登录
+    volumes:
+      - ./iris/init-password.sh:/shared/init-password.sh:ro   # 凭据初始化脚本
+      - ./iris/setup.sh:/shared/setup.sh:ro                   # 统一初始化入口
+      - ./iris/src:/shared/src:ro                             # ObjectScript 源码（Production 组件）
+      - ./iris/python:/shared/python:ro                       # Embedded Python 业务逻辑
+      - ./iris/sql:/shared/sql:ro                             # SQL 初始化脚本
+      - ./data/iris:/dur                                      # IRIS 数据目录持久化
+    networks:
+      - dataflow-net
+
+  # ---------- Flask 后端 API 服务（数据源管理 + AI 推荐 + 管道下发） ----------
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: dataflow-backend
+    ports:
+      # 宿主 5001 -> 容器内 5000（宿主 5000 常被 macOS 隔空播放等占用）
+      - "5001:5000"
+    environment:
+      IRIS_HOST: iris          # 通过 Docker 网络访问 IRIS 服务名
+      IRIS_PORT: "1972"
+      IRIS_NAMESPACE: USER
+      IRIS_USERNAME: superuser   # 约定：所有 Demo 统一使用 superuser / SYS 登录
+      IRIS_PASSWORD: SYS
+      # FHIR 数据源（IRIS 自带 FHIR Server），经 Docker 网络访问
+      FHIR_BASE_URL: http://iris:52773/csp/healthshare/fhirserver/fhir/r4/
+      FHIR_USERNAME: superuser
+      FHIR_PASSWORD: SYS
+      # LLM（OpenAI 兼容接口）配置，来自宿主 .env
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+    volumes:
+      - ./jdbc:/app/jdbc            # JDBC 驱动 jar（转换目标通用连接）
+    depends_on:
+      - iris
+    networks:
+      - dataflow-net
+
+  # ---------- 前端 Vue3 应用（nginx 多阶段构建部署） ----------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: dataflow-frontend
+    ports:
+      - "80:80"            # 对外通过 http://localhost 访问
+    depends_on:
+      - backend
+    networks:
+      - dataflow-net
+
+# 统一 Docker 网络，三个服务互联
+networks:
+  dataflow-net:
+    driver: bridge

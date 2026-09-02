@@ -1,0 +1,11 @@
+# AI 数据自动化转换 Demo - 后端依赖清单
+flask>=3.0
+flask-cors>=4.0
+python-dotenv>=1.0
+# InterSystems Native SDK for Python（import iris），支持 Python 3.11
+intersystems-irispython>=5.3
+# AI 推荐：OpenAI 兼容接口客户端
+openai>=1.0
+# JDBC 通用数据库连接（转换目标发现；需 JVM：openjdk-17）
+JayDeBeApi>=1.2.3
+JPype1>=1.5.0
