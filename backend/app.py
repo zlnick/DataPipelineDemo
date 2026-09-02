@@ -12,6 +12,7 @@ from backend.routes.datasources import datasources_bp
 from backend.routes.mappings import mappings_bp
 from backend.routes.pipelines import pipelines_bp
 from backend.routes.targets import targets_bp
+from backend.routes.domain_models import domain_bp
 from backend.services import iris_connector
 from backend.utils import success
 
@@ -34,6 +35,7 @@ def create_app() -> Flask:
     app.register_blueprint(ai_bp)
     app.register_blueprint(mappings_bp)
     app.register_blueprint(pipelines_bp)
+    app.register_blueprint(domain_bp)
 
     @app.get("/")
     def index():

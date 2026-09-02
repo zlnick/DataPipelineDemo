@@ -119,6 +119,17 @@ def create_target():
         conn = {**conn, "bo_class": imp["boClass"]}
         target_id = repository.create_target(name, "SOAP", conn)
         repository.update_target(target_id, {"status": "analyzed"})
+        repository.save_target_interface({
+            "id": target_id,
+            "target_id": target_id,
+            "name": name,
+            "type": "SOAP",
+            "config": {
+                "service": conn.get("service") or "default",
+                "wsdl": conn.get("wsdl"),
+                "bo_class": imp["boClass"],
+            },
+        })
         return success({
             "id": target_id, "bo_class": imp["boClass"],
             "target": repository.get_target(target_id),
@@ -127,6 +138,13 @@ def create_target():
     if not conn.get("jdbc_url"):
         return error("缺少 JDBC 连接信息（jdbc_url）"), 400
     target_id = repository.create_target(name, target_type, conn)
+    repository.save_target_interface({
+        "id": target_id,
+        "target_id": target_id,
+        "name": name,
+        "type": target_type,
+        "connection": conn,
+    })
     return success({"id": target_id, "target": repository.get_target(target_id)}, "数据目标添加成功")
 
 
@@ -256,4 +274,3 @@ def table_data(table: str):
         f"WHERE table_schema='SQLUser' AND table_name='{table}' ORDER BY ordinal_position")]
     items = [dict(zip(cols, row)) for row in rows]
     return success({"items": items, "count": len(items)})
-

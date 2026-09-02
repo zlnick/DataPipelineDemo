@@ -17,15 +17,17 @@ class AgentError(Exception):
 # ===== Agent A：数据转换（系统提示词） =====
 SYSTEM_PROMPT_TRANSFORMATION = (
     "你是医疗数据集成专家。给定源数据资产（HL7 FHIR 资源类型及其关键字段）"
-    "与目标表（远端数据库表及列结构），为每个源资产推荐最合适的投放目标表并生成字段级映射。"
-    "要求：1. 基于字段语义匹配（FHIR 资源字段→目标表列），字段高度匹配时 confidence 高。"
-    "2. field_mappings 的 source 使用 FHIRPath 风格路径，target 为目标表列名。"
+    "与目标接口模型，为源资产集合生成 Transformation Plan；目标可以是数据库表或 SOAP WSDL 实体，"
+    "不能假设源表与目标实体一一对应，需根据字段、关系和接口结构决定一对一、多对一或一对多。"
+    "要求：1. 基于字段语义、主键关系和目标实体结构匹配，并生成 join/group_by/emit 策略。"
+    "2. field_mappings 的 source 使用表.字段或 FHIRPath 路径，target 使用目标实体路径，支持嵌套对象和数组。"
     "3. 日期字段建议加 transform:date（提取 YYYY-MM-DD）。"
     "4. 无法匹配的目标返回空列表即可。"
     "严格输出 JSON（不要输出其他文字），格式："
     '{"recommendations":[{"asset":"Patient","target_table":"patient","confidence":0.92,'
     '"reason":"字段高度匹配","field_mappings":[{"source":"id","target":"ID","transform":null},'
-    '{"source":"birthDate","target":"BirthDate","transform":"date"}]}]}'
+    '{"source":"birthDate","target":"BirthDate","transform":"date"}]}],'
+    '"transformation_plan":{"source_models":[],"target_models":[],"mappings":[],"status":"draft"}}'
 )
 
 
@@ -84,10 +86,14 @@ def _call_llm(system_prompt: str, user_content: str, agent_name: str) -> dict:
 
 
 # ===== Agent A：数据转换 =====
-def recommend_transformation(assets: list[dict], targets: list[dict]) -> dict:
+def recommend_transformation(assets: list[dict], targets: list[dict],
+                             source_models: list[dict] | None = None,
+                             target_models: list[dict] | None = None) -> dict:
     """Agent A：生成资产→目标表匹配建议与字段级映射。"""
     user_content = json.dumps(
-        {"assets": assets, "targets": targets}, ensure_ascii=False, indent=2)
+        {"assets": assets, "targets": targets,
+         "source_models": source_models or assets,
+         "target_models": target_models or targets}, ensure_ascii=False, indent=2)
     result = _call_llm(SYSTEM_PROMPT_TRANSFORMATION, user_content, "数据转换Agent")
     recs = result.get("recommendations", [])
     if not isinstance(recs, list):
@@ -97,13 +103,19 @@ def recommend_transformation(assets: list[dict], targets: list[dict]) -> dict:
 
 # ===== Agent B：数据管道 =====
 def recommend_pipeline(mappings: list[dict], source_type: str, target_type: str,
-                       available_components: list[dict]) -> dict:
+                       available_components: list[dict],
+                       source_models: list[dict] | None = None,
+                       target_models: list[dict] | None = None,
+                       transformation_plan: dict | None = None) -> dict:
     """Agent B：生成管道组件拓扑。"""
     user_content = json.dumps(
         {
             "source": {"type": source_type},
             "target": {"type": target_type},
             "mappings": mappings,
+            "transformation_plan": transformation_plan or {"mappings": mappings},
+            "source_models": source_models or [],
+            "target_models": target_models or [],
             "available_components": available_components,
         }, ensure_ascii=False, indent=2)
     result = _call_llm(SYSTEM_PROMPT_PIPELINE, user_content, "数据管道Agent")

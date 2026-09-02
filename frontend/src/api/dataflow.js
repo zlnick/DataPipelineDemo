@@ -14,6 +14,15 @@ export const datasourceApi = {
   selectTables: (id, tables) => http.post(`/datasources/${id}/tables`, { tables }),
 }
 
+// 独立领域模型（源资产模型 / 目标接口模型 / 转换计划）
+export const modelApi = {
+  sourceAssets: (sourceId) => http.get('/source-assets', { params: sourceId ? { source_id: sourceId } : {} }),
+  targetInterfaces: () => http.get('/target-interfaces'),
+  plans: () => http.get('/transformation-plans'),
+  createPlan: (plan) => http.post('/transformation-plans', plan),
+  verifyPlan: (id) => http.post(`/transformation-plans/${id}/verify`),
+}
+
 // 转换目标（数据目标 JDBC 分步发现 / SOAP WSDL 导入）
 export const targetApi = {
   list: () => http.get('/targets'),
@@ -31,6 +40,7 @@ export const targetApi = {
 // AI 智能推荐
 export const aiApi = {
   recommend: (data) => http.post('/ai/recommend', data),
+  verify: (plan) => http.post('/ai/verify', { transformation_plan: plan }),
 }
 
 // 转换关系

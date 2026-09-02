@@ -9,7 +9,7 @@
             <el-option
               v-for="a in allAssets"
               :key="a.id"
-              :value="a.name"
+              :value="a.id"
             >
               <span>{{ a.type === 'SQL_TABLE' ? '[SQL] ' : '' }}{{ a.name }}</span>
               <span class="gray" style="float: right; font-size: 12px">
@@ -111,7 +111,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { aiApi, datasourceApi, mappingApi, targetApi } from '../api/dataflow'
+import { aiApi, datasourceApi, mappingApi, modelApi, targetApi } from '../api/dataflow'
 
 const route = useRoute()
 const router = useRouter()
@@ -122,6 +122,7 @@ const assetFields = ref({})
 const targets = ref([])
 const recommending = ref(false)
 const recommendations = ref([])
+const transformationPlan = ref(null)
 const validation = ref(null)
 
 // 检查项名称映射（后端 check 字段 → 中文）
@@ -158,16 +159,38 @@ const ASSET_FIELDS = {
 }
 
 function buildRecommendPayload() {
-  const assets = selectedAssets.value.map((name) => ({
-    name,
+  const selected = allAssets.value.filter((a) => selectedAssets.value.includes(a.id))
+  const assets = selected.map((a) => ({
+    id: a.id,
+    name: a.name,
+    type: a.type,
+    source_id: a.source_id,
     // 优先使用资产真实字段（SQL 表资产=列名；FHIR 资产无 fields 时前端典型字段兜底）
-    fields: assetFields.value[name] || ASSET_FIELDS[name] || [name, 'id'],
+    fields: a.fields || assetFields.value[a.name] || ASSET_FIELDS[a.name] || [a.name, 'id'],
+    structure: a.structure || null,
   }))
   const targetList = targets.value.map((t) => ({
     table: t.table,
     columns: t.columns,
   }))
-  return { assets, targets: targetList }
+  const targetModels = targets.value.map((t) => ({
+    id: t.target_id,
+    target_id: t.target_id,
+    name: t.target_name || t.table,
+    type: t.type || 'DB',
+    table: t.table,
+    schema: t.schema,
+    columns: t.columns || [],
+    config: t.type === 'SOAP'
+      ? { service: t.table, bo_class: t.bo_class }
+      : {},
+  }))
+  return {
+    assets,
+    targets: targetList,
+    source_models: assets,
+    target_models: targetModels,
+  }
 }
 
 async function loadAssets() {
@@ -206,6 +229,7 @@ async function handleRecommend() {
   try {
     const data = await aiApi.recommend(buildRecommendPayload())
     recommendations.value = data?.recommendations || []
+    transformationPlan.value = data?.transformation_plan || null
     validation.value = data?.validation || null
     ElMessage.success(`AI 推荐完成，共 ${recommendations.value.length} 条建议`)
     if (validation.value && !validation.value.ok) {
@@ -232,6 +256,14 @@ async function confirmAll() {
       transform: fm.transform || null,
     })),
   }))
+  const plan = {
+    ...(transformationPlan.value || {}),
+    source_models: buildRecommendPayload().source_models,
+    target_models: buildRecommendPayload().target_models,
+    mappings,
+    status: 'confirmed',
+  }
+  await modelApi.createPlan(plan)
   await mappingApi.save(mappings)
   ElMessage.success('转换关系已保存，可前往「转换关系」查看或「管道监控」生成管道')
   router.push('/mappings')
@@ -241,7 +273,8 @@ onMounted(async () => {
   await Promise.all([loadAssets(), loadTargets()])
   // 支持从资产页带 asset 参数进入
   if (route.query.asset && !selectedAssets.value.includes(route.query.asset)) {
-    selectedAssets.value = [route.query.asset]
+    const match = allAssets.value.find((a) => a.name === route.query.asset)
+    if (match) selectedAssets.value = [match.id]
   }
 })
 </script>
@@ -257,4 +290,3 @@ onMounted(async () => {
 .gray { color: #909399; }
 .card-title { font-weight: 600; }
 </style>
-

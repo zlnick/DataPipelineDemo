@@ -14,6 +14,19 @@ FHIR 端点 → 自动分析 Profile → 注册数据源 → 发现数据资产(
 
 ## 功能清单
 
+### 分层模型与 AI 转换
+
+平台将数据转换拆分为三个独立层次，而不是假设“源表 → 目标实体”一一对应：
+
+1. **源资产模型**：描述 FHIR 资源、SQL 表及其字段、类型、主键和关系。
+2. **目标接口模型**：描述数据库表或 SOAP WSDL Operation 的 Request 实体、嵌套字段和约束。
+3. **转换计划**：由 AI 基于两类模型生成，表达多表聚合、拆分消息、JOIN、分组以及字段映射；用户确认后才用于生成管道。
+
+转换计划可通过 `/api/source-assets`、`/api/target-interfaces` 和
+`/api/transformation-plans` 管理，并可通过 `/api/ai/verify` 执行事实验证。
+只有用户在管道监控页面点击“生成 / 重建数据管道”后，系统才会调用 AI 设计
+Production 拓扑并交给 IRIS 编译启动。
+
 - **数据源管理**：注册 FHIR 数据源（IRIS 自带 FHIR Server），自动分析 CapabilityStatement（Profile / 资源类型 / 支持的操作）。
 - **数据资产**：FHIR 接口中的资源类型（如 Patient / Observation / MedicationRequest）即数据资产，由 Profile 分析自动发现并注册。
 - **AI 智能匹配**：选择资产后，AI（OpenAI 兼容接口，可配 DeepSeek/通义/智谱/Kimi 等）推荐「资产 → 目标表」匹配、置信度与字段级映射，用户确认。
@@ -164,4 +177,3 @@ LLM_MODEL=deepseek-chat                        # 模型名
 - 数据源仅实现 **FHIR**；数据库 / REST / SOAP 数据源与 FHIR / REST / SOAP 目标为**预留类型**（界面禁用态，扩展时启用 `enabled` 标记即可）。
 - 目标表写入为 UPSERT（存在则更新），管道定时拉取重复执行不冲突。
 - `init_data.py` / `init_fhir_data.py` 每次后端启动会重建目标表并重新提交 FHIR 示例数据，适合演示；生产环境不应自动清表。
-

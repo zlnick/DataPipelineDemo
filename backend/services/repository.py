@@ -11,7 +11,7 @@ import logging
 import time
 from datetime import datetime
 
-from backend.schemas.models import DataSourceIn
+from backend.schemas.models import DataSourceIn, SourceAssetModel, TargetInterfaceModel, TransformationPlan
 
 logger = logging.getLogger(__name__)
 
@@ -259,3 +259,82 @@ def add_target_table(target_id: str, schema: str, table: str,
     })
     tg["tables"] = tables
     set_json("^demo.Target", target_id, tg)
+
+
+# ---------------- 分层领域模型 ----------------
+
+def _model_record(model, prefix: str) -> tuple[str, dict]:
+    """将 Pydantic 领域模型转为可存储记录。"""
+    record = model.model_dump(by_alias=True, exclude_none=True)
+    ident = record.get("id") or _gen_id(prefix)
+    record["id"] = ident
+    record.setdefault("created_at", datetime.now().isoformat())
+    return ident, record
+
+
+def save_source_asset(model: SourceAssetModel | dict) -> dict:
+    ident, record = _model_record(model if isinstance(model, SourceAssetModel)
+                                  else SourceAssetModel(**model), "SA")
+    set_json("^demo.SourceAsset", ident, record)
+    return record
+
+
+def get_source_asset(asset_id: str) -> dict | None:
+    return get_json("^demo.SourceAsset", asset_id)
+
+
+def list_source_assets(source_id: str | None = None) -> list[dict]:
+    rows = list_json("^demo.SourceAsset")
+    # 兼容旧版发现流程写入的 ^demo.DataAsset。
+    if not rows:
+        rows = list_json("^demo.DataAsset")
+    return [r for r in rows if not source_id or r.get("source_id") == source_id]
+
+
+def save_target_interface(model: TargetInterfaceModel | dict) -> dict:
+    ident, record = _model_record(model if isinstance(model, TargetInterfaceModel)
+                                  else TargetInterfaceModel(**model), "TI")
+    set_json("^demo.TargetInterface", ident, record)
+    return record
+
+
+def get_target_interface(interface_id: str) -> dict | None:
+    return get_json("^demo.TargetInterface", interface_id)
+
+
+def list_target_interfaces() -> list[dict]:
+    rows = list_json("^demo.TargetInterface")
+    if not rows:
+        rows = list_json("^demo.Target")
+    return rows
+
+
+def save_transformation_plan(plan: TransformationPlan | dict) -> dict:
+    ident, record = _model_record(plan if isinstance(plan, TransformationPlan)
+                                  else TransformationPlan(**plan), "TP")
+    record["id"] = ident
+    set_json("^demo.TransformationPlan", ident, record)
+    return record
+
+
+def get_transformation_plan(plan_id: str) -> dict | None:
+    return get_json("^demo.TransformationPlan", plan_id)
+
+
+def list_transformation_plans() -> list[dict]:
+    return list_json("^demo.TransformationPlan")
+
+
+def update_transformation_plan(plan_id: str, patch: dict) -> dict | None:
+    plan = get_transformation_plan(plan_id)
+    if not plan:
+        return None
+    plan.update(patch)
+    set_json("^demo.TransformationPlan", plan_id, plan)
+    return plan
+
+
+# Domain-oriented aliases kept stable for callers that use model terminology.
+create_source_asset = save_source_asset
+create_target_interface = save_target_interface
+create_transformation_plan = save_transformation_plan

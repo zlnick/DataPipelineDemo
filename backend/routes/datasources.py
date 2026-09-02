@@ -83,6 +83,12 @@ def analyze_datasource(ds_id: str):
             endpoint, auth.get("username", "superuser"), auth.get("password", "SYS"))
         analysis = profile_analyzer.analyze_capability(cap)
         assets = repository.save_assets(ds_id, analysis["resource_types"])
+        for asset in assets:
+            repository.save_source_asset({
+                **asset,
+                "fields": asset.get("fields", []),
+                "description": f"FHIR 资产 {asset.get('name', '')}",
+            })
         repository.update_datasource(ds_id, {"status": "analyzed", "profile": analysis})
     except Exception as exc:  # noqa: BLE001 - 需返回明确错误给前端
         logger.error("数据源分析失败: %s", exc)
@@ -161,7 +167,13 @@ def select_source_tables(ds_id: str):
 
     if not saved:
         return error("未选择有效数据表"), 400
-    repository.save_sql_table_assets(ds_id, saved)
+    assets = repository.save_sql_table_assets(ds_id, saved)
+    for asset in assets:
+        repository.save_source_asset({
+            **asset,
+            "fields": asset.get("fields", []),
+            "description": f"SQL 资产 {asset.get('name', '')}",
+        })
     # 自动生成轮询 Query（EnsLib.SQL.Service.GenericService 的 Host 设置）
     first = saved[0]
     qtable = first["table"]

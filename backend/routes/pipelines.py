@@ -171,11 +171,24 @@ def generate():
     """生成并启动数据管道。支持异构组合（source_type/target_type + target_config）。"""
     body = request.get_json(silent=True) or {}
     mappings = body.get("mappings") or []
+    plan = body.get("transformation_plan") or {}
+    if not mappings:
+        mappings = plan.get("mappings") or []
     config = body.get("config")
     source_type = body.get("source_type") or "FHIR"
     target_type = body.get("target_type") or "DB"
     source_config = body.get("source_config") or {}
     target_config = body.get("target_config") or {}
+    source_models = body.get("source_models") or plan.get("source_models") or []
+    target_models = body.get("target_models") or plan.get("target_models") or []
+    if source_models and not body.get("source_type"):
+        source_type = "SQL" if any(
+            m.get("type") == "SQL_TABLE" for m in source_models
+        ) else source_type
+    if target_models and not body.get("target_type"):
+        target_type = "SOAP" if any(
+            m.get("type") == "SOAP" for m in target_models
+        ) else target_type
     # 便捷：传 source_id / target_id 时，从登记的数据源/目标读取类型与配置
     if body.get("source_id"):
         ds = repository.get_datasource(body["source_id"])
@@ -184,7 +197,7 @@ def generate():
             if not source_config:
                 cfg = ds.get("config") or {}
                 source_config = {
-                    "dsn": cfg.get("dsn", ""),
+                    "dsn": cfg.get("dsn") or cfg.get("jdbc_url", ""),
                     "query": cfg.get("query", ""),
                     "key_field": cfg.get("key_field", ""),
                 }
@@ -203,7 +216,7 @@ def generate():
         return error("缺少 mappings"), 400
 
     try:
-        req = PipelineGenerateRequest(**body)
+        req = PipelineGenerateRequest(**{**body, "mappings": mappings})
     except Exception as exc:
         return error(f"参数校验失败: {exc}"), 400
     repository.save_mappings([m.model_dump() for m in req.mappings])
@@ -227,7 +240,10 @@ def generate():
         p_result = llm_client.recommend_pipeline(
             mappings_effective,
             source_type=source_type, target_type=target_type,
-            available_components=AVAILABLE_COMPONENTS)
+            available_components=AVAILABLE_COMPONENTS,
+            source_models=source_models,
+            target_models=target_models,
+            transformation_plan=plan or {"mappings": mappings_effective})
         pipeline = p_result.get("pipeline")
         if pipeline:
             suggested_types = [c.get("type") for c in pipeline.get("components", [])]

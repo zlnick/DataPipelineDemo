@@ -30,11 +30,57 @@ class AssetDiscovery(BaseModel):
     fields: list[str] = Field(default_factory=list, description="字段/路径列表")
 
 
+class SourceAssetModel(BaseModel):
+    """可供转换计划使用的源资产模型。"""
+
+    id: Optional[str] = None
+    name: str
+    type: str = "FHIR_RESOURCE"
+    source_id: Optional[str] = None
+    fields: list[str] = Field(default_factory=list)
+    structure: Optional[dict] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+
+
+class TargetInterfaceModel(BaseModel):
+    """目标接口模型（数据库表、SOAP 服务或其他投递端）。"""
+
+    id: Optional[str] = None
+    name: str
+    type: str = "DB"
+    target_id: Optional[str] = None
+    endpoint: Optional[str] = None
+    table: Optional[str] = None
+    schema_name: Optional[str] = Field(None, alias="schema")
+    columns: list = Field(default_factory=list)
+    config: dict = Field(default_factory=dict)
+    connection: Optional[dict] = None
+    tables: list[dict] = Field(default_factory=list)
+
+    class Config:
+        populate_by_name = True
+
+
+class TransformationPlan(BaseModel):
+    """可持久化的转换计划。"""
+
+    id: Optional[str] = None
+    name: Optional[str] = None
+    source_models: list[SourceAssetModel] = Field(default_factory=list)
+    target_models: list[TargetInterfaceModel] = Field(default_factory=list)
+    mappings: list[dict] = Field(default_factory=list)
+    status: str = "draft"
+    metadata: dict = Field(default_factory=dict)
+
+
 class RecommendRequest(BaseModel):
     """AI 推荐请求。"""
 
-    assets: list[AssetDiscovery] = Field(..., description="源资产列表（含字段结构）")
-    targets: list[dict] = Field(..., description="目标表列表 [{'table': str, 'columns': [...]}]")
+    assets: list[AssetDiscovery] = Field(default_factory=list, description="兼容旧版源资产列表")
+    targets: list[dict] = Field(default_factory=list, description="兼容旧版目标表列表")
+    source_models: Optional[list[SourceAssetModel]] = None
+    target_models: Optional[list[TargetInterfaceModel]] = None
 
 
 class FieldMapping(BaseModel):
@@ -49,10 +95,15 @@ class MappingItem(BaseModel):
     """转换关系项。"""
 
     id: str = Field(..., description="转换关系 ID，如 M1")
-    source: str = Field(..., description="源资产（FHIR 资源类型）")
-    target_table: str = Field(..., description="目标表名")
+    source: str = Field("", description="兼容旧版的单一源资产名称")
+    target_table: str = Field("", description="兼容数据库目标的表名")
     target_type: str = Field("DB", description="目标类型（DB/SOAP）")
     field_mappings: list[FieldMapping] = Field(default_factory=list)
+    source_assets: list[str] = Field(default_factory=list)
+    target_model_id: Optional[str] = None
+    operation: Optional[str] = None
+    request_class: Optional[str] = None
+    strategy: dict = Field(default_factory=dict)
 
 
 class PipelineGenerateRequest(BaseModel):
@@ -60,3 +111,8 @@ class PipelineGenerateRequest(BaseModel):
 
     mappings: list[MappingItem] = Field(..., description="已确认的转换关系列表")
     config: Optional[dict] = Field(None, description="FHIR 数据源配置 {endpoint, username, password}")
+    transformation_plan: Optional[TransformationPlan] = None
+    source_models: list[SourceAssetModel] = Field(default_factory=list)
+    target_models: list[TargetInterfaceModel] = Field(default_factory=list)
+    source_id: Optional[str] = None
+    target_id: Optional[str] = None

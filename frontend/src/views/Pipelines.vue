@@ -102,7 +102,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { mappingApi, pipelineApi } from '../api/dataflow'
+import { mappingApi, modelApi, pipelineApi } from '../api/dataflow'
 
 const running = ref(false)
 const generating = ref(false)
@@ -177,8 +177,13 @@ async function handleGenerate() {
   }
   generating.value = true
   try {
+    const plans = (await modelApi.plans())?.items || []
+    const plan = [...plans].reverse().find((p) => p.status === 'confirmed') || null
     const result = await pipelineApi.generate({
       mappings,
+      transformation_plan: plan || undefined,
+      source_models: plan?.source_models || [],
+      target_models: plan?.target_models || [],
       config: {
         endpoint: 'http://127.0.0.1:52773/csp/healthshare/fhirserver/fhir/r4/',
         username: 'superuser',
