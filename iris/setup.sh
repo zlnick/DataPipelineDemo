@@ -48,6 +48,14 @@ try {
     write "INSTALL_INSTANCE_SKIPPED: ", $system.Status.GetErrorText(ex.AsStatus()), !
 }
 
+// 确保 Web Application 开启 Basic Password 认证与 %All 角色权限，解决 HTTP 401/404 认证匹配异常
+zn "%SYS"
+if ##class(Security.Applications).Get(appKey, .props) {
+    set props("AutheEnabled") = 8288
+    set props("MatchRoles") = ":%All"
+    do ##class(Security.Applications).Modify(appKey, .props)
+}
+
 write "FHIR_SERVER_SETUP_DONE", !
 halt
 EOF

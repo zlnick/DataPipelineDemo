@@ -13,8 +13,8 @@ services:
     # -a: IRIS 启动后执行统一初始化脚本（凭据 + FHIR Server 搭建 + 编译 + 启动 Production）
     command: ["-a", "/shared/setup.sh"]
     ports:
-      - "52773:52773"   # 管理门户 / Web 网关 / FHIR endpoint
-      - "1972:1972"     # 超级服务器端口（Native SDK 连接使用）
+      - "52774:52773"   # 管理门户 / Web 网关 / FHIR endpoint
+      - "1973:1972"     # 超级服务器端口（映射到宿主 1973 避开本地 ssh 端口转发冲突）
     environment:
       IRIS_PASSWORD: SYS   # 约定：所有 Demo 统一使用 superuser / SYS 登录
     volumes:

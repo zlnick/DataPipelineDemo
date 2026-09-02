@@ -35,12 +35,14 @@ class SourceAssetModel(BaseModel):
 
     id: Optional[str] = None
     name: str
-    type: str = "FHIR_RESOURCE"
+    type: str = "SQL_TABLE"
     source_id: Optional[str] = None
     fields: list[str] = Field(default_factory=list)
     structure: Optional[dict] = None
     description: Optional[str] = None
     status: Optional[str] = None
+    tables: list[dict] = Field(default_factory=list)
+    relationships: list[dict] = Field(default_factory=list)
 
 
 class TargetInterfaceModel(BaseModel):
