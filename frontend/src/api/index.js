@@ -4,7 +4,7 @@ import { ElMessage } from 'element-plus'
 // axios 实例：统一 baseURL（生产环境经 nginx 同源代理 /api，开发环境经 vite 代理）
 const http = axios.create({
   baseURL: '/api',
-  timeout: 60000,
+  timeout: 300000,
 })
 
 // 响应拦截器：解包统一响应格式 {code, data, message}

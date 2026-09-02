@@ -54,7 +54,7 @@ def _call_llm(system_prompt: str, user_content: str, agent_name: str) -> dict:
     """调用 LLM 一次并解析 JSON 返回。"""
     if not LLMConfig.API_KEY or LLMConfig.API_KEY.startswith("sk-xxxx"):
         raise AgentError("未配置 LLM_API_KEY，请在 .env 中设置（OpenAI 兼容服务）")
-    client = OpenAI(base_url=LLMConfig.BASE_URL, api_key=LLMConfig.API_KEY)
+    client = OpenAI(base_url=LLMConfig.BASE_URL, api_key=LLMConfig.API_KEY, timeout=180.0)
     for attempt in range(2):
         try:
             resp = client.chat.completions.create(

@@ -18,9 +18,25 @@
             </el-option>
           </el-select>
         </el-form-item>
-        <el-form-item label="转换目标">
-          <el-tag v-for="t in targets" :key="t.table" class="mr6" type="success">{{ t.table }}</el-tag>
-          <span v-if="!targets.length" class="gray">无目标表</span>
+        <el-form-item label="转换目标（多选）">
+          <el-select
+            v-model="selectedTargets"
+            multiple
+            filterable
+            style="width: 400px"
+            placeholder="选择要转成的目标表或 SOAP 实体"
+          >
+            <el-option
+              v-for="t in targets"
+              :key="(t.target_id || '') + '::' + t.table"
+              :value="(t.target_id || '') + '::' + t.table"
+            >
+              <span>{{ t.type === 'SOAP' ? '[SOAP] ' : '[DB] ' }}{{ t.table }}</span>
+              <span class="gray" style="float: right; font-size: 12px">
+                {{ t.target_name ? t.target_name : t.schema }}
+              </span>
+            </el-option>
+          </el-select>
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="recommending" @click="handleRecommend">
@@ -118,6 +134,7 @@ const router = useRouter()
 
 const allAssets = ref([])
 const selectedAssets = ref([])
+const selectedTargets = ref([])
 const assetFields = ref({})
 const targets = ref([])
 const recommending = ref(false)
@@ -169,11 +186,14 @@ function buildRecommendPayload() {
     fields: a.fields || assetFields.value[a.name] || ASSET_FIELDS[a.name] || [a.name, 'id'],
     structure: a.structure || null,
   }))
-  const targetList = targets.value.map((t) => ({
+  const selectedTargetObjs = targets.value.filter((t) =>
+    selectedTargets.value.includes((t.target_id || '') + '::' + t.table)
+  )
+  const targetList = selectedTargetObjs.map((t) => ({
     table: t.table,
     columns: t.columns,
   }))
-  const targetModels = targets.value.map((t) => ({
+  const targetModels = selectedTargetObjs.map((t) => ({
     id: t.target_id,
     target_id: t.target_id,
     name: t.target_name || t.table,
@@ -214,6 +234,8 @@ async function loadAssets() {
 async function loadTargets() {
   const data = await targetApi.list()
   targets.value = data?.items || []
+  // 默认选中所有可用的转换目标
+  selectedTargets.value = targets.value.map((t) => (t.target_id || '') + '::' + t.table)
 }
 
 async function handleRecommend() {
@@ -221,8 +243,8 @@ async function handleRecommend() {
     ElMessage.warning('请先选择数据资产')
     return
   }
-  if (!targets.value.length) {
-    ElMessage.warning('无可用目标表')
+  if (!selectedTargets.value.length) {
+    ElMessage.warning('请选择要转换的目标表或 SOAP 实体')
     return
   }
   recommending.value = true
