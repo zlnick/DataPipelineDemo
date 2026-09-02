@@ -2,7 +2,10 @@
 import iris
 from backend.services import iris_connector
 
-DEMO_GLOBALS = ["^demo.DataSource", "^demo.DataAsset", "^demo.Target", "^demo.Mapping", "^demo.Config"]
+DEMO_GLOBALS = [
+    "^demo.DataSource", "^demo.DataAsset", "^demo.Target", "^demo.Mapping", "^demo.Config",
+    "^demo.SourceAsset", "^demo.TargetInterface", "^demo.TransformationPlan", "^demo.ValidationIssue"
+]
 PRODUCTION_NAME = "demo.DataflowProduction"
 GENERATED_FILE = "/dur/generated/DataflowProduction.cls"
 
