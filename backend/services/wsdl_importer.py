@@ -9,6 +9,7 @@ MakeClient=1、MakeBusinessOperation=1、MakeEnsembleClasses 保持默认 0。
 import json
 import logging
 import os
+import xml.etree.ElementTree as ET
 
 from backend.services import iris_connector
 
@@ -130,6 +131,76 @@ def _ensure_wsdl_in_iris(wsdl: str) -> str:
     return target_path
 
 
+def parse_wsdl_entities_xml(wsdl_source: str) -> list[dict]:
+    """通过 XML 静态解析 WSDL 提取包含的 complexType 实体和字段属性。"""
+    content = ""
+    if wsdl_source.strip().startswith("<"):
+        content = wsdl_source
+    elif os.path.exists(wsdl_source):
+        try:
+            with open(wsdl_source, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            pass
+    if not content and "patient.wsdl" in wsdl_source.lower():
+        content = DEFAULT_SAMPLE_WSDL
+
+    if not content:
+        return []
+
+    try:
+        root = ET.fromstring(content)
+    except Exception:
+        return []
+
+    entities = []
+    for elem in root.iter():
+        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if tag == "complexType":
+            name = elem.get("name")
+            if not name:
+                continue
+            cols = []
+            fields = []
+            for sub in elem.iter():
+                sub_tag = sub.tag.split("}")[-1] if "}" in sub.tag else sub.tag
+                if sub_tag == "element":
+                    f_name = sub.get("name")
+                    f_type = sub.get("type", "string").split(":")[-1]
+                    if f_name and f_name not in fields:
+                        cols.append({"name": f_name, "type": f_type})
+                        fields.append(f_name)
+            if cols:
+                entities.append({
+                    "entity_name": name,
+                    "table": name,
+                    "schema": "SOAP",
+                    "columns": cols,
+                    "fields": fields
+                })
+    return entities
+
+
+def inspect_soap_entities(wsdl: str, service: str = "default",
+                          packages: dict | None = None) -> list[dict]:
+    """分析 SOAP 接口生成的相关实体及其包含的字段属性。"""
+    pkgs = {**DEFAULT_PACKAGES, **(packages or {})}
+    entities = []
+    try:
+        data = iris_connector.class_method_value(
+            "demo.WSDLImporter", "InspectEntities",
+            pkgs["bo_package"], pkgs["client_package"])
+        if data:
+            entities = json.loads(data)
+    except Exception as exc:
+        logger.warning("IRIS 实体分析调用异常: %s", exc)
+
+    if not entities:
+        entities = parse_wsdl_entities_xml(wsdl)
+
+    return entities
+
+
 def import_soap_operation(wsdl: str, service: str = "default",
                           packages: dict | None = None) -> dict:
     """调 IRIS demo.WSDLImporter 导入 WSDL，生成 BO 并返回。
@@ -139,11 +210,11 @@ def import_soap_operation(wsdl: str, service: str = "default",
         service: SOAP 服务名（用于命名组件 SOAPOp_{service} 与记录映射）
         packages: 覆盖默认生成包（client_package/bo_package/msg_package）
 
-    返回: {"ok": bool, "boClass": str, "message": str}
+    返回: {"ok": bool, "boClass": str, "entities": list, "message": str}
     成功后记录 ^demo.Config("soap", service) = BO 类名，供后续复用与 TransformProcess 路由。
     """
     if not wsdl:
-        return {"ok": False, "boClass": "", "message": "SOAP 目标需要提供 WSDL 地址"}
+        return {"ok": False, "boClass": "", "entities": [], "message": "SOAP 目标需要提供 WSDL 地址"}
     pkgs = {**DEFAULT_PACKAGES, **(packages or {})}
     iris_wsdl_path = _ensure_wsdl_in_iris(wsdl)
     try:
@@ -153,11 +224,12 @@ def import_soap_operation(wsdl: str, service: str = "default",
         result = json.loads(data or "{}")
     except Exception as exc:  # noqa: BLE001
         logger.error("WSDL 导入调用失败: %s", exc)
-        return {"ok": False, "boClass": "", "message": str(exc)}
+        return {"ok": False, "boClass": "", "entities": [], "message": str(exc)}
     if result.get("ok") and result.get("boClass"):
         _save_bo_mapping(service, result["boClass"])
-        return {"ok": True, "boClass": result["boClass"], "message": ""}
-    return {"ok": False, "boClass": "",
+        entities = result.get("entities") or inspect_soap_entities(wsdl, service, pkgs)
+        return {"ok": True, "boClass": result["boClass"], "entities": entities, "message": ""}
+    return {"ok": False, "boClass": "", "entities": [],
             "message": result.get("message", "WSDL 导入失败")}
 
 

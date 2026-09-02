@@ -119,9 +119,10 @@
           </template>
         </el-table-column>
         <el-table-column prop="count" label="行数" width="80" />
-        <el-table-column label="操作" width="100" fixed="right">
+        <el-table-column label="操作" width="120" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" type="primary" plain @click="showData(row.table)">查看数据</el-button>
+            <el-button v-if="row.type !== 'SOAP'" size="small" type="primary" plain @click="showData(row.table)">查看数据</el-button>
+            <el-tag v-else size="small" type="info">SOAP 实体</el-tag>
           </template>
         </el-table-column>
       </el-table>
@@ -265,8 +266,8 @@ async function handleCreate() {
           password: form.password,
         }
     await targetApi.create({ name: form.name.trim(), type: form.type, connection })
-    ElMessage.success(form.type === 'SOAP' ? 'SOAP 目标添加成功（WSDL 已导入生成 BO）' : '数据目标添加成功')
-    await loadManage()
+    ElMessage.success(form.type === 'SOAP' ? 'SOAP 目标添加成功（WSDL 已导入生成 BO 及实体分析）' : '数据目标添加成功')
+    await Promise.all([loadManage(), loadTargetTables()])
   } finally {
     creating.value = false
   }
@@ -294,7 +295,7 @@ async function handleImport(row) {
     // 错误提示已由拦截器处理
   } finally {
     importingId.value = ''
-    await loadManage()
+    await Promise.all([loadManage(), loadTargetTables()])
   }
 }
 

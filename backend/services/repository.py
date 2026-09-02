@@ -194,13 +194,14 @@ def list_mappings() -> list[dict]:
 
 # ---------------- 转换目标（数据目标 / 目标表） ----------------
 
-def create_target(name: str, target_type: str, connection: dict) -> str:
+def create_target(name: str, target_type: str, connection: dict, tables: list[dict] | None = None) -> str:
     """注册一个数据目标（如数据库），返回目标 ID。
 
     参数:
         name: 目标名称。
-        target_type: 目标类型（示例实现 DB，其余预留）。
-        connection: JDBC 连接信息 {jdbc_url, driver_class, username, password, jar}。
+        target_type: 目标类型（DB/SOAP）。
+        connection: 连接配置信息。
+        tables: 选定或分析出的实体/表结构列表。
     """
     target_id = _gen_id("TG")
     record = {
@@ -209,7 +210,7 @@ def create_target(name: str, target_type: str, connection: dict) -> str:
         "type": target_type,
         "connection": connection,
         "status": "registered",
-        "tables": [],
+        "tables": tables or [],
         "created_at": datetime.now().isoformat(),
     }
     set_json("^demo.Target", target_id, record)

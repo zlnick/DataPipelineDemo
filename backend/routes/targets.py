@@ -26,25 +26,38 @@ def _target_table_rows() -> list[dict]:
     """汇总所有数据目标下已选定的目标表（扁平化，供 AI 推荐/管道投放）。
 
     - DB 目标：每个选定表一个条目（含列结构）；
-    - SOAP 目标：每个 service 一个条目（无列，目标以 service 名义投递）。
+    - SOAP 目标：每个分析出的 WSDL 实体一个条目（含实体名、属性结构列）。
     """
     items = []
     for tg in repository.list_targets():
         if tg.get("type") == "SOAP":
             conn = tg.get("connection") or {}
             service = conn.get("service") or "default"
-            items.append({
-                "target_id": tg.get("id"),
-                "target_name": tg.get("name"),
-                "table": service,
-                "schema": "",
-                "columns": [],
-                "type": "SOAP",
-                "bo_class": conn.get("bo_class", ""),
-                "enabled": True,
-                "count": 0,
-                "status": tg.get("status", "registered"),
-            })
+            entities = tg.get("tables") or conn.get("entities") or []
+            if not entities:
+                entities = [{
+                    "entity_name": service,
+                    "table": service,
+                    "schema": "SOAP",
+                    "columns": [],
+                    "fields": []
+                }]
+            for ent in entities:
+                cols = ent.get("columns", [])
+                col_names = [c["name"] if isinstance(c, dict) else c for c in cols]
+                items.append({
+                    "target_id": tg.get("id"),
+                    "target_name": tg.get("name"),
+                    "table": ent.get("entity_name") or ent.get("table") or service,
+                    "schema": "SOAP",
+                    "columns": col_names,
+                    "fields": ent.get("fields") or col_names,
+                    "type": "SOAP",
+                    "bo_class": conn.get("bo_class", ""),
+                    "enabled": True,
+                    "count": 0,
+                    "status": tg.get("status", "analyzed"),
+                })
             continue
         for tb in tg.get("tables", []):
             count = 0
@@ -62,7 +75,7 @@ def _target_table_rows() -> list[dict]:
                 "type": tg.get("type", "DB"),
                 "enabled": True,
                 "count": count,
-                "status": tg.get("status", "registered"),
+                "status": tg.get("status", "analyzed"),
             })
     return items
 
@@ -116,14 +129,16 @@ def create_target():
             conn.get("wsdl"), conn.get("service") or "default", conn.get("packages"))
         if not imp["ok"]:
             return error(f"WSDL 导入失败: {imp['message']}"), 400
-        conn = {**conn, "bo_class": imp["boClass"]}
-        target_id = repository.create_target(name, "SOAP", conn)
+        entities = imp.get("entities") or []
+        conn = {**conn, "bo_class": imp["boClass"], "entities": entities}
+        target_id = repository.create_target(name, "SOAP", conn, tables=entities)
         repository.update_target(target_id, {"status": "analyzed"})
         repository.save_target_interface({
             "id": target_id,
             "target_id": target_id,
             "name": name,
             "type": "SOAP",
+            "tables": entities,
             "config": {
                 "service": conn.get("service") or "default",
                 "wsdl": conn.get("wsdl"),
@@ -131,9 +146,9 @@ def create_target():
             },
         })
         return success({
-            "id": target_id, "bo_class": imp["boClass"],
+            "id": target_id, "bo_class": imp["boClass"], "entities": entities,
             "target": repository.get_target(target_id),
-        }, "SOAP 目标添加成功（WSDL 已导入生成 BO）")
+        }, "SOAP 目标添加成功（WSDL 已导入生成 BO 及实体分析）")
 
     if not conn.get("jdbc_url"):
         return error("缺少 JDBC 连接信息（jdbc_url）"), 400
@@ -150,7 +165,7 @@ def create_target():
 
 @targets_bp.post("/<target_id>/import")
 def import_target(target_id: str):
-    """（SOAP 目标）重新导入 WSDL，更新 BO 类。"""
+    """（SOAP 目标）重新导入 WSDL，更新 BO 类并重新分析实体与属性。"""
     tg = repository.get_target(target_id)
     if not tg:
         return error("数据目标不存在"), 404
@@ -161,9 +176,22 @@ def import_target(target_id: str):
         conn.get("wsdl", ""), conn.get("service") or "default", conn.get("packages"))
     if not imp["ok"]:
         return error(f"WSDL 导入失败: {imp['message']}"), 500
-    conn = {**conn, "bo_class": imp["boClass"]}
-    repository.update_target(target_id, {"connection": conn, "status": "analyzed"})
-    return success({"bo_class": imp["boClass"]}, "WSDL 重新导入成功")
+    entities = imp.get("entities") or []
+    conn = {**conn, "bo_class": imp["boClass"], "entities": entities}
+    repository.update_target(target_id, {"connection": conn, "tables": entities, "status": "analyzed"})
+    repository.save_target_interface({
+        "id": target_id,
+        "target_id": target_id,
+        "name": tg.get("name"),
+        "type": "SOAP",
+        "tables": entities,
+        "config": {
+            "service": conn.get("service") or "default",
+            "wsdl": conn.get("wsdl"),
+            "bo_class": imp["boClass"],
+        },
+    })
+    return success({"bo_class": imp["boClass"], "entities": entities}, "WSDL 重新导入与实体分析成功")
 
 
 

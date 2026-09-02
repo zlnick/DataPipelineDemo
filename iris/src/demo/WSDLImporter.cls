@@ -54,7 +54,84 @@ ClassMethod Import(wsdl As %String,
         Set tObj = {"ok":0, "message":("WSDL 导入完成但未找到生成的 BO 类（包 "_boPackage_"）")}
         Quit tObj.%ToJSON()
     }
-    Quit {"ok":1, "boClass":(tBoClass)}.%ToJSON()
+
+    Set tEntities = ..InspectEntities(boPackage, clientPackage)
+    Quit {"ok":1, "boClass":(tBoClass), "entities":(##class(%DynamicAbstractObject).%FromJSON(tEntities))}.%ToJSON()
+}
+
+/// 分析由 WSDL 生成的相关实体类及其字段属性
+ClassMethod InspectEntities(boPackage As %String = "demo.soap.bo",
+                            clientPackage As %String = "demo.soap.client") As %String
+{
+    Set tArr = []
+    Set tRS = ##class(%SQL.Statement).%New()
+    Set tSC = tRS.%Prepare(
+        "SELECT parent, Name, Type FROM %Dictionary.CompiledProperty " _
+        "WHERE (parent LIKE ? OR parent LIKE ? OR parent LIKE '%PatientService%') " _
+        "AND Name NOT LIKE '%%' " _
+        "ORDER BY parent, Name")
+    If $$$ISOK(tSC) {
+        Set tRset = tRS.%Execute("%" _ boPackage _ "%", "%" _ clientPackage _ "%")
+        Set tCurrentClass = ""
+        Set tCols = []
+        Set tFields = []
+        While tRset.%Next() {
+            Set tClass = tRset.%Get("parent")
+            // 过滤系统/框架类
+            If (tClass [ "bont.") || (tClass [ ".client.") Continue
+            
+            Set tPropName = tRset.%Get("Name")
+            // 过滤系统框架属性
+            If (tPropName = "Adapter") || (tPropName = "AlertOnError") || (tPropName = "RetryInterval") Continue
+
+            If (tCurrentClass '= "") && (tClass '= tCurrentClass) {
+                Set tEntityName = $Piece(tCurrentClass, ".", *)
+                If (tCols.%Size() > 0) {
+                    Do tArr.%Push({
+                        "entity_name": (tEntityName),
+                        "table": (tEntityName),
+                        "schema": "SOAP",
+                        "full_class": (tCurrentClass),
+                        "columns": (tCols),
+                        "fields": (tFields)
+                    })
+                }
+                Set tCols = []
+                Set tFields = []
+            }
+            Set tCurrentClass = tClass
+            Set tPropType = tRset.%Get("Type")
+            Set tSimpleType = $Piece(tPropType, ".", *)
+            If (tSimpleType [ "String") { Set tSimpleType = "string" }
+            ElseIf (tSimpleType [ "Integer") { Set tSimpleType = "integer" }
+            ElseIf (tSimpleType [ "Boolean") { Set tSimpleType = "boolean" }
+
+            Set tItem = {}
+            Set tItem.name = tPropName
+            Set tItem.type = tSimpleType
+            Do tCols.%Push(tItem)
+            Do tFields.%Push(tPropName)
+        }
+        If (tCurrentClass '= "") && (tCols.%Size() > 0) {
+            Set tEntityName = $Piece(tCurrentClass, ".", *)
+            // 避免重复
+            Set tFound = 0
+            For i=0:1:tArr.%Size()-1 {
+                If tArr.%Get(i).entity_name = tEntityName Set tFound = 1 Quit
+            }
+            If 'tFound {
+                Do tArr.%Push({
+                    "entity_name": (tEntityName),
+                    "table": (tEntityName),
+                    "schema": "SOAP",
+                    "full_class": (tCurrentClass),
+                    "columns": (tCols),
+                    "fields": (tFields)
+                })
+            }
+        }
+    }
+    Quit tArr.%ToJSON()
 }
 
 }
