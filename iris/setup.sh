@@ -72,6 +72,7 @@ do $SYSTEM.OBJ.Load("/shared/src/demo/TransformProcess.cls", "ck")
 do $SYSTEM.OBJ.Load("/shared/src/demo/TargetOperation.cls", "ck")
 do $SYSTEM.OBJ.Load("/shared/src/demo/PipelineGenerator.cls", "ck")
 do $SYSTEM.OBJ.Load("/shared/src/demo/PipelineQuery.cls", "ck")
+do $SYSTEM.OBJ.Load("/shared/src/demo/WSDLImporter.cls", "ck")
 write "COMPILE_DONE", !
 halt
 EOF
