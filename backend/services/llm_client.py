@@ -16,18 +16,19 @@ class AgentError(Exception):
 
 # ===== Agent A：数据转换（系统提示词） =====
 SYSTEM_PROMPT_TRANSFORMATION = (
-    "你是医疗数据集成专家。给定源数据资产（HL7 FHIR 资源类型及其关键字段）"
-    "与目标接口模型，为源资产集合生成 Transformation Plan；目标可以是数据库表或 SOAP WSDL 实体，"
+    "你是医疗数据集成专家。给定源数据资产（HL7 FHIR 资源或 SQL 数据库表及其字段）"
+    "与目标接口模型，为源资产集合生成 Transformation Plan；目标可以是数据库 SQL 表或 SOAP WSDL 实体，"
     "不能假设源表与目标实体一一对应，需根据字段、关系和接口结构决定一对一、多对一或一对多。"
-    "要求：1. 基于字段语义、主键关系和目标实体结构匹配，并生成 join/group_by/emit 策略。"
-    "2. field_mappings 的 source 使用表.字段或 FHIRPath 路径，target 使用目标实体路径，支持嵌套对象和数组。"
-    "3. 日期字段建议加 transform:date（提取 YYYY-MM-DD）。"
-    "4. 无法匹配的目标返回空列表即可。"
+    "要求：1. 基于字段语义、主键/关联字段和目标实体结构匹配，生成转换映射策略。"
+    "2. 当多张 SQL 源表映射到同一个目标实体（如主从表或多表拼接）时，需以主源表名或代表资产名作为 asset/source，"
+    "在 field_mappings 的 source 中使用 '表名.字段名' 或表达式，target 使用目标实体的字段路径。"
+    "3. 日期字段建议加 transform:date（提取 YYYY-MM-DD），拼接字段可写 concat 表达式。"
+    "4. 必须同时输出 recommendations 数组和 transformation_plan.mappings 数组！"
     "严格输出 JSON（不要输出其他文字），格式："
-    '{"recommendations":[{"asset":"Patient","target_table":"patient","confidence":0.92,'
-    '"reason":"字段高度匹配","field_mappings":[{"source":"id","target":"ID","transform":null},'
-    '{"source":"birthDate","target":"BirthDate","transform":"date"}]}],'
-    '"transformation_plan":{"source_models":[],"target_models":[],"mappings":[],"status":"draft"}}'
+    '{"recommendations":[{"asset":"PatientTable","target_table":"PatientEntity","confidence":0.90,'
+    '"reason":"根据 ID 和姓名字段精准匹配","field_mappings":[{"source":"PatientTable.ID","target":"PatientNo","transform":null},'
+    '{"source":"PatientTable.GivenName","target":"FullName","transform":null}]}],'
+    '"transformation_plan":{"source_models":[],"target_models":[],"mappings":[{"source":"PatientTable","target":"PatientEntity","field_mappings":[]}],"status":"draft"}}'
 )
 
 
@@ -95,9 +96,30 @@ def recommend_transformation(assets: list[dict], targets: list[dict],
          "source_models": source_models or assets,
          "target_models": target_models or targets}, ensure_ascii=False, indent=2)
     result = _call_llm(SYSTEM_PROMPT_TRANSFORMATION, user_content, "数据转换Agent")
-    recs = result.get("recommendations", [])
+    recs = result.get("recommendations")
     if not isinstance(recs, list):
-        raise AgentError("recommendations 必须是数组")
+        recs = []
+
+    # 容错提取：如果 recommendations 为空，但 transformation_plan.mappings 有值，自动提取构建
+    plan_mappings = (result.get("transformation_plan") or {}).get("mappings") or []
+    if not recs and isinstance(plan_mappings, list) and plan_mappings:
+        for i, pm in enumerate(plan_mappings, 1):
+            if isinstance(pm, dict):
+                src = (pm.get("source") or pm.get("source_asset") or pm.get("source_entity")
+                       or (assets[0].get("name") if assets else ""))
+                tgt = (pm.get("target") or pm.get("target_table") or pm.get("target_entity")
+                       or pm.get("emit") or (targets[0].get("table") if targets else ""))
+                fms = pm.get("field_mappings") or []
+                recs.append({
+                    "id": f"R{i}",
+                    "asset": src,
+                    "target_table": tgt,
+                    "confidence": 0.85,
+                    "reason": pm.get("reason") or f"从转换计划中自动提取 {src} ➔ {tgt} 映射",
+                    "field_mappings": fms,
+                })
+        result["recommendations"] = recs
+
     return result
 
 

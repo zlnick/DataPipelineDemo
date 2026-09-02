@@ -39,7 +39,8 @@ def recommend():
     recs = result.get("recommendations", [])
     # 归一化为映射结构（asset→source + 补 id），供 C1 验证-修复
     normalized = transformation_validator.normalize_recommendations(recs)
-    trans_fix = transformation_validator.validate_and_fix_transformation(normalized, assets)
+    trans_fix = transformation_validator.validate_and_fix_transformation(
+        normalized, assets, target_models=target_models or targets)
     if trans_fix["status"] == "ok":
         normalized = trans_fix["mappings"]
     else:

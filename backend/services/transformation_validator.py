@@ -46,13 +46,17 @@ def normalize_recommendations(recs: list[dict]) -> list[dict]:
     """
     normalized: list[dict] = []
     for i, r in enumerate(recs or [], 1):
+        src = (r.get("source") or r.get("asset") or r.get("source_asset")
+               or r.get("source_entity") or r.get("source_table") or "")
+        tgt = (r.get("target_table") or r.get("target") or r.get("target_entity")
+               or r.get("target_model") or r.get("emit") or "")
         normalized.append({
             "id": r.get("id") or f"R{i}",
-            "source": r.get("source") or r.get("asset") or "",
-            "target_table": r.get("target_table", ""),
+            "source": src,
+            "target_table": tgt,
             "field_mappings": r.get("field_mappings", []),
-            "confidence": r.get("confidence"),
-            "reason": r.get("reason"),
+            "confidence": r.get("confidence") or 0.85,
+            "reason": r.get("reason") or "AI 智能匹配",
         })
     return normalized
 
@@ -76,13 +80,14 @@ def judge_transformation(report: dict, context: dict,
     }
 
 
-def _l1_fix_mappings(mappings: list[dict]) -> tuple[list[dict], bool]:
+def _l1_fix_mappings(mappings: list[dict],
+                      target_models: list[dict] | None = None) -> tuple[list[dict], bool]:
     """L1 转换规则修复：剔除指向不存在目标列的字段映射（机械规则）。"""
     changed = False
     fixed: list[dict] = []
     for m in mappings or []:
         table = m.get("target_table", "")
-        cols = pipeline_validator._get_table_columns(table) if table else []
+        cols = pipeline_validator._get_table_columns(table, target_models) if table else []
         fms = []
         for fm in m.get("field_mappings", []):
             target = fm.get("target", "")
@@ -98,17 +103,20 @@ def _l1_fix_mappings(mappings: list[dict]) -> tuple[list[dict], bool]:
 
 def validate_and_fix_transformation(mappings: list[dict],
                                     assets: list[dict] | None = None,
+                                    target_models: list[dict] | None = None,
                                     max_rounds: int = 2) -> dict:
     """转换验证-修复闭环（≤2 轮）：事实检查 → L1 规则 → L2 LLM 决策 → 验证。
 
     参数:
         mappings: 转换关系列表（Agent A 输出或用户确认）
         assets: 源资产结构（含 fields），用于源路径检查（可选）
+        target_models: 目标模型列表（含 columns/fields，可选）
     返回:
         {"status": "ok"|"failed", "rounds": [...], "mappings", "report", "message"}
     """
     context = {
         "assets": assets or [],
+        "target_models": target_models or [],
         "mapping_count": len(mappings or []),
     }
     past_issues = pipeline_validator.load_validation_issues()
@@ -118,7 +126,7 @@ def validate_and_fix_transformation(mappings: list[dict],
 
     for round_i in range(max_rounds + 1):
         report = pipeline_validator.run_transformation_validation(
-            current_mappings, assets)
+            current_mappings, assets, target_models)
         errors = [i for i in report["issues"] if i.get("severity") == "error"]
         err_summary = "；".join(f"[{i.get('check')}] {i.get('message')}" for i in errors)
         rounds_log.append({"round": round_i, "error_count": len(errors),
@@ -129,7 +137,7 @@ def validate_and_fix_transformation(mappings: list[dict],
                     "message": "转换验证通过"}
 
         # L1 规则修复（机械规则：剔除坏列映射）
-        new_mappings, changed = _l1_fix_mappings(current_mappings)
+        new_mappings, changed = _l1_fix_mappings(current_mappings, target_models)
         if changed:
             current_mappings = new_mappings
             logger.info("转换 L1 规则修复生效: 映射改动=True")

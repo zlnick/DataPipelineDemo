@@ -17,17 +17,65 @@ logger = logging.getLogger(__name__)
 PRODUCTION_NAME = "demo.DataflowProduction"
 
 
-def _get_table_columns(table: str) -> list[str]:
-    """查询目标表列名（information_schema，按 ordinal_position 排序）。"""
-    rows = iris_connector.query(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema='SQLUser' AND table_name=? ORDER BY ordinal_position",
-        [table])
-    return [r[0] for r in rows]
+def _get_table_columns(table: str, target_models: list[dict] | None = None) -> list[str]:
+    """查询目标表/实体列名。
+
+    优先从传入的 target_models 或持久化的 Target/TargetInterface 获取列名结构
+    （支持 SOAP 实体或未建 SQL 表的目标）；无匹配时降级查 information_schema。
+    """
+    if not table:
+        return []
+
+    def _extract_cols(obj: dict) -> list[str]:
+        cols = obj.get("columns") or obj.get("fields") or []
+        res = []
+        for c in cols:
+            if isinstance(c, dict) and c.get("name"):
+                res.append(str(c["name"]))
+            elif isinstance(c, str) and c:
+                res.append(c)
+        return res
+
+    # 1. 优先从请求传入的 target_models / targets 匹配
+    for tm in target_models or []:
+        tm_table = tm.get("table") or tm.get("name") or tm.get("target_name") or ""
+        if tm_table == table:
+            cols = _extract_cols(tm)
+            if cols:
+                return cols
+
+    # 2. 查 Repository 中持久化的 Target / TargetInterface
+    try:
+        from backend.services import repository
+        for tg in repository.list_targets():
+            # SOAP 实体或 DB 表
+            for tb in tg.get("tables") or []:
+                tb_name = tb.get("table") or tb.get("entity_name") or ""
+                if tb_name == table:
+                    cols = _extract_cols(tb)
+                    if cols:
+                        return cols
+            # 兼容 target 顶层名/服务名
+            if tg.get("name") == table or (tg.get("connection") or {}).get("service") == table:
+                cols = _extract_cols(tg.get("connection") or {})
+                if cols:
+                    return cols
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("从 Repository 获取列名失败: %s", exc)
+
+    # 3. 降级查数据库 information_schema.columns
+    try:
+        rows = iris_connector.query(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='SQLUser' AND table_name=? ORDER BY ordinal_position",
+            [table])
+        return [r[0] for r in rows]
+    except Exception:  # noqa: BLE001
+        return []
 
 
-def check_recommendations(mappings: list[dict]) -> dict:
-    """检查转换关系：结构完整性 + 目标列名存在于目标表。
+def check_recommendations(mappings: list[dict], target_models: list[dict] | None = None) -> dict:
+    """检查转换关系：结构完整性 + 目标列名存在于目标表/实体。
 
     返回: {"ok": bool, "issues": [{"severity", "item", "message"}], "count": int}
     """
@@ -42,16 +90,16 @@ def check_recommendations(mappings: list[dict]) -> dict:
         if not table:
             issues.append({"severity": "error", "item": mid, "message": "缺少目标表 target_table"})
             continue
-        cols = _get_table_columns(table)
+        cols = _get_table_columns(table, target_models)
         if not cols:
             issues.append({"severity": "error", "item": mid,
-                           "message": f"目标表 {table} 不存在或列结构为空"})
+                           "message": f"目标表/实体 {table} 不存在或列结构为空"})
             continue
         for fm in m.get("field_mappings", []):
             target = fm.get("target", "")
             if target and target not in cols:
                 issues.append({"severity": "error", "item": f"{mid}.{target}",
-                               "message": f"目标列 {target} 不存在于表 {table}"})
+                               "message": f"目标列 {target} 不存在于目标表/实体 {table}"})
             if not fm.get("source"):
                 issues.append({"severity": "warning", "item": f"{mid}.{target}",
                                "message": "字段映射缺少 source 路径"})
@@ -60,8 +108,11 @@ def check_recommendations(mappings: list[dict]) -> dict:
 
 
 def _path_root(path: str) -> str:
-    """取路径首段（不含下标），如 name[0].family → name。"""
-    return (path or "").split("[")[0].split(".")[0]
+    """取路径首段（不含下标和表名前缀），如 name[0].family → name；PatientTable.ID → ID。"""
+    p = (path or "").strip()
+    if "." in p and not p.startswith("concat"):
+        p = p.split(".", 1)[1]
+    return p.split("[")[0].split(".")[0]
 
 
 def check_source_fields(assets: list[dict], mappings: list[dict]) -> dict:
@@ -71,20 +122,26 @@ def check_source_fields(assets: list[dict], mappings: list[dict]) -> dict:
     （不阻塞），由转换验证 Agent 判断是否语义错配。
     """
     issues: list[dict] = []
+    all_known_fields: set[str] = set()
     asset_roots: dict[str, set[str]] = {}
     for a in assets or []:
-        asset_roots[a.get("name", "")] = {_path_root(f) for f in a.get("fields", [])}
+        fs = set(a.get("fields", []))
+        all_known_fields.update(fs)
+        asset_roots[a.get("name", "")] = fs | {_path_root(f) for f in fs}
+
     for m in mappings or []:
         src = m.get("source", "")
-        known = asset_roots.get(src, set())
+        known = asset_roots.get(src, all_known_fields)
         if not known:
             continue  # 资产未登记字段，跳过
         for fm in m.get("field_mappings", []):
             path = fm.get("source", "")
             root = _path_root(path)
-            if root and root not in known:
-                issues.append({"severity": "warning", "item": f"{m.get('id', '?')}.{path}",
-                               "message": f"源路径 {path} 不在资产 {src} 的已知字段中"})
+            # 函数/常量/已有已知字段均算合法
+            if path.startswith("concat(") or " " in path or root in known or root in all_known_fields:
+                continue
+            issues.append({"severity": "warning", "item": f"{m.get('id', '?')}.{path}",
+                           "message": f"源路径 {path} 不在资产 {src} 的已知字段中"})
     return {"ok": True, "issues": issues}
 
 
@@ -209,13 +266,14 @@ def run_validation(mappings: list[dict], topology: dict | None,
             "error_count": len(errors), "warning_count": len(warnings)}
 
 
-def run_transformation_validation(mappings: list[dict], assets: list[dict] | None = None) -> dict:
+def run_transformation_validation(mappings: list[dict], assets: list[dict] | None = None,
+                                target_models: list[dict] | None = None) -> dict:
     """转换关系专项验证（供转换验证-修复 Agent C1 使用）。
 
     覆盖：映射结构/目标列存在性（error）+ 源字段路径（warning）。
     """
     results = {
-        "recommendations": check_recommendations(mappings),
+        "recommendations": check_recommendations(mappings, target_models),
         "source_fields": check_source_fields(assets or [], mappings),
     }
     issues: list[dict] = []
