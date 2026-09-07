@@ -2,10 +2,10 @@
   <div class="recommend-page">
     <!-- 输入区：选择资产 + 目标表 -->
     <el-card shadow="never" class="mb16">
-      <template #header><span class="card-title">选择数据资产与转换目标</span></template>
+      <template #header><span class="card-title">{{ t('recommend.title') }}</span></template>
       <el-form :inline="true" label-width="100px">
-        <el-form-item label="数据资产（多选）">
-          <el-select v-model="selectedAssets" multiple filterable style="width: 400px" placeholder="选择要转换的数据资产">
+        <el-form-item :label="t('recommend.assetMulti')">
+          <el-select v-model="selectedAssets" multiple filterable style="width: 400px" :placeholder="t('recommend.assetPlaceholder')">
             <el-option
               v-for="a in allAssets"
               :key="a.id"
@@ -13,18 +13,18 @@
             >
               <span>{{ a.type === 'SQL_TABLE' ? '[SQL] ' : '' }}{{ a.name }}</span>
               <span class="gray" style="float: right; font-size: 12px">
-                {{ a.type === 'SQL_TABLE' ? (a.fields || []).length + ' 列' : 'FHIR' }}
+                {{ a.type === 'SQL_TABLE' ? (a.fields || []).length + t('recommend.colUnit') : 'FHIR' }}
               </span>
             </el-option>
           </el-select>
         </el-form-item>
-        <el-form-item label="转换目标（多选）">
+        <el-form-item :label="t('recommend.targetMulti')">
           <el-select
             v-model="selectedTargets"
             multiple
             filterable
             style="width: 400px"
-            placeholder="选择要转成的目标表或 SOAP 实体"
+            :placeholder="t('recommend.targetPlaceholder')"
           >
             <el-option
               v-for="t in targets"
@@ -40,21 +40,16 @@
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="recommending" @click="handleRecommend">
-            <el-icon class="mr4"><MagicStick /></el-icon>AI 智能匹配
+            <el-icon class="mr4"><MagicStick /></el-icon>{{ t('recommend.aiMatch') }}
           </el-button>
         </el-form-item>
       </el-form>
-      <el-alert
-        title="AI 将根据资产字段语义与目标表列结构，推荐「资产 → 目标表」匹配并生成字段级映射。需在 .env 中配置 LLM_API_KEY（OpenAI 兼容服务）。"
-        type="warning"
-        :closable="false"
-        show-icon
-      />
+      <el-alert :title="t('recommend.alert')" type="warning" :closable="false" show-icon />
     </el-card>
 
     <!-- 验证报告（AI 推荐后的转换关系验证状态） -->
     <el-card shadow="never" v-if="validation" class="mb16">
-      <template #header><span class="card-title">转换关系验证报告</span></template>
+      <template #header><span class="card-title">{{ t('recommend.validationTitle') }}</span></template>
       <el-alert :title="validationTitle" :type="validationType" :closable="false" show-icon />
       <el-table
         v-if="validation.issues && validation.issues.length"
@@ -63,51 +58,51 @@
         size="small"
         class="mt8"
       >
-        <el-table-column label="检查项" width="130">
+        <el-table-column :label="t('recommend.validationCheck')" width="130">
           <template #default="{ row }">
             <el-tag size="small">{{ CHECK_NAMES[row.check] || row.check }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="级别" width="90">
+        <el-table-column :label="t('recommend.validationSeverity')" width="90">
           <template #default="{ row }">
             <el-tag size="small" :type="row.severity === 'error' ? 'danger' : 'warning'">
-              {{ row.severity === 'error' ? '错误' : '警告' }}
+              {{ row.severity === 'error' ? t('recommend.severityError') : t('recommend.severityWarning') }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="item" label="对象" width="170" />
-        <el-table-column prop="message" label="说明" min-width="240" />
+        <el-table-column prop="item" :label="t('recommend.validationItem')" width="170" />
+        <el-table-column prop="message" :label="t('recommend.validationMessage')" min-width="240" />
       </el-table>
     </el-card>
 
     <!-- 推荐结果 -->
     <el-card shadow="never" v-if="recommendations.length">
       <template #header>
-        <span class="card-title">AI 推荐结果（{{ recommendations.length }} 条）</span>
+        <span class="card-title">{{ t('recommend.results', { n: recommendations.length }) }}</span>
         <el-button size="small" type="success" style="float: right" @click="confirmAll">
-          全部确认并保存转换关系
+          {{ t('recommend.confirmAll') }}
         </el-button>
       </template>
 
       <div v-for="rec in recommendations" :key="rec.asset + rec.target_table" class="rec-item">
         <el-descriptions :column="4" border size="small">
-          <el-descriptions-item label="源资产">
+          <el-descriptions-item :label="t('recommend.sourceAsset')">
             <el-tag type="success">{{ rec.asset }}</el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="目标表">
+          <el-descriptions-item :label="t('recommend.targetTable')">
             <el-tag type="primary">{{ rec.target_table }}</el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="置信度">
+          <el-descriptions-item :label="t('recommend.confidence')">
             <el-progress :percentage="Math.round((rec.confidence || 0) * 100)" :stroke-width="10" style="width: 120px" />
           </el-descriptions-item>
-          <el-descriptions-item label="理由">{{ rec.reason }}</el-descriptions-item>
+          <el-descriptions-item :label="t('recommend.reason')">{{ rec.reason }}</el-descriptions-item>
         </el-descriptions>
 
-        <div class="mt8 mb8"><b>字段映射：</b></div>
+        <div class="mt8 mb8"><b>{{ t('recommend.fieldMapping') }}</b></div>
         <el-table :data="rec.field_mappings" border size="small" class="fm-table">
-          <el-table-column prop="source" label="源字段（FHIRPath）" min-width="220" />
-          <el-table-column prop="target" label="目标列" min-width="140" />
-          <el-table-column prop="transform" label="转换" width="100">
+          <el-table-column prop="source" :label="t('recommend.sourceField')" min-width="220" />
+          <el-table-column prop="target" :label="t('recommend.targetCol')" min-width="140" />
+          <el-table-column prop="transform" :label="t('recommend.transform')" width="100">
             <template #default="{ row }">
               <el-tag v-if="row.transform" size="small" type="warning">{{ row.transform }}</el-tag>
               <span v-else class="gray">—</span>
@@ -118,7 +113,7 @@
     </el-card>
 
     <el-card shadow="never" v-else>
-      <el-empty description="尚未进行 AI 匹配，请选择资产后点击「AI 智能匹配」" />
+      <el-empty :description="t('recommend.emptyDesc')" />
     </el-card>
   </div>
 </template>
@@ -126,11 +121,13 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { aiApi, datasourceApi, mappingApi, modelApi, targetApi } from '../api/dataflow'
 
 const route = useRoute()
 const router = useRouter()
+const { t } = useI18n()
 
 const allAssets = ref([])
 const selectedAssets = ref([])
@@ -142,10 +139,10 @@ const recommendations = ref([])
 const transformationPlan = ref(null)
 const validation = ref(null)
 
-// 检查项名称映射（后端 check 字段 → 中文）
+// 验证检查项名称（后端 check 字段 → 本地化标签）
 const CHECK_NAMES = {
-  recommendations: '映射校验',
-  source_fields: '源字段检查',
+  recommendations: t('recommend.checkRecommendations'),
+  source_fields: t('recommend.checkSourceFields'),
 }
 
 // 验证报告标题（按状态/错误数生成）
@@ -155,10 +152,10 @@ const validationTitle = computed(() => {
   const warns = v.warning_count || 0
   if (!v.ok) {
     return warns
-      ? `验证发现 ${v.error_count} 个错误、${warns} 个警告`
-      : `验证发现 ${v.error_count} 个错误`
+      ? t('recommend.validationErrorWarn', { n: v.error_count, m: warns })
+      : t('recommend.validationError', { n: v.error_count })
   }
-  return warns ? `验证通过（${warns} 个警告）` : '转换关系验证通过'
+  return warns ? t('recommend.validationOkWarn', { n: warns }) : t('recommend.validationOk')
 })
 
 // 验证报告 alert 类型：有错误 error / 有警告 warning / 全部通过 success
@@ -240,11 +237,11 @@ async function loadTargets() {
 
 async function handleRecommend() {
   if (!selectedAssets.value.length) {
-    ElMessage.warning('请先选择数据资产')
+    ElMessage.warning(t('recommend.warnSelectAsset'))
     return
   }
   if (!selectedTargets.value.length) {
-    ElMessage.warning('请选择要转换的目标表或 SOAP 实体')
+    ElMessage.warning(t('recommend.warnSelectTarget'))
     return
   }
   recommending.value = true
@@ -253,9 +250,9 @@ async function handleRecommend() {
     recommendations.value = data?.recommendations || []
     transformationPlan.value = data?.transformation_plan || null
     validation.value = data?.validation || null
-    ElMessage.success(`AI 推荐完成，共 ${recommendations.value.length} 条建议`)
+    ElMessage.success(t('recommend.recommendDone', { n: recommendations.value.length }))
     if (validation.value && !validation.value.ok) {
-      ElMessage.warning(`转换验证发现 ${validation.value.error_count} 个错误，请检查后确认`)
+      ElMessage.warning(t('recommend.validationWarnMessage', { n: validation.value.error_count }))
     }
   } finally {
     recommending.value = false
@@ -293,7 +290,7 @@ async function confirmAll() {
   }
   await modelApi.createPlan(plan)
   await mappingApi.save(mappings)
-  ElMessage.success('转换关系已保存，可前往「转换关系」查看或「管道监控」生成管道')
+  ElMessage.success(t('recommend.saved'))
   router.push('/mappings')
 }
 

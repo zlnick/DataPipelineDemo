@@ -72,8 +72,72 @@ import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { agentApi } from '../api/dataflow'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const agents = ref([])
+
+// 英文页：Agent/Skill 能力卡元数据由前端词典覆盖（后端返回中文，仅界面翻译层处理）
+const EN_AGENTS = {
+  'interface-analyzer-agent': {
+    name: 'Interface Analyzer',
+    role: 'Source/Target interface semantic analyst',
+    purpose: 'Builds AI conclusions on top of deterministic facts (CapabilityStatement / columns / WSDL entities / runtime contract): asset semantics & polling-key hints, target direction (write/read), and a natural-language reading of the runtime contract. Written back to assets/targets and runtime.note.ai as context for Agent A/B.',
+    input: 'Probed facts (capability / columns / WSDL / runtime contract, credentials masked)',
+    output: 'ai_semantics / key_hint / direction / ai_reason + runtime.note.ai',
+    trigger: 'Auto on datasource profile analysis / SQL table select / SOAP import / DB table select',
+    capabilities: ['Asset semantics', 'Polling-key hints', 'Direction (write/read)', 'Contract interpretation'],
+    engine: 'Single-shot LLM prompt (interface_analyzer); explicit error on failure',
+  },
+  'transformation-agent': {
+    name: 'Transformation Generation',
+    role: 'Healthcare data integration expert',
+    purpose: 'Generates asset-to-target matching and field-level mappings based on source field semantics and target columns/write semantics.',
+    input: 'Source assets + target structures + runtime contracts (masked)',
+    output: 'recommendations (asset → target + field mappings)',
+    trigger: 'AI Matching',
+    capabilities: ['Field semantics', 'FHIRPath', 'concat() expr', 'table.column prefix', 'date transform'],
+    engine: 'Single-shot LLM prompt',
+  },
+  'transformation-validate-agent': {
+    name: 'Transformation Validation Agent',
+    role: 'Transformation validation expert',
+    purpose: 'Validates and fixes field mappings (target column existence, source paths, semantic mismatches) before pipeline generation (per group in multi-pipeline).',
+    input: 'Agent A / user mappings + asset structures',
+    output: 'Fixed mappings + validation report',
+    trigger: 'After AI Matching, before pipeline generation',
+    capabilities: ['Target column check', 'Source path check', 'Mismatch judgment', 'Mapping fix'],
+    engine: 'Fact-check tools + LLM decisions (L1 rules → L2 LLM ≤2 rounds)',
+  },
+  'pipeline-agent': {
+    name: 'Pipeline Design',
+    role: 'IRIS interoperability architect',
+    purpose: 'Generates the pipeline component topology from confirmed mappings and source/target runtime contracts. AI decides the component set & order (incl. multiple target tables / multiple pipelines); the registry only fills className/settings and backfills essentials (marked ai_supplemented).',
+    input: 'Confirmed mappings + runtime contracts (masked) + component enumeration (+ interface semantics)',
+    output: 'pipeline topology (AI-decided composition, registry parameterized)',
+    trigger: 'Generate pipeline',
+    capabilities: ['Component composition', 'Heterogeneous combos', 'Multi-pipeline', 'Source routing', 'AI-auditable'],
+    engine: 'LLM topology generation (recommend_pipeline) + registry parameterization',
+  },
+  'pipeline-validate-agent': {
+    name: 'Pipeline Validation Agent',
+    role: 'IRIS pipeline validation & fix expert',
+    purpose: 'Validates and fixes pipeline generation: topology/compile/start/message flow (incl. mixed multi-pipeline types); auto rebuild once on failure and stores experience into ^demo.ValidationIssue.',
+    input: 'Generation result + topology + source/target types + past issues',
+    output: 'Report + fix actions + experience',
+    trigger: 'Generation failed or validation failed (single/multi unified)',
+    capabilities: ['Topology check', 'Compile check', 'Start check', 'Smoke test', 'Layered fix', 'Experience store'],
+    engine: 'Fact-check tools + LLM decisions (L1 → L2 LLM ≤2 rounds → L3 default)',
+  },
+  'knowledge-polish-agent': {
+    name: 'Knowledge Polish',
+    role: 'Healthcare IT knowledge-base editor',
+    purpose: 'Reviews, deduplicates and restructures the validation experience stored in ^demo.ValidationIssue into structured knowledge (title/problem/solution/prevention), written to the Obsidian vault for human retrieval.',
+    input: 'Recent validation issues (may include duplicates of the same failure)',
+    output: 'Deduped, restructured knowledge items',
+    trigger: 'export_validation_issues.py before writing knowledge/04-Pitfalls',
+    capabilities: ['Semantic dedup', 'Restructure', 'Obsidian export'],
+    engine: 'Single-shot LLM prompt (llm_client.polish_validation_issues); explicit error on failure',
+  },
+}
 
 // 按 kind 分组：Skill（单轮 LLM 技能）区 与 Agent（工具+修复循环）区
 const skillAgents = computed(() => agents.value.filter((a) => a.kind === 'skill'))
@@ -81,7 +145,11 @@ const agentAgents = computed(() => agents.value.filter((a) => a.kind === 'agent'
 
 async function loadAgents() {
   const data = await agentApi.list()
-  agents.value = data?.items || []
+  let items = data?.items || []
+  if (locale.value === 'en') {
+    items = items.map((a) => (EN_AGENTS[a.id] ? { ...a, ...EN_AGENTS[a.id] } : a))
+  }
+  agents.value = items
 }
 
 onMounted(loadAgents)

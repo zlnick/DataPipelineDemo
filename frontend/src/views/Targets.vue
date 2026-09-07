@@ -2,54 +2,52 @@
   <div class="targets-page">
     <!-- ① 添加数据目标 -->
     <el-card shadow="never" class="mb16">
-      <template #header><span class="card-title">添加数据目标</span></template>
+      <template #header><span class="card-title">{{ t('targets.addHeader') }}</span></template>
       <el-form :inline="true" label-width="90px" @submit.prevent>
-        <el-form-item label="名称">
-          <el-input v-model="form.name" placeholder="如：模拟远端数据库" style="width: 170px" />
+        <el-form-item :label="t('targets.fldName')">
+          <el-input v-model="form.name" :placeholder="t('targets.namePlaceholder')" style="width: 170px" />
         </el-form-item>
-        <el-form-item label="类型">
+        <el-form-item :label="t('targets.fldType')">
           <el-select v-model="form.type" style="width: 130px">
             <el-option
               v-for="opt in TARGET_TYPES"
               :key="opt.value"
-              :label="opt.label + (opt.enabled ? '' : '（预留）')"
+              :label="typeLabel(opt.value) + (opt.enabled ? '' : '（' + t('targets.reserved') + '）')"
               :value="opt.value"
               :disabled="!opt.enabled"
             >
               <el-tooltip :content="opt.desc" placement="left" :disabled="opt.enabled">
-                <span>{{ opt.label }}{{ opt.enabled ? '' : '（预留，暂未实现）' }}</span>
+                <span>{{ typeLabel(opt.value) }}{{ opt.enabled ? '' : '（' + t('targets.reserved') + '）' }}</span>
               </el-tooltip>
             </el-option>
           </el-select>
         </el-form-item>
         <!-- DB 目标：JDBC 连接 -->
-        <el-form-item v-if="form.type === 'DB'" label="JDBC URL">
+        <el-form-item v-if="form.type === 'DB'" :label="t('targets.fldJdbcUrl')">
           <el-input v-model="form.jdbc_url" placeholder="jdbc:IRIS://iris:1972/USER" style="width: 320px" />
         </el-form-item>
-        <el-form-item v-if="form.type === 'DB'" label="驱动类">
+        <el-form-item v-if="form.type === 'DB'" :label="t('targets.fldDriver')">
           <el-input v-model="form.driver_class" placeholder="com.intersystems.jdbc.IRISDriver" style="width: 260px" />
         </el-form-item>
-        <el-form-item v-if="form.type === 'DB'" label="用户名">
+        <el-form-item v-if="form.type === 'DB'" :label="t('targets.fldUser')">
           <el-input v-model="form.username" placeholder="superuser" style="width: 120px" />
         </el-form-item>
-        <el-form-item v-if="form.type === 'DB'" label="密码">
+        <el-form-item v-if="form.type === 'DB'" :label="t('targets.fldPass')">
           <el-input v-model="form.password" type="password" placeholder="SYS" style="width: 120px" show-password />
         </el-form-item>
         <!-- SOAP 目标：WSDL 导入型 -->
-        <el-form-item v-if="form.type === 'SOAP'" label="WSDL">
-          <el-input v-model="form.wsdl" placeholder="WSDL 地址或文件路径" style="width: 320px" />
+        <el-form-item v-if="form.type === 'SOAP'" :label="t('targets.fldWsdl')">
+          <el-input v-model="form.wsdl" :placeholder="t('targets.phWsdl')" style="width: 320px" />
         </el-form-item>
-        <el-form-item v-if="form.type === 'SOAP'" label="服务名">
+        <el-form-item v-if="form.type === 'SOAP'" :label="t('targets.fldService')">
           <el-input v-model="form.service" placeholder="PatientService" style="width: 180px" />
         </el-form-item>
         <el-form-item>
-          <el-button type="primary" :loading="creating" @click="handleCreate">添加数据目标</el-button>
+          <el-button type="primary" :loading="creating" @click="handleCreate">{{ t('targets.addBtn') }}</el-button>
         </el-form-item>
       </el-form>
       <el-alert
-        :title="form.type === 'SOAP'
-          ? '说明：SOAP 目标为「WSDL 导入型」——添加时自动读 WSDL 生成 Business Operation（BO），BO 作为管道投放组件，无需手写 SOAP 请求构造。'
-          : '说明：数据库连接与目标发现（schema / 表 / 列）全程通过 JDBC 保障通用性；示例连接 IRIS 模拟远端库（jdbc:IRIS://iris:1972/USER）。'"
+        :title="form.type === 'SOAP' ? t('targets.soapInfo') : t('targets.dbInfo')"
         type="info"
         :closable="false"
         show-icon
@@ -59,26 +57,26 @@
     <!-- ② 数据目标管理 -->
     <el-card shadow="never" class="mb16">
       <template #header>
-        <span class="card-title">数据目标管理</span>
-        <el-button size="small" style="float: right" @click="loadManage">刷新</el-button>
+        <span class="card-title">{{ t('targets.mgmtTitle') }}</span>
+        <el-button size="small" style="float: right" @click="loadManage">{{ t('pipelines.refreshBtn') }}</el-button>
       </template>
       <el-table :data="managers" v-loading="manageLoading" border stripe>
-        <el-table-column prop="name" label="名称" min-width="140" />
-        <el-table-column prop="type" label="类型" width="80" />
-        <el-table-column prop="status" label="状态" width="100">
+        <el-table-column prop="name" :label="t('targets.fldName')" min-width="140" />
+        <el-table-column prop="type" :label="t('targets.fldType')" width="80" />
+        <el-table-column prop="status" :label="t('targets.colStatus')" width="100">
           <template #default="{ row }">
             <el-tag :type="row.status === 'analyzed' ? 'success' : row.status === 'connected' ? 'primary' : row.status === 'error' ? 'danger' : 'warning'">
-              {{ row.status === 'analyzed' ? '已分析' : row.status === 'connected' ? '已连接' : row.status === 'error' ? '连接失败' : '已注册' }}
+              {{ row.status === 'analyzed' ? t('targets.analyzed') : row.status === 'connected' ? t('targets.connected') : row.status === 'error' ? t('targets.failed') : t('targets.registered') }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="已选表" width="80">
+        <el-table-column :label="t('targets.colSelected')" width="80">
           <template #default="{ row }">
             <span v-if="row.type === 'SOAP'">—</span>
-            <span v-else>{{ (row.tables || []).length }} 个</span>
+            <span v-else>{{ t('targets.selCount', { n: (row.tables || []).length }) }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="connection" label="连接信息" min-width="220" show-overflow-tooltip>
+        <el-table-column prop="connection" :label="t('targets.colConn')" min-width="220" show-overflow-tooltip>
           <template #default="{ row }">
             <template v-if="row.type === 'SOAP'">
               <el-tag size="small" type="info">{{ row.connection?.service || 'default' }}</el-tag>
@@ -87,12 +85,12 @@
             <template v-else>{{ row.connection?.jdbc_url }}</template>
           </template>
         </el-table-column>
-        <el-table-column label="投递语义" min-width="220">
+        <el-table-column :label="t('targets.colDelivery')" min-width="220">
           <template #default="{ row }">
             <template v-if="row.type === 'SOAP'">
               <div v-for="op in (row.runtime?.capabilities?.operations || [])" :key="op.name" class="mb4">
                 <el-tag size="small" :type="op.kind === 'write' ? 'success' : 'warning'">
-                  {{ op.name }} · {{ op.kind === 'write' ? '写入' : '查询' }}
+                  {{ op.name }} · {{ op.kind === 'write' ? t('targets.opWrite') : t('targets.opQuery') }}
                 </el-tag>
               </div>
               <div v-if="row.runtime?.delivery?.note" class="mb4 gray sm">{{ row.runtime.delivery.note }}</div>
@@ -100,19 +98,19 @@
             <template v-else><el-tag size="small" type="info">DB UPSERT</el-tag></template>
             <el-tooltip :content="(row.runtime?.health?.detail) || ''" placement="top">
               <el-tag size="small" :type="row.runtime?.health?.ok ? 'success' : 'danger'">
-                {{ row.runtime?.health?.ok ? '可达' : '待探查' }}
+                {{ row.runtime?.health?.ok ? t('targets.reachOk') : t('targets.reachNa') }}
               </el-tag>
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column :label="t('targets.colOps')" width="220" fixed="right">
           <template #default="{ row }">
             <template v-if="row.type === 'SOAP'">
-              <el-button size="small" :loading="importingId === row.id" @click="handleImport(row)">重新导入 WSDL</el-button>
+              <el-button size="small" :loading="importingId === row.id" @click="handleImport(row)">{{ t('targets.btnReimport') }}</el-button>
             </template>
             <template v-else>
-              <el-button size="small" :loading="testingId === row.id" @click="handleTest(row)">联通测试</el-button>
-              <el-button size="small" type="primary" @click="openWizard(row)">选择目标表</el-button>
+              <el-button size="small" :loading="testingId === row.id" @click="handleTest(row)">{{ t('targets.test') }}</el-button>
+              <el-button size="small" type="primary" @click="openWizard(row)">{{ t('targets.selectTables') }}</el-button>
             </template>
           </template>
         </el-table-column>
@@ -122,83 +120,83 @@
     <!-- ③ 已选目标表 -->
     <el-card shadow="never">
       <template #header>
-        <span class="card-title">已选目标表（供 AI 匹配与管道投放）</span>
-        <el-button size="small" style="float: right" @click="loadTargetTables">刷新</el-button>
+        <span class="card-title">{{ t('targets.selected') }}</span>
+        <el-button size="small" style="float: right" @click="loadTargetTables">{{ t('pipelines.refreshBtn') }}</el-button>
       </template>
       <el-table :data="targetTables" v-loading="tablesLoading" border stripe>
-        <el-table-column prop="target_name" label="所属目标" min-width="130" />
-        <el-table-column prop="table" label="表名" min-width="130">
+        <el-table-column prop="target_name" :label="t('targets.colOwner')" min-width="130" />
+        <el-table-column prop="table" :label="t('targets.colTable')" min-width="130">
           <template #default="{ row }"><el-tag type="primary">{{ row.table }}</el-tag></template>
         </el-table-column>
-        <el-table-column prop="schema" label="Schema" min-width="100" />
-        <el-table-column label="列结构" min-width="300">
+        <el-table-column prop="schema" :label="t('targets.colSchema')" min-width="100" />
+        <el-table-column :label="t('targets.colCols')" min-width="300">
           <template #default="{ row }">
             <el-tag v-for="c in row.columns" :key="c" size="small" class="mr6 mb4">{{ c }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="count" label="行数" width="80" />
-        <el-table-column label="操作" width="120" fixed="right">
+        <el-table-column prop="count" :label="t('targets.colRows')" width="80" />
+        <el-table-column :label="t('targets.colOps')" width="120" fixed="right">
           <template #default="{ row }">
-            <el-button v-if="row.type !== 'SOAP'" size="small" type="primary" plain @click="showData(row.table)">查看数据</el-button>
-            <el-tag v-else size="small" type="info">SOAP 实体</el-tag>
+            <el-button v-if="row.type !== 'SOAP'" size="small" type="primary" plain @click="showData(row.table)">{{ t('targets.btnView') }}</el-button>
+            <el-tag v-else size="small" type="info">{{ t('targets.soapEntity') }}</el-tag>
           </template>
         </el-table-column>
       </el-table>
     </el-card>
 
     <!-- 选择目标表向导 -->
-    <el-dialog v-model="wizardVisible" :title="`选择目标表 — ${currentName}`" width="720px">
+    <el-dialog v-model="wizardVisible" :title="t('targets.wizTitle', { name: currentName })" width="720px">
       <el-steps :active="wizardStep" finish-status="success" align-center class="mb16">
-        <el-step title="联通测试" />
-        <el-step title="选择 Schema" />
-        <el-step title="选择目标表" />
-        <el-step title="分析列并保存" />
+        <el-step :title="t('targets.stepTest')" />
+        <el-step :title="t('targets.stepSchema')" />
+        <el-step :title="t('targets.stepTables')" />
+        <el-step :title="t('targets.stepSave')" />
       </el-steps>
 
       <div v-if="wizardStep === 0" class="center">
-        <el-button type="primary" :loading="testingId === currentId" @click="doTest">执行联通测试</el-button>
+        <el-button type="primary" :loading="testingId === currentId" @click="doTest">{{ t('targets.btnRunTest') }}</el-button>
         <el-tag v-if="testResult !== null" :type="testResult ? 'success' : 'danger'" class="ml12">
-          {{ testResult ? '连接成功' : '连接失败' }}
+          {{ testResult ? t('targets.connOk') : t('targets.connFail') }}
         </el-tag>
       </div>
 
       <div v-else-if="wizardStep === 1">
-        <el-alert class="mb12" title="选择要分析的数据库 schema（如 SQLUser）" type="info" :closable="false" />
-        <el-select v-model="wizardSchema" placeholder="请选择 schema" filterable style="width: 100%">
+        <el-alert class="mb12" :title="t('targets.schema')" type="info" :closable="false" />
+        <el-select v-model="wizardSchema" :placeholder="t('targets.phSchema')" filterable style="width: 100%">
           <el-option v-for="s in schemaList" :key="s" :label="s" :value="s" />
         </el-select>
         <div class="mt12">
-          <el-button type="primary" :disabled="!wizardSchema" @click="loadWizardTables">下一步：列出表</el-button>
+          <el-button type="primary" :disabled="!wizardSchema" @click="loadWizardTables">{{ t('targets.btnNext') }}</el-button>
         </div>
       </div>
 
       <div v-else-if="wizardStep === 2">
-        <el-alert class="mb12" title="勾选要作为数据目标的表" type="info" :closable="false" />
+        <el-alert class="mb12" :title="t('targets.checkNote')" type="info" :closable="false" />
         <el-table :data="wizardTables" border max-height="300" @selection-change="onTableSelect">
           <el-table-column type="selection" width="50" />
-          <el-table-column prop="table" label="表名" min-width="160" />
-          <el-table-column prop="type" label="类型" width="90" />
+          <el-table-column prop="table" :label="t('targets.colTable')" min-width="160" />
+          <el-table-column prop="type" :label="t('targets.fldType')" width="90" />
         </el-table>
         <div class="mt12">
-          <el-button @click="wizardStep = 1">上一步</el-button>
+          <el-button @click="wizardStep = 1">{{ t('targets.btnPrev') }}</el-button>
           <el-button type="primary" :disabled="!checkedTables.length" @click="saveSelectedTables">
-            保存所选表并分析列
+            {{ t('targets.btnSaveCols') }}
           </el-button>
         </div>
       </div>
 
       <div v-else>
-        <el-alert title="目标表已保存并完成列结构分析，可在下方「已选目标表」查看。" type="success" :closable="false" />
+        <el-alert :title="t('targets.savedNote')" type="success" :closable="false" />
         <div v-for="t in savedResult" :key="t.table" class="mt12">
           <b>{{ t.table }}：</b>
           <el-tag v-for="c in t.columns" :key="c.name" size="small" class="mr6">{{ c.name }}</el-tag>
         </div>
-        <div class="mt12"><el-button type="primary" @click="closeWizard">完成</el-button></div>
+        <div class="mt12"><el-button type="primary" @click="closeWizard">{{ t('targets.btnDone') }}</el-button></div>
       </div>
     </el-dialog>
 
     <!-- 表数据对话框 -->
-    <el-dialog v-model="dataVisible" :title="`${currentTable} 表数据`" width="860px">
+    <el-dialog v-model="dataVisible" :title="t('targets.viewDataTitle', { t: currentTable })" width="860px">
       <el-table :data="rows" border stripe max-height="480">
         <el-table-column
           v-for="col in columns"
@@ -209,16 +207,25 @@
           show-overflow-tooltip
         />
       </el-table>
-      <div class="mt12">共 {{ rows.length }} 行</div>
+      <div class="mt12">{{ t('targets.rows', { n: rows.length }) }}</div>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { TARGET_TYPES } from '../api/constants'
 import { targetApi } from '../api/dataflow'
+
+const { t } = useI18n()
+
+// 类型显示名（value → 本地化 label）
+function typeLabel(v) {
+  const map = { DB: t('targets.tDB'), SOAP: t('targets.tSOAP'), FHIR: t('targets.tFHIR'), REST: t('targets.tREST') }
+  return map[v] || v
+}
 
 const managers = ref([])
 const targetTables = ref([])
@@ -229,7 +236,7 @@ const testingId = ref('')
 const importingId = ref('')
 
 const form = reactive({
-  name: '模拟远端数据库',
+  name: t('targets.defName'),
   type: 'DB',
   jdbc_url: 'jdbc:IRIS://iris:1972/USER',
   driver_class: 'com.intersystems.jdbc.IRISDriver',
@@ -262,15 +269,15 @@ async function loadTargetTables() {
 
 async function handleCreate() {
   if (!form.name.trim()) {
-    ElMessage.warning('请填写目标名称')
+    ElMessage.warning(t('targets.warnName'))
     return
   }
   if (form.type === 'DB' && !form.jdbc_url.trim()) {
-    ElMessage.warning('请填写 JDBC URL')
+    ElMessage.warning(t('targets.fldJdbcUrl'))
     return
   }
   if (form.type === 'SOAP' && !form.wsdl.trim()) {
-    ElMessage.warning('SOAP 目标需要提供 WSDL 地址')
+    ElMessage.warning(t('targets.wsdlNeeded'))
     return
   }
   creating.value = true
@@ -284,7 +291,7 @@ async function handleCreate() {
           password: form.password,
         }
     await targetApi.create({ name: form.name.trim(), type: form.type, connection })
-    ElMessage.success(form.type === 'SOAP' ? 'SOAP 目标添加成功（WSDL 已导入生成 BO 及实体分析）' : '数据目标添加成功')
+    ElMessage.success(form.type === 'SOAP' ? t('targets.soapCreated') : t('targets.dbCreated'))
     await Promise.all([loadManage(), loadTargetTables()])
   } finally {
     creating.value = false
@@ -295,7 +302,7 @@ async function handleTest(row) {
   testingId.value = row.id
   try {
     const data = await targetApi.test(row.id)
-    ElMessage.success(`连接成功（${data?.product || 'JDBC'}）`)
+    ElMessage.success(t('targets.testOkDetail', { p: data?.product || 'JDBC' }))
   } catch {
     // 错误提示已由拦截器处理
   } finally {
@@ -308,7 +315,7 @@ async function handleImport(row) {
   importingId.value = row.id
   try {
     const data = await targetApi.import(row.id)
-    ElMessage.success(`WSDL 重新导入成功（BO: ${data?.bo_class || ''}）`)
+    ElMessage.success(t('targets.reimportOk', { b: data?.bo_class || '' }))
   } catch {
     // 错误提示已由拦截器处理
   } finally {
@@ -348,12 +355,12 @@ async function doTest() {
     const data = await targetApi.test(currentId.value)
     testResult.value = data?.ok === true
     if (testResult.value) {
-      ElMessage.success('联通测试通过')
+      ElMessage.success(t('targets.testPassed'))
       wizardStep.value = 1
       const schemas = await targetApi.schemas(currentId.value)
       schemaList.value = schemas?.items || []
     } else {
-      ElMessage.error('连接失败')
+      ElMessage.error(t('targets.connFail'))
     }
   } finally {
     testingId.value = ''
@@ -383,7 +390,7 @@ async function saveSelectedTables() {
     const data = await targetApi.selectTables(currentId.value, selected)
     savedResult.value = data?.saved || []
     wizardStep.value = 3
-    ElMessage.success(`已保存 ${data?.count ?? 0} 个目标表并完成列分析`)
+    ElMessage.success(t('targets.saved', { n: data?.count ?? 0 }))
     await Promise.all([loadManage(), loadTargetTables()])
   } catch {
     // 错误提示已由拦截器处理

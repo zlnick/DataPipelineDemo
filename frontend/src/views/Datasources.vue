@@ -12,12 +12,12 @@
             <el-option
               v-for="opt in DATA_SOURCE_TYPES"
               :key="opt.value"
-              :label="opt.label + (opt.enabled ? '' : t('datasources.reserved'))"
+              :label="dsTypeLabel(opt.value) + (opt.enabled ? '' : t('datasources.reserved'))"
               :value="opt.value"
               :disabled="!opt.enabled"
             >
               <el-tooltip :content="opt.desc" placement="left" :disabled="opt.enabled">
-                <span>{{ opt.label }}{{ opt.enabled ? '' : t('datasources.reservedTip') }}</span>
+                <span>{{ dsTypeLabel(opt.value) }}{{ opt.enabled ? '' : t('datasources.reservedTip') }}</span>
               </el-tooltip>
             </el-option>
           </el-select>
@@ -93,7 +93,7 @@
         <el-table-column :label="t('datasources.actions')" width="220" fixed="right">
           <template #default="{ row }">
             <template v-if="row.type === 'SQL'">
-              <el-button size="small" type="primary" @click="openSourceWizard(row)">选择数据表</el-button>
+              <el-button size="small" type="primary" @click="openSourceWizard(row)">{{ t('datasources.selectTables') }}</el-button>
               <el-button size="small" @click="goAssets(row.id)">{{ t('datasources.assets') }}</el-button>
             </template>
             <template v-else>
@@ -137,46 +137,46 @@
     </el-dialog>
 
     <!-- SQL 源选表向导（连通 → schema → 表 → 分析列） -->
-    <el-dialog v-model="srcWizardVisible" :title="`选择数据表 — ${srcCurrentName}`" width="680px">
+    <el-dialog v-model="srcWizardVisible" :title="t('datasources.srcWizTitle', { name: srcCurrentName })" width="680px">
       <el-steps :active="srcStep" finish-status="success" align-center class="mb16">
-        <el-step title="联通测试" />
-        <el-step title="选择 Schema" />
-        <el-step title="选择数据表" />
-        <el-step title="分析列并保存" />
+        <el-step :title="t('datasources.stepTest')" />
+        <el-step :title="t('datasources.stepSchema')" />
+        <el-step :title="t('datasources.stepTables')" />
+        <el-step :title="t('datasources.stepSave')" />
       </el-steps>
 
       <div v-if="srcStep === 0" class="center">
-        <el-button type="primary" :loading="srcTesting" @click="doSourceTest">执行联通测试</el-button>
+        <el-button type="primary" :loading="srcTesting" @click="doSourceTest">{{ t('datasources.btnRunTest') }}</el-button>
         <el-tag v-if="srcTestResult !== null" :type="srcTestResult ? 'success' : 'danger'" class="ml12">
-          {{ srcTestResult ? '连接成功' : '连接失败' }}
+          {{ srcTestResult ? t('datasources.connOk') : t('datasources.connFail') }}
         </el-tag>
       </div>
 
       <div v-else-if="srcStep === 1">
-        <el-alert class="mb12" title="选择要作为数据源的数据库 schema（如 SQLUser）" type="info" :closable="false" />
-        <el-select v-model="srcSchema" placeholder="请选择 schema" filterable style="width: 100%">
+        <el-alert class="mb12" :title="t('datasources.schemaAlert')" type="info" :closable="false" />
+        <el-select v-model="srcSchema" :placeholder="t('datasources.phSchema')" filterable style="width: 100%">
           <el-option v-for="s in srcSchemas" :key="s" :label="s" :value="s" />
         </el-select>
         <div class="mt12 center">
-          <el-button type="primary" :disabled="!srcSchema" @click="loadSourceTables">下一步：列出表</el-button>
+          <el-button type="primary" :disabled="!srcSchema" @click="loadSourceTables">{{ t('datasources.btnNext') }}</el-button>
         </div>
       </div>
 
       <div v-else-if="srcStep === 2">
-        <el-alert class="mb12" title="勾选要作为数据源的表（选表后自动生成轮询 Query）" type="info" :closable="false" />
+        <el-alert class="mb12" :title="t('datasources.checkAlert')" type="info" :closable="false" />
         <el-table :data="srcTables" border max-height="320" @selection-change="onSrcSelChange">
           <el-table-column type="selection" width="50" />
-          <el-table-column prop="table" label="表名" min-width="160" />
-          <el-table-column prop="type" label="类型" width="90" />
+          <el-table-column prop="table" :label="t('datasources.colTable')" min-width="160" />
+          <el-table-column prop="type" :label="t('datasources.colType')" width="90" />
         </el-table>
         <div class="mt12 center">
-          <el-button type="primary" :disabled="!srcChecked.length" @click="saveSourceTables">分析列并保存</el-button>
+          <el-button type="primary" :disabled="!srcChecked.length" @click="saveSourceTables">{{ t('datasources.btnSaveCols') }}</el-button>
         </div>
       </div>
 
       <div v-else class="center">
-        <el-alert title="数据表已保存：列结构已分析，轮询 Query 已自动生成（可在「资产」查看）。" type="success" :closable="false" />
-        <div class="mt12"><el-button type="primary" @click="srcWizardVisible = false">完成</el-button></div>
+        <el-alert :title="t('datasources.doneAlert')" type="success" :closable="false" />
+        <div class="mt12"><el-button type="primary" @click="srcWizardVisible = false">{{ t('datasources.btnDone') }}</el-button></div>
       </div>
     </el-dialog>
   </div>
@@ -193,6 +193,17 @@ import { datasourceApi } from '../api/dataflow'
 const router = useRouter()
 const { t } = useI18n()
 const list = ref([])
+
+// 数据源类型显示名（value → 本地化 label）
+function dsTypeLabel(v) {
+  const map = {
+    FHIR: t('datasources.typeFHIR'),
+    SQL: t('datasources.typeSQL'),
+    REST: t('datasources.typeREST'),
+    SOAP: t('datasources.typeSOAP'),
+  }
+  return map[v] || v
+}
 const loading = ref(false)
 const creating = ref(false)
 const analyzingId = ref('')
@@ -200,7 +211,7 @@ const analysisVisible = ref(false)
 const analysis = ref(null)
 
 const form = reactive({
-  name: 'IRIS内置FHIR',
+  name: t('datasources.defName'),
   type: 'FHIR',
   endpoint: 'http://iris:52773/csp/healthshare/fhirserver/fhir/r4/',
   username: 'superuser',
@@ -228,14 +239,14 @@ function runtimeSummary(row) {
   const poll = rt.poll || {}
   if (kind === 'FHIR') {
     const mode = caps.incremental_search
-      ? `增量 ${caps.incremental_search}`
-      : (poll.note ? '全量（增量受限）' : '全量')
+      ? t('datasources.incSearch', { m: caps.incremental_search })
+      : (poll.note ? t('datasources.fullLimited') : t('datasources.full'))
     return `FHIR ${caps.fhir_version || '-'} · ${mode}`
   }
   if (kind === 'SQL') {
     const q = (rt.connection || {}).query || ''
     const tbl = q.includes('FROM ') ? q.split('FROM ').pop().trim() : ''
-    return `轮询 ${tbl || '-'} · 增量键 ${poll.key_column || '-'}`
+    return t('datasources.pollSummary', { t: tbl || '-', k: poll.key_column || '-' })
   }
   return '-'
 }
@@ -256,7 +267,7 @@ async function handleCreate() {
     return
   }
   if (form.type === 'SQL' && !form.jdbc_url.trim()) {
-    ElMessage.warning('SQL 数据源需要填写 JDBC URL')
+    ElMessage.warning(t('datasources.warnJdbc'))
     return
   }
   creating.value = true
@@ -366,7 +377,7 @@ async function saveSourceTables() {
   try {
     const data = await datasourceApi.selectTables(srcCurrentId.value, tables)
     srcStep.value = 3
-    ElMessage.success(`已保存 ${data?.count || tables.length} 个数据表（轮询 Query 已自动生成）`)
+    ElMessage.success(t('datasources.savedTables', { n: data?.count || tables.length }))
     await loadList()
   } catch {
     // 错误提示已由拦截器处理
