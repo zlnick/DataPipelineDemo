@@ -38,6 +38,20 @@ CREATE_TABLES_SQL = [
         City VARCHAR(50)
     )
     """,
+    # SQL 源演示表（模拟"第三方业务库"患者表，结构与 Patient 一致但独立）：
+    # 供 SQL→SOAP 管道的 SQL 源轮询使用，避免与 FHIR→DB 目标表（Patient）同表造成回环
+    """
+    CREATE TABLE PatientSource (
+        ID VARCHAR(20) PRIMARY KEY,
+        FamilyName VARCHAR(50),
+        GivenName VARCHAR(50),
+        Gender VARCHAR(20),
+        BirthDate VARCHAR(20),
+        Phone VARCHAR(20),
+        Address VARCHAR(200),
+        City VARCHAR(50)
+    )
+    """,
     # 检验观察目标表（对应 FHIR Observation）
     """
     CREATE TABLE Observation (
@@ -60,6 +74,15 @@ CREATE_TABLES_SQL = [
         ResourceJson VARCHAR(10000),
         MappingId VARCHAR(50),
         Status VARCHAR(20) DEFAULT 'pending'
+    )
+    """,
+    # SOAP 写入型目标演示表（Python mock 收到 AddPatient 实体后保存于此，
+    # 便于演示「转换后的三字段实体投递到第三方 HIS 成功」）
+    """
+    CREATE TABLE PatientEntity (
+        PatientNo VARCHAR(20) PRIMARY KEY,
+        FullName VARCHAR(100),
+        Gender VARCHAR(20)
     )
     """,
 ]
@@ -88,13 +111,15 @@ def create_tables(conn) -> None:
     """创建目标表与队列表（已存在则先删除，保证脚本可重复执行）。"""
     cursor = conn.cursor()
     try:
+        cursor.execute("DROP TABLE IF EXISTS PatientEntity")
+        cursor.execute("DROP TABLE IF EXISTS PatientSource")
         cursor.execute("DROP TABLE IF EXISTS FHIRQueue")
         cursor.execute("DROP TABLE IF EXISTS Observation")
         cursor.execute("DROP TABLE IF EXISTS Patient")
         for sql in CREATE_TABLES_SQL:
             cursor.execute(sql)
         conn.commit()
-        logger.info("目标表/队列表创建完成：Patient / Observation / FHIRQueue")
+        logger.info("目标表/队列表创建完成：Patient / PatientSource / Observation / FHIRQueue / PatientEntity")
     finally:
         cursor.close()
 

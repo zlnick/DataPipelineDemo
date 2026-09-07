@@ -27,14 +27,29 @@ FHIR 端点 → 自动分析 Profile → 注册数据源 → 发现数据资产(
 只有用户在管道监控页面点击“生成 / 重建数据管道”后，系统才会调用 AI 设计
 Production 拓扑并交给 IRIS 编译启动。
 
-- **数据源管理**：注册 FHIR 数据源（IRIS 自带 FHIR Server），自动分析 CapabilityStatement（Profile / 资源类型 / 支持的操作）。
-- **数据资产**：FHIR 接口中的资源类型（如 Patient / Observation / MedicationRequest）即数据资产，由 Profile 分析自动发现并注册。
-- **AI 智能匹配**：选择资产后，AI（OpenAI 兼容接口，可配 DeepSeek/通义/智谱/Kimi 等）推荐「资产 → 目标表」匹配、置信度与字段级映射，用户确认。
-- **转换关系**：保存并查看已确认的转换关系（源资产 → 目标表 + 字段映射）。
-- **数据管道（增量同步 + 传统模式）**：一键生成 IRIS Production 管道：`FHIRSyncService`（定时按 `_lastUpdated` 游标**增量抓取**）→ 队列表 `FHIRQueue` → `FHIRService`（**逐条处理，每条数据独立会话**）→ `TransformProcess`（字段映射）→ `SQL Operation`（`EnsLib.SQL.Operation.GenericOperation`，JDBC UPSERT 投放，按目标表动态生成 `SQLOp_<表>`）。
-- **管道监控**：实时消息流转日志（Ens.MessageHeader 真实消息历史）、目标表落库结果。
-- **转换目标（JDBC 分步发现）**：用户可**添加数据目标**（JDBC 连接，保障通用性）→ 联通测试 → 选择 schema → 列出表 → 勾选目标表 → **自动分析列结构**；预置「模拟远端数据库」目标（Patient / Observation 表）。
-- **类型预留**：数据源（数据库/REST/SOAP）与转换目标（FHIR/REST/SOAP）为预留类型，界面渲染禁用态 + 提示，便于后续扩展。
+- **数据源（FHIR / SQL）**：
+  - FHIR：注册端点后自动分析 CapabilityStatement（Profile / 资源类型 / 操作），发现 FHIR 资源资产。
+  - SQL：JDBC 向导（联通测试 → 选 schema → 选表 → 分析列结构），自动生成轮询 Query，源资产=所选表。
+- **转换目标（DB / SOAP）**：
+  - DB：JDBC 向导（联通测试 → 选 schema → 勾选目标表 → 分析列结构）。
+  - SOAP：WSDL 导入型（读 WSDL 自动生成 BO + 实体分析），数据管道把**转换后的实体**作为请求消息投递；
+    内置示例为**写入型 AddPatient**（扁平三字段），被调系统由 Python mock 承担（`backend/services/mock_soap.py`，
+    收到实体后落库 `PatientEntity` 表并返回回执）。
+- **连接运行契约（Connection Contract）**：添加源/目标时由**连接探查 Agent**
+  （`connection_profiler`）探测并产出归一 `runtime` 契约（connection / capabilities / poll / delivery / health）——
+  FHIR 增量能力、SQL 轮询增量键、SOAP **操作语义判定**（写入型/查询型）、端点可达性。
+  该契约为前端向导、AI 上下文、管道生成、自动验证的**单一参数来源**（详见 `docs/ConnectionContract-设计.md`）。
+- **AI 智能匹配与转换关系**：AI 推荐「资产 → 目标表/实体」匹配与字段级映射（支持 `concat()` 等表达式），用户确认保存。
+- **数据管道（单 Production 可多管道）**：一键生成 IRIS Production 管道，支持异构组合（FHIR→DB / SQL→DB / SQL→SOAP / FHIR→SOAP）
+  以及**单 Production 多套并存**（`POST /api/pipelines/generate` body `pipelines: [组1, 组2]`）：
+  - 路由 BP `TransformProcess` 按**消息来源**（源 BS）查路由表 `^demo.Config("pipe", 源名)` 分发到对应目标（SOAPOp / SQLOp）
+  - FHIR 增量：`FHIRSyncService`（`_lastUpdated` 游标）→ `FHIRQueue` → `FHIRService`（逐条独立会话）→ 转换 → 投放
+  - SQL 轮询：`EnsLib.SQL.Service.GenericService`（Query/KeyFieldName 增量）→ 行 JSON → 转换 → 投放
+- **自动测试-修复闭环**：generate 前置**连通性检查**（用运行时契约）→ C1 转换验证 → C2 管道验证
+  （拓扑/编译/启动/消息）→ 分层修复（规则 → AI ≤2 轮 → 回退），多管道同样走 C2。
+- **动态选项**：前端页面（资产/目标/可查看数据表）的选项**由演示过程登记的内容动态生成**（API 驱动，非写死）。
+- **管道监控**：实时消息流转日志（Ens.MessageHeader 真实消息历史）、目标表落库结果（动态可选表）。
+
 
 ## 技术架构
 
@@ -48,10 +63,23 @@ Production 拓扑并交给 IRIS 编译启动。
 | 编排部署 | Docker Compose（三容器） |
 
 **IRIS 双角色（单实例）**：
-- **FHIRSERVER namespace**：FHIR Server（数据源），承载 CapabilityStatement 与示例资源（10 Patient + 30 Observation）
-- **USER namespace**：转换平台——目标表（模拟远端数据库）、互操作性 Production、Mapping 配置
+- **FHIRSERVER namespace**：FHIR Server（数据源），承载 CapabilityStatement 与示例资源（Patient / Observation 等）
+- **USER namespace**：转换平台——目标表（模拟远端库/落库）、互操作性 Production、Mapping 与运行契约配置
 
-**数据管道（Production）**：`FHIRService`（定时拉取 FHIR，CallInterval=15s）→ `TransformProcess`（Embedded Python 字段映射转换）→ `SQL Operation`（`EnsLib.SQL.Operation.GenericOperation`，JDBC 连接 `localTarget` 指向本实例 USER namespace，`INSERT OR UPDATE` UPSERT 写入目标表）。
+**演示数据表（SQLUser schema，结构与语义）**：
+| 表 | 语义 | 数据来源 |
+| ---- | ---- | ---- |
+| `Patient` / `Observation` | FHIR→DB 目标落库（FHIR 资源转换写入） | FHIR 管道 / 亦可用于 SQL 源（向导自行选择即可） |
+| `PatientSource` | SQL 源演示表（与 Patient 同结构，模拟“第三方业务库”） | 手工/脚本插入，供 SQL→SOAP 管道轮询 |
+| `PatientEntity` | SOAP 投递结果（Python mock 收到 AddPatient 实体后落库） | mock 写入 |
+| `FHIRQueue` | FHIR 增量抓取队列表（FHIRSyncService 入队，FHIRService 消费） | FHIRSyncService |
+
+**数据管道（Production）**：`TransformProcess`（路由 BP，Embedded Python 字段映射转换，支持 `concat()` 表达式与 `表.列` 前缀）：
+- FHIR 源：`FHIRSyncService`（`_lastUpdated` 增量游标）→ `FHIRQueue` → `FHIRService`（逐条独立会话）→ `TransformProcess`
+- SQL 源：`EnsLib.SQL.Service.GenericService`（JDBC 轮询，Query + KeyFieldName）→ 行 JSON → `TransformProcess`
+- 目标：`SQLOp_<表>`（JDBC `localTarget` UPSERT）；`SOAPOp_<服务>`（WSDL 导入 BO + Adapter WebServiceURL 指向远端/mock）
+- 路由：`TransformProcess` 用消息来源（`SourceConfigName`）查 `^demo.Config("pipe", 源BS名)` 分发（单 Production 多套并存）
+
 
 ## 快速启动
 
@@ -140,7 +168,7 @@ LLM_MODEL=deepseek-chat                        # 模型名
 │   ├── app.py                # 应用入口（注册全部路由蓝图）
 │   ├── config.py             # IRIS/FHIR/LLM 配置
 │   ├── schemas/              # Pydantic 模型
-│   ├── services/             # repository(global) / fhir_client / profile_analyzer / llm_client / iris_connector
+│   ├── services/             # repository(global/归一runtime) / connection_profiler(探查Agent) / mock_soap / fhir_client / profile_analyzer / llm_client / iris_connector / wsdl_importer / pipeline_validator / validate_agent / transformation_validator / type_registry
 │   └── routes/               # datasources / targets / ai / mappings / pipelines
 ├── frontend/                 # Vue 3 + Element Plus
 │   └── src/
@@ -157,23 +185,36 @@ LLM_MODEL=deepseek-chat                        # 模型名
 └── knowledge -> 知识库软链接
 ```
 
-## 演示步骤（从零开始，每步均有按钮触发）
+## 演示步骤（从零开始，页面选项随演示进度动态出现）
 
-> 系统启动后处于**空白演示态**：无预置数据源/数据目标/资产/映射，操作者现场逐步完成全流程。
+> 系统启动后处于**空白演示态**：无预置数据源/目标/资产/映射；页面（资产/目标/可查看表）只出现你已登记的内容。
+> 重置环境：`python cleanup_demo.py`（清配置/Production/表数据/消息历史）。
 
-1. **添加数据源**：「数据源管理」→ 表单**已预填默认值**（名称 `IRIS内置FHIR`、端点 `http://iris:52773/csp/healthshare/fhirserver/fhir/r4/`、认证 superuser/SYS）→ 直接点击「注册数据源」。
-2. **触发解析数据资产**：注册后点击该行的 **「Profile 分析」** 按钮 → 自动解析 CapabilityStatement，发现 145 个数据资产（Patient / Observation 等）。
-3. **添加数据目标**：「转换目标」→ 表单**已预填默认值**（名称 `模拟远端数据库`、JDBC URL `jdbc:IRIS://iris:1972/USER`、驱动类默认、认证 superuser/SYS）→ 直接点击「添加数据目标」。
-4. **触发目标发现**：点击该目标的 **「联通测试」** → 通过后进入向导：选择 schema（`SQLUser`）→ 勾选目标表（`Patient` / `Observation`）→ 自动分析列结构 → 保存。
-5. **AI 智能匹配**：「AI 智能匹配」→ 选择 `Patient` → 点击「AI 智能匹配」→ 查看推荐的目标表与字段映射 → 确认保存转换关系。
-6. **生成数据管道**：「管道监控」→ 点击「生成 / 重建数据管道」→ IRIS Production 自动生成并启动（含 `FHIRSyncService` 增量同步抓取器 + `FHIRService` 队列表逐条处理）。
-7. **增量同步演示**：初始游标在预置数据之后，目标表为空；点击 **「🎲 生成模拟数据（演示增量）」** → 平台自动往 FHIR 写入模拟数据（`lastUpdated` 晚于游标）→ 下个同步周期自动增量抓取 → 逐条独立会话转换 → 约 12 秒后自动刷新落库结果。
-8. **概览**：返回「项目概览」查看整体统计。
+### A. FHIR → DB（数据源 = FHIR 资源）
+1. **添加 FHIR 数据源**：「数据源管理」→ 端点 `http://iris:52773/csp/healthshare/fhirserver/fhir/r4/`、认证 `superuser/SYS` → 注册 → **Profile 分析**（自动产出运行契约：版本/增量能力/健康）。
+2. **添加 DB 目标**：「转换目标」→ JDBC `jdbc:IRIS://iris:1972/USER`、认证 superuser/SYS → 添加 → 联通测试 → 选 schema `SQLUser` → 勾选目标表（`Patient`/`Observation`）→ 分析列结构 → 保存。
+3. **AI 智能匹配**：选 `Patient` 资产 → AI 推荐字段映射 → 确认保存。
+4. **生成管道**：「管道监控」→ 生成 → FHIR 增量同步自动抓取 FHIR Server 数据 → 转换 → `Patient` 表落库（Pipelines 目标数据下拉动态可选 `Patient` 查看）。
+5. **看效果**：往 FHIR 写新资源（或用「生成模拟数据」按钮）→ 增量抓取 → 消息 Completed → 落库。
+
+### B. SQL → SOAP（数据源 = SQL 表，目标 = 第三方 SOAP 接口，Python mock 应答）
+1. **添加 SQL 数据源**：数据源向导 → JDBC 连接 → 选 schema → 选表 **`PatientSource`**（与 Patient 同结构的“业务库”演示表）→ 分析列 → 自动生成轮询 Query。
+2. **添加 SOAP 目标**：转换目标 → SOAP → WSDL `/tmp/patient.wsdl`（内置**写入型 AddPatient**）→ 导入生成 BO + 实体分析（运行契约自动判定 `AddPatient → 写入型`、endpoint 可达）。
+3. **AI 智能匹配**：选 `PatientSource`（SQL 资产，列即字段）→ AI 推荐 → 确认（mapping 自动带 `target_type=SOAP`）。
+4. **生成管道**：SQLService 轮询 `PatientSource` → 转换 → `SOAPOp_PatientService` 调用 mock（WebServiceURL）→ mock 收到实体 → 落库 `PatientEntity` 表并回执。
+5. **看效果**：往 `PatientSource` 插几行患者 → SQLService 轮询投递 → Pipelines 消息 Completed + `PatientEntity` 可见（下拉动态含 `PatientEntity`/`PatientSource`）。
+
+### C. 多管道并存（单 Production 内 FHIR→DB 与 SQL→SOAP 同时跑）
+- 前端一次确认多组转换关系后，生成 body 走 `pipelines: [组1, 组2]`；
+  `TransformProcess` 按来源（`SQLService`/`FHIRService`）路由到各自目标，消息互不干扰。
+- 注意：SQL 源表与 FHIR 目标表**不要用同一张**（否则 FHIR 写入会被 SQL 源再轮询产生回环，demo 已内置独立 `PatientSource` 表避免）。
 
 ## 说明与限制
 
 - 本项目为技术演示用途，示例数据均为程序生成，不涉及真实患者信息。
 - IRIS 登录统一 `superuser` / `SYS`；FHIR 资源读写需 Basic Auth（仅 `/metadata` 匿名公开）。
-- 数据源仅实现 **FHIR**；数据库 / REST / SOAP 数据源与 FHIR / REST / SOAP 目标为**预留类型**（界面禁用态，扩展时启用 `enabled` 标记即可）。
+- SOAP 目标演示默认指向 **Python mock**（`backend/services/mock_soap.py`，`Config.MOCK_SOAP_URL`）；
+  真实接入时在目标连接信息里填真实 endpoint 即可（Adapter `WebServiceURL` 覆盖 WSDL 地址）。
 - 目标表写入为 UPSERT（存在则更新），管道定时拉取重复执行不冲突。
 - `init_data.py` / `init_fhir_data.py` 每次后端启动会重建目标表并重新提交 FHIR 示例数据，适合演示；生产环境不应自动清表。
+- **注意：不要修改 IRIS 的 Web Application / Security 权限**（管理门户与 Ensemble 门户依赖，属外部环境）。

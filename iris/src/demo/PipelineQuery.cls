@@ -1,10 +1,10 @@
 Class demo.PipelineQuery Extends %RegisteredObject
 {
 
-/// 目标表白名单（防止表名注入，Demo 固定两个目标表）
+/// 目标表白名单（防止表名注入，Demo 固定目标表 + SOAP 远端落库演示表）
 ClassMethod IsAllowedTable(pTable As %String) As %Boolean
 {
-    if (pTable = "Patient") || (pTable = "Observation") quit 1
+    if (pTable = "Patient") || (pTable = "Observation") || (pTable = "PatientEntity") || (pTable = "PatientSource") quit 1
     quit 0
 }
 

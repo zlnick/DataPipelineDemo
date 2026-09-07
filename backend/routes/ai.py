@@ -4,12 +4,49 @@ import logging
 
 from flask import Blueprint, request
 
-from backend.services import domain_models, llm_client, transformation_validator
+from backend.services import domain_models, llm_client, repository, transformation_validator
 from backend.utils import error, success
 
 logger = logging.getLogger(__name__)
 
 ai_bp = Blueprint("ai", __name__, url_prefix="/api/ai")
+
+
+def _enrich_ai_semantics(assets: list[dict], targets: list[dict]) -> tuple[list[dict], list[dict]]:
+    """把接口分析 Agent 的 AI 语义结论（资产/目标）补充进 Agent A 的上下文。
+
+    只做上下文增强（assets/targets 载荷结构保持不变，缺省字段补全），不改变 LLM 决策。
+    """
+    asset_by_name = {}
+    for a in repository.list_assets() or []:
+        if a.get("name") and (a.get("ai_semantics") or a.get("description")):
+            asset_by_name[str(a["name"]).lower()] = a
+    assets = [dict(a) for a in assets]
+    for a in assets:
+        rec = asset_by_name.get(str(a.get("name", "")).lower())
+        if not rec:
+            continue
+        a.setdefault("description", rec.get("ai_semantics") or rec.get("description") or "")
+        a.setdefault("ai_semantics", rec.get("ai_semantics") or "")
+        a.setdefault("key_hint", rec.get("key_hint") or "")
+
+    # 目标（表/实体）语义：方向判定与说明来自目标记录（接口分析 Agent 写回）
+    tg_by_table = {}
+    for tg in repository.list_targets() or []:
+        for tb in tg.get("tables") or []:
+            nm = tb.get("entity_name") or tb.get("table") or ""
+            if nm and (tb.get("ai_semantics") or tb.get("direction")):
+                tg_by_table[str(nm).lower()] = tb
+    targets = [dict(t) for t in targets]
+    for t in targets:
+        nm = t.get("table") or t.get("entity_name") or t.get("name") or ""
+        rec = tg_by_table.get(str(nm).lower())
+        if not rec:
+            continue
+        t.setdefault("ai_semantics", rec.get("ai_semantics") or "")
+        t.setdefault("direction", rec.get("direction") or "")
+        t.setdefault("ai_reason", rec.get("ai_reason") or "")
+    return assets, targets
 
 
 @ai_bp.post("/recommend")
@@ -27,6 +64,7 @@ def recommend():
         return error("缺少目标表列表（targets）"), 400
 
     try:
+        assets, targets = _enrich_ai_semantics(assets, targets)
         result = llm_client.recommend_transformation(
             assets, targets, source_models=source_models or assets,
             target_models=target_models or targets)

@@ -59,6 +59,56 @@ ClassMethod Import(wsdl As %String,
     Quit {"ok":1, "boClass":(tBoClass), "entities":(##class(%DynamicAbstractObject).%FromJSON(tEntities))}.%ToJSON()
 }
 
+/// 从 BO 的 MessageMap XData 解析请求消息类（如 PatientService.demo.soap.bo.AddPatientRequest）。
+/// 供 Python 侧登记 ^demo.Config("soap","request_class")，TransformProcess.PackSOAPRequest 使用。
+ClassMethod GetRequestClass(boClass As %String) As %String
+{
+    Set tMsgClass = ""
+    Set tXData = ##class(%Dictionary.CompiledXData).%OpenId(boClass _ "||MessageMap")
+    If $isobject(tXData) {
+        Set tXml = tXData.Data.Read()
+        // MessageMap 形如 <MapItem MessageType="Xxx.请求消息类"><Method>...</Method></MapItem>
+        // 取 MessageType=" 之后到下一个双引号之间的值
+        Set tPart = $piece(tXml, "MessageType=""", 2)
+        Set tMsgClass = $piece(tPart, """", 1)
+    }
+    Quit tMsgClass
+}
+
+/// 解析 BO 的 MessageMap：返回 [{"method":..., "requestClass":...}] JSON 数组字符串。
+/// 供 connection_profiler 做 SOAP 目标操作语义判定（写入型 vs 查询型）。
+ClassMethod GetMessageMap(boClass As %String) As %String
+{
+    Set tArr = []
+    Set tXData = ##class(%Dictionary.CompiledXData).%OpenId(boClass _ "||MessageMap")
+    If $isobject(tXData) {
+        Set tXml = tXData.Data.Read()
+        // 逐 <MapItem ...> 段：MessageType="X" <Method>Y</Method>
+        Set tI = 1
+        For {
+            Set tSeg = $piece(tXml, "<MapItem ", tI + 1)
+            If tSeg = "" Quit
+            Set tSeg = $piece(tSeg, "</MapItem>", 1)
+            If tSeg '= "" {
+                Set tMsgType = ""
+                Set tMt = $piece(tSeg, "MessageType=", 2)
+                If tMt '= "" {
+                    Set tMt = $extract(tMt, 2, *)  // 去开引号
+                    Set tMsgType = $piece(tMt, """", 1)  // 到闭引号
+                }
+                Set tMethod = ""
+                Set tMm = $piece(tSeg, "<Method>", 2)
+                If tMm '= "" {
+                    Set tMethod = $piece(tMm, "</Method>", 1)
+                }
+                Do tArr.%Push({"method": (tMethod), "requestClass": (tMsgType)})
+            }
+            Set tI = tI + 1
+        }
+    }
+    Quit tArr.%ToJSON()
+}
+
 /// 分析由 WSDL 生成的相关实体类及其字段属性
 ClassMethod InspectEntities(boPackage As %String = "demo.soap.bo",
                             clientPackage As %String = "demo.soap.client") As %String

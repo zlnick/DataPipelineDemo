@@ -17,8 +17,8 @@ SOURCE_COMPONENTS = {
     "SQL": [
         {"type": "SQLService", "className": "EnsLib.SQL.Service.GenericService",
          "role": "service", "comment": "SQL 轮询服务（定时执行查询，逐行入队）",
-         "adapter_settings": {"DSN": ""},
-         "host_settings": {"Query": "", "KeyFieldName": ""}},
+         "adapter_settings": {"DSN": "", "Query": "", "KeyFieldName": "", "JGService": "EnsLib.JavaGateway.Service"},
+         "host_settings": {"TargetConfigNames": ""}},
     ],
 }
 

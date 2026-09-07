@@ -87,6 +87,24 @@
             <template v-else>{{ row.connection?.jdbc_url }}</template>
           </template>
         </el-table-column>
+        <el-table-column label="投递语义" min-width="220">
+          <template #default="{ row }">
+            <template v-if="row.type === 'SOAP'">
+              <div v-for="op in (row.runtime?.capabilities?.operations || [])" :key="op.name" class="mb4">
+                <el-tag size="small" :type="op.kind === 'write' ? 'success' : 'warning'">
+                  {{ op.name }} · {{ op.kind === 'write' ? '写入' : '查询' }}
+                </el-tag>
+              </div>
+              <div v-if="row.runtime?.delivery?.note" class="mb4 gray sm">{{ row.runtime.delivery.note }}</div>
+            </template>
+            <template v-else><el-tag size="small" type="info">DB UPSERT</el-tag></template>
+            <el-tooltip :content="(row.runtime?.health?.detail) || ''" placement="top">
+              <el-tag size="small" :type="row.runtime?.health?.ok ? 'success' : 'danger'">
+                {{ row.runtime?.health?.ok ? '可达' : '待探查' }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }">
             <template v-if="row.type === 'SOAP'">

@@ -92,14 +92,134 @@ def create_datasource(data: DataSourceIn) -> str:
     return ds_id
 
 
+def datasource_runtime(ds: dict) -> dict:
+    """数据源运行契约（Connection Contract）——参数归一单一取值。
+
+    有显式 runtime.connection 用之；否则从旧字段惰性构造（FHIR endpoint 在记录顶层/auth，
+    SQL 在 config），保证前端 / generate / AI 上下文读到一致的 connection 结构。
+    真实能力/增量键探测由 connection_profiler（P1）补全到 runtime。
+    """
+    kind = (ds.get("type") or "").upper()
+    rt = ds.get("runtime") or {}
+    # SQL 源的 connection 是「向导可变配置」（query/key_field/dsn 可能被更新），
+    # 始终以 config 现算，不复用 runtime 缓存的旧值（曾缓存 key_field=ID 导致 SQLService 报错）
+    if rt.get("connection") and kind != "SQL":
+        return rt
+
+    cfg = ds.get("config") or {}
+    assets = []
+    poll: dict = {}
+    caps: dict = {}
+    conn: dict = {}
+    if kind == "FHIR":
+        # FHIR：endpoint/auth 在记录顶层（历史上也有 config 版本，兼容读）
+        conn = {
+            "endpoint": ds.get("endpoint") or cfg.get("endpoint") or "",
+            "username": (ds.get("auth") or {}).get("username") or cfg.get("username") or "superuser",
+            "password": (ds.get("auth") or {}).get("password") or cfg.get("password") or "SYS",
+        }
+        caps = {"auth": "basic", "incremental_search": "_lastUpdated"}
+        poll = {"mechanism": "cursor"}
+        assets = [
+            {"name": a.get("name"), "type": a.get("type") or "FHIR",
+             "fields": a.get("fields") or []}
+            for a in list_assets(ds.get("id") or "") if a.get("name")]
+    elif kind == "SQL":
+        if cfg.get("jdbc_url"):
+            conn = {
+                "jdbc_url": cfg["jdbc_url"],
+                "driver_class": cfg.get("driver_class") or "",
+                "username": cfg.get("username") or "",
+                "password": cfg.get("password") or "",
+                "query": cfg.get("query") or "",
+                "key_field": cfg.get("key_field") or "ID",
+            }
+            caps = {"dialect": "jdbc"}
+        else:
+            conn = {
+                "dsn": cfg.get("dsn") or "localTarget",
+                "query": cfg.get("query") or "",
+                "key_field": cfg.get("key_field") or "ID",
+            }
+            caps = {"dialect": "IRIS"}
+        poll = {"mechanism": "key_field", "key_column": conn.get("key_field") or "ID"}
+        assets = [
+            {"name": t.get("table"), "type": "SQL_TABLE", "schema": t.get("schema"),
+             "table": t.get("table"),
+             "fields": [c["name"] if isinstance(c, dict) else str(c) for c in (t.get("columns") or [])]}
+            for t in (ds.get("tables") or []) if t.get("table")]
+    return {
+        "kind": kind, "role": "source",
+        "connection": conn, "capabilities": caps,
+        "assets": assets, "poll": poll, "delivery": {}, "health": {},
+    }
+
+
+def target_runtime(tg: dict) -> dict:
+    """数据目标运行契约（Connection Contract）——参数归一单一取值。
+
+    统一 connection 结构：DB 目标 {jdbc_url|dsn,...}；SOAP 目标 {wsdl/service/packages/endpoint/bo_class}。
+    目标写入方式（delivery）由 connection_profiler（P1）进一步补全。
+    """
+    kind = (tg.get("type") or "").upper()
+    rt = tg.get("runtime") or {}
+    if rt.get("connection"):
+        return rt
+
+    conn0 = tg.get("connection") or {}
+    assets = []
+    delivery: dict = {}
+    if kind == "SOAP":
+        # SOAP：connection 与 TargetInterface.config 可能字段不全（endpoint 只在一处）——归一补齐
+        svc = conn0.get("service") or "default"
+        conn = {
+            "wsdl": conn0.get("wsdl") or "",
+            "service": svc,
+            "packages": conn0.get("packages") or {},
+            "endpoint": conn0.get("endpoint") or "",
+            "bo_class": conn0.get("bo_class") or conn0.get("boClass") or tg.get("bo_class") or "",
+        }
+        delivery = {"mechanism": "soap_operation", "target": svc}
+        assets = [
+            {"entity_name": (tb.get("entity_name") or tb.get("table")), "table": (tb.get("table")),
+             "schema": tb.get("schema") or "SOAP",
+             "fields": tb.get("fields") or [c.get("name") if isinstance(c, dict) else str(c)
+                                            for c in (tb.get("columns") or [])]}
+            for tb in (tg.get("tables") or [])]
+    else:  # DB
+        conn = {
+            "jdbc_url": conn0.get("jdbc_url") or "",
+            "dsn": conn0.get("dsn") or "localTarget",
+            "driver_class": conn0.get("driver_class") or "",
+            "username": conn0.get("username") or "",
+            "password": conn0.get("password") or "",
+        }
+        delivery = {"mechanism": "upsert"}
+        assets = [
+            {"table": tb.get("table"), "schema": tb.get("schema") or "SQLUser",
+             "columns": tb.get("columns") or []}
+            for tb in (tg.get("tables") or []) if tb.get("table")]
+    return {
+        "kind": kind, "role": "target",
+        "connection": conn, "capabilities": {},
+        "assets": assets, "poll": {}, "delivery": delivery, "health": {},
+    }
+
+
 def get_datasource(ds_id: str) -> dict | None:
-    """按 ID 获取数据源。"""
-    return get_json("^demo.DataSource", ds_id)
+    """按 ID 获取数据源（含归一化 runtime 契约）。"""
+    ds = get_json("^demo.DataSource", ds_id)
+    if ds:
+        ds["runtime"] = datasource_runtime(ds)
+    return ds
 
 
 def list_datasources() -> list[dict]:
-    """返回全部数据源。"""
-    return list_json("^demo.DataSource")
+    """返回全部数据源（每项含归一化 runtime 契约）。"""
+    items = list_json("^demo.DataSource")
+    for ds in items:
+        ds["runtime"] = datasource_runtime(ds)
+    return items
 
 
 def update_datasource(ds_id: str, patch: dict) -> None:
@@ -109,6 +229,32 @@ def update_datasource(ds_id: str, patch: dict) -> None:
         return
     ds.update(patch)
     set_json("^demo.DataSource", ds_id, ds)
+
+
+def update_asset(asset_id: str, patch: dict) -> None:
+    """更新发现资产（^demo.DataAsset）并尽量同步分层模型资产（^demo.SourceAsset）。
+
+    用于写入接口分析 Agent 的语义结论（description/key_hint/comment 等）。
+    """
+    rec = get_json("^demo.DataAsset", asset_id)
+    if rec:
+        rec.update(patch)
+        set_json("^demo.DataAsset", asset_id, rec)
+    rec2 = get_json("^demo.SourceAsset", asset_id)
+    if rec2:
+        rec2.update(patch)
+        set_json("^demo.SourceAsset", asset_id, rec2)
+
+
+def enrich_target_table(target_id: str, table_name: str, patch: dict) -> None:
+    """给数据目标内指定表/实体记录补 AI 分析字段（description/direction…，不影响列）。"""
+    tg = get_json("^demo.Target", target_id)
+    if not tg:
+        return
+    for t in tg.get("tables", []):
+        if (t.get("table") or t.get("entity_name")) == table_name:
+            t.update(patch)
+    set_json("^demo.Target", target_id, tg)
 
 
 # ---------------- 数据资产 ----------------
@@ -224,13 +370,19 @@ def create_target(name: str, target_type: str, connection: dict, tables: list[di
 
 
 def get_target(target_id: str) -> dict | None:
-    """按 ID 获取数据目标。"""
-    return get_json("^demo.Target", target_id)
+    """按 ID 获取数据目标（含归一化 runtime 契约）。"""
+    tg = get_json("^demo.Target", target_id)
+    if tg:
+        tg["runtime"] = target_runtime(tg)
+    return tg
 
 
 def list_targets() -> list[dict]:
-    """返回全部数据目标。"""
-    return list_json("^demo.Target")
+    """返回全部数据目标（每项含归一化 runtime 契约）。"""
+    items = list_json("^demo.Target")
+    for tg in items:
+        tg["runtime"] = target_runtime(tg)
+    return items
 
 
 def update_target(target_id: str, patch: dict) -> None:

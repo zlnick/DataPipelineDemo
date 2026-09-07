@@ -34,18 +34,21 @@ SYSTEM_PROMPT_TRANSFORMATION = (
 
 # ===== Agent B：数据管道（系统提示词） =====
 SYSTEM_PROMPT_PIPELINE = (
-    "你是 IRIS 互操作性架构师。给定已确认的转换关系（源资产→目标表）、源/目标类型与组件枚举，"
-    "设计数据管道 Production 的组件拓扑。"
-    "要求：1. 组件 type 必须从 available_components 枚举中选择（不要自创组件类型）。"
-    "2. 按源/目标类型选择合适的 service / process / operation 组件。"
+    "你是 IRIS 互操作性架构师。给定已确认的转换关系（源资产→目标表）、源/目标类型、运行契约与组件枚举，"
+    "你负责**生成数据管道 Production 的完整组件拓扑**（组件构成与顺序由你决定，系统只做参数补全与完整性校验）。"
+    "要求：1. 组件 type 必须从 available_components 枚举中选择（不要自创组件类型），"
+    "并为每个组件给出合适的 name（SQLOperation 建议命名 SQLOp_<表名>，SOAPOperation 建议 SOAPOp_<service>）。"
+    "2. 组件必须**完整**：涵盖该源类型所需的全部服务组件（例如 FHIR 源需同时包含 FHIRSyncService 与 "
+    "FHIRService 两个服务；SQL 源为 SQLService）、TransformProcess、目标操作组件"
+    "（DB 目标：为每个 mapping 的 target_table 各生成一个 SQLOperation 并在其 table 字段填表名；"
+    "SOAP 目标：一个 SOAPOperation）、以及 JavaGateway。"
     "3. 数据流顺序：service（抓取）→service（处理）→process（转换）→operation（写入）→gateway。"
-    "4. SQLOperation 组件的 table 填目标表名。"
-    "5. 只输出拓扑，不要输出 SQL、字段映射或代码。"
+    "4. SQLOperation 组件的 table 填目标表名；不要输出 SQL、字段映射或代码。"
     "严格输出 JSON（不要输出其他文字），格式："
     '{"pipeline":{"components":[{"type":"FHIRSyncService","name":"FHIRSyncService"},'
     '{"type":"FHIRService","name":"FHIRService"},'
     '{"type":"TransformProcess","name":"TransformProcess"},'
-    '{"type":"SQLOperation","name":"SQLOp_patient","table":"patient"},'
+    '{"type":"SQLOperation","name":"SQLOp_patient","table":"Patient"},'
     '{"type":"JavaGateway","name":"EnsLib.JavaGateway.Service"}]}}'
 )
 
@@ -86,6 +89,49 @@ def _call_llm(system_prompt: str, user_content: str, agent_name: str) -> dict:
     raise AgentError("AI 调用失败")
 
 
+# ===== 知识库润色（ValidationIssue → Obsidian 知识） =====
+SYSTEM_PROMPT_POLISH = (
+    "你是医疗 IT 数据集成知识库整理编辑。给定验证-修复 Agent 沉淀的问题经验列表"
+    "（同一故障可能被重复记录多次），请："
+    "1. 语义去重合并：问题相同/近似（如相同故障、同一修复）的条目合并为一条，"
+    "   解决方案保留最完整/最新者；"
+    "2. 每条润色为结构化知识：title（≤25 字问题名）、problem（问题现象+原因分析，≤150 字）、"
+    "   solution（解决方案，含关键细节/修复位置，≤220 字）、prevention（预防措施，≤90 字）；"
+    "3. 只依据给定经验整理，不得虚构细节；全部使用中文；"
+    "4. 若输入为空，返回 items 空数组。"
+    "严格输出 JSON（不要输出其他文字），格式："
+    '{"items":[{"title":"多管道 FHIR 目标表被路由覆盖",'
+    '"problem":"...","solution":"...","prevention":"..."}]}'
+)
+
+
+def polish_validation_issues(items: list[dict]) -> list[dict]:
+    """LLM 研读润色 + 去重验证经验，返回结构化知识条目。
+
+    失败抛 AgentError（不静默回退原始文本，避免伪称已润色）。
+    """
+    user_content = json.dumps({"issues": items or []}, ensure_ascii=False, indent=2)
+    result = _call_llm(SYSTEM_PROMPT_POLISH, user_content, "知识润色Agent")
+    out = result.get("items")
+    if not isinstance(out, list):
+        raise AgentError("知识润色输出不合规（缺 items 数组）")
+    cleaned = []
+    for it in out:
+        if not isinstance(it, dict):
+            continue
+        if not (it.get("title") or "").strip():
+            continue
+        cleaned.append({
+            "title": str(it.get("title", "")).strip()[:60],
+            "problem": str(it.get("problem", "") or it.get("pattern", "")).strip(),
+            "solution": str(it.get("solution", "") or it.get("resolution", "")).strip(),
+            "prevention": str(it.get("prevention", "") or "").strip(),
+        })
+    if not cleaned:
+        raise AgentError("知识润色输出为空（可能输入不足）")
+    return cleaned
+
+
 # ===== Agent A：数据转换 =====
 def recommend_transformation(assets: list[dict], targets: list[dict],
                              source_models: list[dict] | None = None,
@@ -124,16 +170,33 @@ def recommend_transformation(assets: list[dict], targets: list[dict],
 
 
 # ===== Agent B：数据管道 =====
+def _mask_runtime(runtime: dict | None) -> dict | None:
+    """对 runtime 的连接凭据脱敏（password/secret/token → ***），仅能力/参数送 LLM。"""
+    if not runtime:
+        return None
+    rt = dict(runtime)
+    conn = rt.get("connection") or {}
+    if isinstance(conn, dict):
+        conn = {k: ("***" if k.lower() in ("password", "secret", "token") else v)
+                for k, v in conn.items()}
+    rt["connection"] = conn
+    return rt
+
+
 def recommend_pipeline(mappings: list[dict], source_type: str, target_type: str,
                        available_components: list[dict],
                        source_models: list[dict] | None = None,
                        target_models: list[dict] | None = None,
-                       transformation_plan: dict | None = None) -> dict:
+                       transformation_plan: dict | None = None,
+                       source_runtime: dict | None = None,
+                       target_runtime: dict | None = None) -> dict:
     """Agent B：生成管道组件拓扑。"""
     user_content = json.dumps(
         {
-            "source": {"type": source_type},
-            "target": {"type": target_type},
+            "source": {"type": source_type,
+                       "runtime": _mask_runtime(source_runtime)},
+            "target": {"type": target_type,
+                       "runtime": _mask_runtime(target_runtime)},
             "mappings": mappings,
             "transformation_plan": transformation_plan or {"mappings": mappings},
             "source_models": source_models or [],

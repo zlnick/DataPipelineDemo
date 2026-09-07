@@ -152,6 +152,8 @@ def validate_and_fix_pipeline(mappings: list[dict], topology: dict | None,
     current_topology = topology or {}
     rounds_log: list[dict] = []
     report: dict = {}
+    # AI 驱动红线审计：规则/默认拓扑是否在修复中改写了 AI 决策的构成（必须向用户显式标注）
+    rule_applied = False
 
     for round_i in range(max_rounds + 1):
         report = pipeline_validator.run_pipeline_validation(
@@ -163,13 +165,16 @@ def validate_and_fix_pipeline(mappings: list[dict], topology: dict | None,
         if not errors:
             return {"status": "ok", "rounds": rounds_log,
                     "topology": current_topology, "mappings": list(mappings or []),
-                    "report": report, "message": "验证通过"}
+                    "report": report, "message": "验证通过",
+                    "rule_applied": rule_applied}
 
         # L1 规则修复（管道域机械规则：剔未知组件/补 className/补必选）
         new_topo, topo_fixed = _l1_rule_fix(current_topology, source_type, target_type)
         if topo_fixed:
             current_topology = new_topo
-            logger.info("管道 L1 规则修复生效: 拓扑改动=True")
+            # 红线审计：L1 改变了 AI 决策的组件构成（剔除未知/补必选）→ 显式标记
+            rule_applied = True
+            logger.info("管道 L1 规则修复生效（规则介入改写 AI 拓扑，已审计标记）: 拓扑改动=True")
             # L1 修复后立即重新生成，下一轮验证修复效果
             try:
                 gen_result = generate_fn(current_topology, mappings)
@@ -197,6 +202,8 @@ def validate_and_fix_pipeline(mappings: list[dict], topology: dict | None,
             except Exception as exc:  # noqa: BLE001
                 logger.error("启动 Production 失败: %s", exc)
         elif action == "fallback":
+            # L3 回退默认：规则重建整拓扑（红线审计：AI 决策被规则默认替换，必须显式标注）
+            rule_applied = True
             current_topology = _default_topology(
                 list(mappings or []), source_type, target_type)
 
@@ -217,6 +224,7 @@ def validate_and_fix_pipeline(mappings: list[dict], topology: dict | None,
 
     return {"status": "failed", "rounds": rounds_log,
             "topology": current_topology, "mappings": list(mappings or []),
-            "report": report, "message": "超过最大修复轮数仍存在问题"}
+            "report": report, "message": "超过最大修复轮数仍存在问题",
+            "rule_applied": rule_applied}
 
 

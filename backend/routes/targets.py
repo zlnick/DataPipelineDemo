@@ -11,12 +11,48 @@ import logging
 
 from flask import Blueprint, request
 
-from backend.services import iris_connector, jdbc_client, repository, wsdl_importer
+from backend.config import Config
+from backend.services import (connection_profiler, interface_analyzer, iris_connector,
+                              jdbc_client, repository, wsdl_importer)
+from backend.services.llm_client import AgentError
 from backend.utils import error, success
 
 logger = logging.getLogger(__name__)
 
 targets_bp = Blueprint("targets", __name__, url_prefix="/api/targets")
+
+
+def _apply_target_ai(target_id: str, tables: list[dict], target_type: str,
+                     facts: dict | None = None) -> list[dict]:
+    """接口分析 Agent：目标表/实体语义 + direction（LLM）并写回。失败抛 AgentError。"""
+    items = interface_analyzer.analyze_target_interfaces(target_type, tables, facts)
+    by_name = {}
+    for it in items:
+        if it.get("name"):
+            by_name[str(it["name"]).lower()] = it
+    for t in tables:
+        nm = t.get("entity_name") or t.get("table") or ""
+        it = by_name.get(str(nm).lower())
+        if not it:
+            continue
+        patch = {
+            "ai_analysis": True,
+            "ai_semantics": it.get("semantics", ""),
+            "direction": it.get("direction", ""),
+        }
+        if it.get("reason"):
+            patch["ai_reason"] = it["reason"]
+        repository.enrich_target_table(target_id, nm, patch)
+    return items
+
+
+def _apply_ai_contract(kind: str, rt: dict | None) -> dict | None:
+    """接口分析 Agent：运行契约解读写 runtime.note.ai。失败抛 AgentError。"""
+    if not rt:
+        return rt
+    note = interface_analyzer.interpret_contract(kind, rt)
+    rt.setdefault("note", {})["ai"] = note
+    return rt
 
 # 允许的目标类型（DB: JDBC 表；SOAP: WSDL 导入型 BO）
 TARGET_TYPES = ["DB", "SOAP"]
@@ -57,6 +93,10 @@ def _target_table_rows() -> list[dict]:
                     "enabled": True,
                     "count": 0,
                     "status": tg.get("status", "analyzed"),
+                    # 接口分析 Agent（AI）语义产物
+                    "ai_semantics": ent.get("ai_semantics") or "",
+                    "direction": ent.get("direction") or "",
+                    "ai_reason": ent.get("ai_reason") or "",
                 })
             continue
         for tb in tg.get("tables", []):
@@ -76,6 +116,10 @@ def _target_table_rows() -> list[dict]:
                 "enabled": True,
                 "count": count,
                 "status": tg.get("status", "analyzed"),
+                # 接口分析 Agent（AI）语义产物
+                "ai_semantics": tb.get("ai_semantics") or "",
+                "direction": tb.get("direction") or "",
+                "ai_reason": tb.get("ai_reason") or "",
             })
     return items
 
@@ -130,7 +174,13 @@ def create_target():
         if not imp["ok"]:
             return error(f"WSDL 导入失败: {imp['message']}"), 400
         entities = imp.get("entities") or []
-        conn = {**conn, "bo_class": imp["boClass"], "entities": entities}
+        # SOAP 目标支持显式指定远端地址 endpoint（默认指向 Python mock 演示第三方系统）
+        conn = {
+            **conn,
+            "bo_class": imp["boClass"],
+            "entities": entities,
+            "endpoint": conn.get("endpoint") or Config.MOCK_SOAP_URL,
+        }
         target_id = repository.create_target(name, "SOAP", conn, tables=entities)
         repository.update_target(target_id, {"status": "analyzed"})
         repository.save_target_interface({
@@ -143,12 +193,31 @@ def create_target():
                 "service": conn.get("service") or "default",
                 "wsdl": conn.get("wsdl"),
                 "bo_class": imp["boClass"],
+                "endpoint": conn.get("endpoint") or Config.MOCK_SOAP_URL,
             },
         })
+        # —— 接口分析 Agent（LLM）：SOAP 实体语义 + 写读方向判定（失败即显式失败）——
+        try:
+            _apply_target_ai(target_id, entities, "SOAP",
+                             {"service": conn.get("service") or "default",
+                              "bo_class": imp["boClass"]})
+        except AgentError as exc:
+            logger.error("SOAP 实体接口分析 Agent 失败: %s", exc)
+            return error(f"SOAP 实体接口分析 Agent（AI）失败: {exc}"), 500
+        # 连接探查：操作语义判定（写入/查询）+ endpoint 可达性 → 刷新运行契约
+        try:
+            rt = connection_profiler.profile_target(repository.get_target(target_id))
+            _apply_ai_contract("target", rt)
+            repository.update_target(target_id, {"runtime": rt})
+        except AgentError as exc:
+            logger.error("SOAP 目标契约解读 Agent 失败: %s", exc)
+            return error(f"SOAP 目标契约解读 Agent（AI）失败: {exc}"), 500
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SOAP 目标探查失败: %s", exc)
         return success({
             "id": target_id, "bo_class": imp["boClass"], "entities": entities,
             "target": repository.get_target(target_id),
-        }, "SOAP 目标添加成功（WSDL 已导入生成 BO 及实体分析）")
+        }, "SOAP 目标添加成功（WSDL 已导入生成 BO，AI 实体分析完成）")
 
     if not conn.get("jdbc_url"):
         return error("缺少 JDBC 连接信息（jdbc_url）"), 400
@@ -160,6 +229,11 @@ def create_target():
         "type": target_type,
         "connection": conn,
     })
+    try:
+        rt = connection_profiler.profile_target(repository.get_target(target_id))
+        repository.update_target(target_id, {"runtime": rt})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DB 目标探查失败: %s", exc)
     return success({"id": target_id, "target": repository.get_target(target_id)}, "数据目标添加成功")
 
 
@@ -189,9 +263,28 @@ def import_target(target_id: str):
             "service": conn.get("service") or "default",
             "wsdl": conn.get("wsdl"),
             "bo_class": imp["boClass"],
+            "endpoint": conn.get("endpoint") or Config.MOCK_SOAP_URL,
         },
     })
-    return success({"bo_class": imp["boClass"], "entities": entities}, "WSDL 重新导入与实体分析成功")
+    # —— 接口分析 Agent（LLM）：重新导入后刷新实体语义/写读方向 ——
+    try:
+        _apply_target_ai(target_id, entities, "SOAP",
+                         {"service": conn.get("service") or "default",
+                          "bo_class": imp["boClass"]})
+    except AgentError as exc:
+        logger.error("SOAP 实体接口分析 Agent 失败: %s", exc)
+        return error(f"SOAP 实体接口分析 Agent（AI）失败: {exc}"), 500
+    try:
+        rt = connection_profiler.profile_target(repository.get_target(target_id))
+        _apply_ai_contract("target", rt)
+        repository.update_target(target_id, {"runtime": rt})
+    except AgentError as exc:
+        logger.error("SOAP 目标契约解读 Agent 失败: %s", exc)
+        return error(f"SOAP 目标契约解读 Agent（AI）失败: {exc}"), 500
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SOAP 目标探查失败: %s", exc)
+    return success({"bo_class": imp["boClass"], "entities": entities},
+                   "WSDL 重新导入与实体分析成功（AI 语义已刷新）")
 
 
 
@@ -272,7 +365,23 @@ def select_tables(target_id: str):
         saved.append({"schema": schema, "table": table, "columns": columns})
 
     repository.update_target(target_id, {"status": "analyzed"})
-    return success({"saved": saved, "count": len(saved)}, "目标表已保存并完成列分析")
+    # —— 接口分析 Agent（LLM）：DB 目标表语义 + 写读方向判定（失败即显式失败）——
+    try:
+        _apply_target_ai(target_id, saved, "DB", {"kind": "database table target"})
+    except AgentError as exc:
+        logger.error("DB 目标表接口分析 Agent 失败: %s", exc)
+        return error(f"DB 目标表接口分析 Agent（AI）失败: {exc}"), 500
+    try:
+        rt = connection_profiler.profile_target(repository.get_target(target_id))
+        _apply_ai_contract("target", rt)
+        repository.update_target(target_id, {"runtime": rt})
+    except AgentError as exc:
+        logger.error("DB 目标契约解读 Agent 失败: %s", exc)
+        return error(f"DB 目标契约解读 Agent（AI）失败: {exc}"), 500
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DB 目标探查失败: %s", exc)
+    return success({"saved": saved, "count": len(saved)},
+                   "目标表已保存并完成列分析（AI 语义分析完成）")
 
 
 @targets_bp.get("/<target_id>/selected")
@@ -290,7 +399,7 @@ def table_data(table: str):
 
     查询参数: limit（默认 50）。
     """
-    # 仅允许已注册的目标表
+    # 仅允许已登记的目标表（动态，由演示过程添加的目标决定）
     allowed = {tb["table"] for tb in _target_table_rows()}
     if table not in allowed:
         return error(f"目标表不存在或未注册: {table}"), 404

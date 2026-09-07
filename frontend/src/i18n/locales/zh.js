@@ -87,6 +87,9 @@ export default {
     warnNameEndpoint: "请填写名称与端点 URL",
     created: "数据源注册成功",
     analyzeDone: "Profile 分析完成，发现 {n} 个数据资产",
+    runtimeCol: "运行契约",
+    healthOk: "健康",
+    healthBad: "待探查",
   },
   assets: {
     title: "数据资产",
@@ -159,6 +162,7 @@ export default {
     goPipeline: "生成数据管道 →",
   },
   pipelines: {
+    aiBy: "本管道组件拓扑已由 Agent B（大模型）生成设计",
     statusTitle: "管道状态",
     statusOps: "状态与操作",
     generateBtn: "生成 / 重建数据管道",
@@ -200,8 +204,14 @@ export default {
     reserved: "预留，暂未实现",
   },
   agents: {
-    title: "已封装 AI Agents",
-    alert: "平台封装多个 AI Agent，分别负责数据转换生成与数据管道设计，业务操作中自动调用。",
+    title: "已封装 AI 能力（Skills / Agents）",
+    alert: "平台共 6 个 LLM 能力：接口分析、数据转换（A）、数据管道设计（B）、知识润色为 Skill（单轮 LLM 技能，职责单一、按需调用）；"
+           + "转换验证（C1）与管道验证-修复（C2）为 Agent（事实检查工具 + LLM ≤2 轮修复循环 + 经验沉淀，"
+           + "业界认可 agentic workflow）。知识导出时由知识润色 Skill 研读去重后写入 Obsidian 知识库。",
+    skill: "Skill（单轮 LLM 技能）",
+    agent: "Agent（工具 + 修复循环）",
+    sectionSkills: "Skills · 单轮 LLM 技能",
+    sectionAgents: "Agents · 验证-修复循环（事实工具 + LLM ≤2 轮 + 经验沉淀）",
     ready: "就绪",
     input: "输入",
     output: "输出",

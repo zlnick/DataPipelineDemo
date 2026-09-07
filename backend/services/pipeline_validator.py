@@ -145,10 +145,13 @@ def check_source_fields(assets: list[dict], mappings: list[dict]) -> dict:
     return {"ok": True, "issues": issues}
 
 
-def check_pipeline_topology(topology: dict | None, source_type: str,
-                            target_type: str) -> dict:
+def check_pipeline_topology(topology: dict | None, source_type: str | None = None,
+                            target_type: str | None = None,
+                            source_types: list[str] | None = None,
+                            target_types: list[str] | None = None) -> dict:
     """检查拓扑：组件枚举合法 + 必选组件齐全 + className 非空。
 
+    单管道传 source_type/target_type；多管道传 source_types/target_types（并集）。
     返回: {"ok": bool, "issues": [...], "components": [type...]}
     """
     issues: list[dict] = []
@@ -157,10 +160,12 @@ def check_pipeline_topology(topology: dict | None, source_type: str,
         issues.append({"severity": "error", "item": "components",
                        "message": "拓扑没有组件"})
     allowed = set()
-    for c in type_registry.get_source_components(source_type):
-        allowed.add(c["type"])
-    for c in type_registry.get_target_components(target_type):
-        allowed.add(c["type"])
+    for st in source_types or ([source_type] if source_type else []):
+        for c in type_registry.get_source_components(st):
+            allowed.add(c["type"])
+    for tt in target_types or ([target_type] if target_type else []):
+        for c in type_registry.get_target_components(tt):
+            allowed.add(c["type"])
     for c in type_registry.get_common_components():
         allowed.add(c["type"])
     seen: set[str] = set()
@@ -293,13 +298,18 @@ def run_transformation_validation(mappings: list[dict], assets: list[dict] | Non
 
 def run_pipeline_validation(topology: dict | None, source_type: str = "FHIR",
                             target_type: str = "DB",
-                            production: str = PRODUCTION_NAME) -> dict:
+                            production: str = PRODUCTION_NAME,
+                            source_types: list[str] | None = None,
+                            target_types: list[str] | None = None) -> dict:
     """数据管道专项验证（供管道验证-修复 Agent C2 使用）。
 
     覆盖：拓扑完整性 + 编译 + 启动 + 消息流转（不含转换关系）。
+    多管道场景传 source_types/target_types（并集）。
     """
     results = {
-        "pipeline": check_pipeline_topology(topology, source_type, target_type),
+        "pipeline": check_pipeline_topology(topology, source_type, target_type,
+                                            source_types=source_types,
+                                            target_types=target_types),
         "compile": check_compile(production),
         "start": check_start(production),
         "smoke": check_smoke(),
@@ -345,3 +355,62 @@ def load_validation_issues(limit: int = 5) -> list[dict]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("读取验证经验失败: %s", exc)
         return []
+
+
+# ---- 生成前连通性检查（Connection Contract 前置门禁） ----
+
+def check_connection(sources: list[dict] | None = None,
+                     targets: list[dict] | None = None) -> dict:
+    """生成前的源/目标连通性检查（D1 类参数错误在生成前拦截）。
+
+    sources/targets 为已归一的 runtime 契约（repository.datasource_runtime / target_runtime）。
+    优先用契约 health；health 缺失或失败时现场最小探测（FHIR metadata / SOAP endpoint / SQL ping）。
+    返回: {"ok": bool, "issues": [...], "results": [{item, role, ok, detail}]}
+    """
+    issues: list[dict] = []
+    results: list[dict] = []
+    import datetime
+
+    from backend.services import connection_profiler
+
+    def _probe(rt: dict) -> dict:
+        """现场最小连通探测，返回 health dict。"""
+        kind = (rt.get("kind") or "").upper()
+        conn = rt.get("connection") or {}
+        health: dict = {"ok": False, "detail": "", "checked_at": datetime.datetime.now().isoformat()}
+        try:
+            if kind == "FHIR":
+                _, _poll = connection_profiler._fhir_capabilities(
+                    conn.get("endpoint") or "", conn.get("username") or "", conn.get("password") or "")
+                health["ok"] = True
+                health["detail"] = "metadata 可达"
+            elif kind == "SOAP":
+                h = connection_profiler._http_reachable(conn.get("endpoint") or "")
+                health.update(h)
+            elif kind in ("SQL", "DB"):
+                rows = iris_connector.query("SELECT 1")
+                health["ok"] = bool(rows)
+                health["detail"] = "localTarget OK" if rows else "ping 失败"
+            else:
+                health["detail"] = f"未支持类型 {kind}"
+        except Exception as exc:  # noqa: BLE001
+            health["detail"] = str(exc)[:200]
+        return health
+
+    for rt in (sources or []) + (targets or []):
+        if not rt or not rt.get("kind"):
+            continue
+        kind = rt.get("kind")
+        role = rt.get("role") or ("source" if rt in (sources or []) else "target")
+        health = rt.get("health") or {}
+        if not health.get("ok"):
+            health = _probe(rt)  # 契约未探查/曾失败 → 现场再试
+        item = f"{role}.{kind}"
+        ok = bool(health.get("ok"))
+        detail = health.get("detail") or ""
+        results.append({"item": item, "role": role, "kind": kind, "ok": ok, "detail": detail})
+        if not ok:
+            issues.append({"severity": "error", "item": item,
+                           "message": f"{item} 不可达/未配置: {detail}"})
+    return {"ok": not issues, "issues": issues, "results": results}
+

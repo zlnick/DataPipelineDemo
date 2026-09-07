@@ -14,6 +14,7 @@ from backend.routes.pipelines import pipelines_bp
 from backend.routes.targets import targets_bp
 from backend.routes.domain_models import domain_bp
 from backend.services import iris_connector
+from backend.services.mock_soap import mock_bp
 from backend.utils import success
 
 logging.basicConfig(
@@ -36,6 +37,9 @@ def create_app() -> Flask:
     app.register_blueprint(mappings_bp)
     app.register_blueprint(pipelines_bp)
     app.register_blueprint(domain_bp)
+
+    # 模拟第三方 SOAP 服务（SOAP 目标演示闭环，非 /api 前缀不走 CORS 限制）
+    app.register_blueprint(mock_bp)
 
     @app.get("/")
     def index():

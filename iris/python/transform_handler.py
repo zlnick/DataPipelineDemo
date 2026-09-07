@@ -59,24 +59,62 @@ def _get_path(obj, path):
     return cur
 
 
-def _extract_value(resource, source_path, transform):
-    """按映射从 FHIR 资源提取并转换值。
+def _split_args(expr):
+    """按逗号切分函数参数，忽略引号内与括号嵌套内的逗号。
 
     参数:
-        resource: FHIR 资源（dict）。
-        source_path: 源路径（如 name[0].given[0]）。
-        transform: 可选的转换规则（如 "date" 提取日期前 10 位）。
+        expr: 函数括号内的内容（如 "Patient.FamilyName, ' ', Patient.GivenName"）。
 
     返回:
-        转换后的值；无法提取返回 None。
+        参数列表。
+    """
+    args = []
+    depth = 0
+    cur = ""
+    quote = None
+    for ch in expr:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "'\"":
+            quote = ch
+            cur += ch
+        elif ch == "(":
+            depth += 1
+            cur += ch
+        elif ch == ")":
+            depth -= 1
+            cur += ch
+        elif ch == "," and depth == 0:
+            args.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        args.append(cur.strip())
+    return args
+
+
+def _get_field(resource, source_path):
+    """从源数据按字段路径提取值（兼容 "表.列" 前缀 + list/dict 归一）。
+
+    参数:
+        resource: 源数据（FHIR 资源 dict / SQL 行 dict）。
+        source_path: 字段路径（如 name[0].given[0]，或 SQL 行扁平列名）。
+
+    返回:
+        归一后的值；提取失败返回 None。
     """
     val = _get_path(resource, source_path)
-    if val is None:
-        return None
+    if val is None and "." in source_path and not source_path.startswith("["):
+        # 兼容 "表名.路径" 前缀（SQL 多表映射/资产命名常带表名前缀）：
+        # 去掉首段（表名）保留完整余路径（可含 name[0] 索引），如 Patient.name[0].family → name[0].family
+        rest = source_path.split(".", 1)[1]
+        val = _get_path(resource, rest)
     if isinstance(val, list):
         val = val[0] if val else None
-    if val is None:
-        return None
     if isinstance(val, dict):
         # 复杂对象：优先取 value / text / display 字段
         if "value" in val:
@@ -87,6 +125,59 @@ def _extract_value(resource, source_path, transform):
             val = val["display"]
         else:
             val = json.dumps(val, ensure_ascii=False)
+    return val
+
+
+def _eval_expr(resource, source_expr):
+    """解析映射 source 表达式并求值。
+
+    支持的表达式（映射 source 字段由 AI / 用户生成，需覆盖常见转换）：
+      1. 字符串字面量：' ' / "X"（引号包裹）
+      2. 字段路径：Patient.FamilyName / name[0].family / SQL 行列名（含 "表.列" 前缀兼容）
+      3. concat 函数：concat(字段, ' ', 字段)（参数可为上述任意组合，支持嵌套）
+
+    参数:
+        resource: 源数据 dict。
+        source_expr: 表达式字符串。
+
+    返回:
+        求值结果（None 表示无法提取）。
+    """
+    expr = (source_expr or "").strip()
+    if not expr:
+        return None
+    # 1. 字面量（成对引号包裹）
+    if len(expr) >= 2 and expr[0] == expr[-1] and expr[0] in "'\"":
+        return expr[1:-1]
+    # 2. concat(…)：拼接各参数求值结果
+    lower = expr.lower()
+    if lower.startswith("concat(") and expr.endswith(")"):
+        inner = expr[len("concat("):-1]
+        pieces = []
+        for arg in _split_args(inner):
+            val = _eval_expr(resource, arg)
+            if val is not None:
+                pieces.append(str(val))
+        return "".join(pieces)
+    # 3. 其余表达式按字段路径兜底处理
+    return _get_field(resource, expr)
+
+
+def _extract_value(resource, source_expr, transform):
+    """按映射从源数据提取并转换值（支持 concat 表达式 / 字段路径 / 字面量）。
+
+    参数:
+        resource: 源数据（FHIR 资源 dict / SQL 行 dict）。
+        source_expr: source 表达式（如 concat(Patient.FamilyName, ' ', Patient.GivenName)，
+                     或字段路径如 name[0].given[0]、SQL 行列名）。
+        transform: 可选的转换规则（如 "date" 提取日期前 10 位）。
+
+    返回:
+        转换后的值；无法提取返回 None。
+    """
+    val = _eval_expr(resource, source_expr)
+    if val is None:
+        return None
     if transform == "date":
         # 日期规范化：取前 10 位（YYYY-MM-DD）
         val = str(val)[:10]
@@ -165,6 +256,10 @@ def fetch_incremental_json(endpoint, username, password, resource_type, cursor="
 def enqueue_resources(bundle_json, mapping_id):
     """把 Bundle 中的 FHIR 资源逐条写入队列表 FHIRQueue（Status=pending）。
 
+    幂等防重：同一 (ResourceType, ResourceId, MappingId) 已在队列（无论
+    pending/processed）则跳过——游标未推进或重复同步时避免无限堆积，
+    保证后入队资源（如 Observation）也能被下游消费到。
+
     参数:
         bundle_json: Bundle JSON 字符串。
         mapping_id: 转换关系 ID（写入队列供下游消费时关联）。
@@ -180,27 +275,39 @@ def enqueue_resources(bundle_json, mapping_id):
         res = entry.get("resource") or {}
         if not res or not res.get("resourceType"):
             continue
+        rtype, rid = res.get("resourceType", ""), res.get("id", "")
+        if not rid:
+            continue
+        # 幂等检查：同 (ResourceType, ResourceId, MappingId) 已在队列（pending/processed）则跳过。
+        # 注：iris.sql 结果集对象无 fetchall 属性，用可迭代协议遍历。
+        exists = False
+        for _ in iris.sql.exec(
+                "SELECT ID FROM FHIRQueue WHERE ResourceType=? AND ResourceId=? AND MappingId=?",
+                rtype, rid, mapping_id):
+            exists = True
+            break
+        if exists:
+            continue  # 已存在（pending/processed）→ 跳过防重复
         iris.sql.exec(
             "INSERT INTO FHIRQueue (ResourceType, ResourceId, ResourceJson, MappingId, Status) "
             "VALUES (?, ?, ?, ?, ?)",
-            res.get("resourceType", ""), res.get("id", ""),
-            json.dumps(res, ensure_ascii=False), mapping_id, "pending")
+            rtype, rid, json.dumps(res, ensure_ascii=False), mapping_id, "pending")
         count += 1
     return str(count)
 
 
 def transform_resource_json(resource_json, field_mappings_json):
-    """按字段映射将 FHIR 资源转换为目标表行，返回 row JSON 字符串。
+    """按字段映射将源数据（FHIR 资源 / SQL 行）转换为目标行 JSON，返回 row JSON 字符串。
 
     参数:
-        resource_json: FHIR 资源 JSON 字符串。
+        resource_json: 源数据——FHIR 资源 JSON 字符串，或已解析对象（dict / SQL 行行 JSON）。
         field_mappings_json: 字段映射 JSON 数组字符串，
             [{"source": "name[0].family", "target": "FamilyName", "transform": null}, ...]。
 
     返回:
-        目标表行 JSON 字符串。
+        目标行 JSON 字符串。
     """
-    resource = json.loads(resource_json)
+    resource = resource_json if isinstance(resource_json, dict) else json.loads(resource_json)
     mappings = json.loads(field_mappings_json)
     row = {}
     for m in mappings:

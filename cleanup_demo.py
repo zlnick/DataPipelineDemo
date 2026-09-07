@@ -43,7 +43,7 @@ def main():
             print(f"已清空 {g}")
     finally:
         conn.close()
-    for table in ("Patient", "Observation"):
+    for table in ("PatientEntity", "PatientSource", "FHIRQueue", "Patient", "Observation"):
         iris_connector.execute(f"DELETE FROM {table}")
         print(f"目标表 {table} 数据已清空（表结构保留）")
     print("清理完成：演示可从零开始")

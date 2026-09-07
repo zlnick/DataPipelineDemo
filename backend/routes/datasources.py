@@ -8,12 +8,64 @@ import logging
 from flask import Blueprint, request
 
 from backend.schemas.models import DataSourceIn
-from backend.services import fhir_client, jdbc_client, profile_analyzer, repository
+from backend.services import (connection_profiler, fhir_client, interface_analyzer,
+                              jdbc_client, profile_analyzer, repository)
+from backend.services.llm_client import AgentError
 from backend.utils import error, success
 
 logger = logging.getLogger(__name__)
 
 datasources_bp = Blueprint("datasources", __name__, url_prefix="/api/datasources")
+
+
+def _apply_ai_semantics(assets: list[dict], source_type: str,
+                        facts: dict | None = None) -> list[dict]:
+    """接口分析 Agent：资产语义/键建议（LLM）并写回资产。失败抛 AgentError（显式失败）。"""
+    items = interface_analyzer.analyze_source_assets(source_type, assets, facts)
+    by_name = {}
+    for it in items:
+        if it.get("name"):
+            by_name[str(it["name"]).lower()] = it
+    for a in assets:
+        it = by_name.get(str(a.get("name", "")).lower())
+        if not it:
+            continue
+        patch = {
+            "ai_analysis": True,
+            "ai_semantics": it.get("semantics", ""),
+            "description": it.get("semantics") or a.get("description", ""),
+        }
+        if it.get("key_hint"):
+            patch["key_hint"] = it["key_hint"]
+        if it.get("comment"):
+            patch["ai_comment"] = it["comment"]
+        repository.update_asset(a["id"], patch)
+    return items
+
+
+def _apply_ai_contract(kind: str, rt: dict | None) -> dict | None:
+    """接口分析 Agent：运行契约解读写 runtime.note.ai。失败抛 AgentError。"""
+    if not rt:
+        return rt
+    note = interface_analyzer.interpret_contract(kind, rt)
+    rt.setdefault("note", {})["ai"] = note
+    return rt
+
+
+def _ai_semantics_summary(assets: list[dict]) -> list[dict]:
+    """汇总已写回资产的 AI 语义（返回给前端展示/审计）。"""
+    out = []
+    for a in assets:
+        sem = a.get("ai_semantics") or ""
+        if not sem:
+            continue
+        out.append({
+            "name": a.get("name"),
+            "semantics": sem,
+            "key_hint": a.get("key_hint") or "",
+            "ai_analysis": True,
+        })
+    return out
 
 
 @datasources_bp.post("")
@@ -68,11 +120,23 @@ def analyze_datasource(ds_id: str):
             return error("请先选择数据表（联通测试 → 选择 schema → 选择表）"), 400
         assets = repository.list_assets(ds_id)
         repository.update_datasource(ds_id, {"status": "analyzed"})
+        # —— 接口分析 Agent：SQL 表资产语义 + 运行契约解读（LLM，失败即显式失败）——
+        try:
+            if assets:
+                _apply_ai_semantics(assets, "SQL",
+                                    {"tables": tables, "source": "SQL database"})
+            rt = connection_profiler.profile_source(repository.get_datasource(ds_id))
+            _apply_ai_contract("source", rt)
+            repository.update_datasource(ds_id, {"runtime": rt})
+        except AgentError as exc:
+            logger.error("SQL 源接口分析 Agent 失败: %s", exc)
+            return error(f"SQL 源接口分析 Agent（AI）失败: {exc}"), 500
         return success({
             "analysis": {"source_type": "SQL",
                          "tables": [f"{t.get('schema', '')}.{t['table']}" for t in tables]},
             "assets": assets, "asset_count": len(assets),
-        }, "SQL 数据源已就绪")
+            "ai": _ai_semantics_summary(assets),
+        }, "SQL 数据源已就绪（AI 语义分析完成）")
     if ds.get("type") != "FHIR":
         return error(f"数据源类型 {ds.get('type')} 尚未实现"), 400
 
@@ -94,7 +158,25 @@ def analyze_datasource(ds_id: str):
         logger.error("数据源分析失败: %s", exc)
         return error(f"Profile 分析失败: {exc}"), 500
 
-    return success({"analysis": analysis, "assets": assets, "asset_count": len(assets)}, "Profile 分析完成")
+    # —— 接口分析 Agent（LLM）：资产语义 + 运行契约解读（失败即显式失败，不静默规则）——
+    try:
+        if assets:
+            _apply_ai_semantics(assets, "FHIR",
+                                {"fhir_version": analysis.get("fhir_version", ""),
+                                 "capability": analysis})
+        rt = connection_profiler.profile_source(repository.get_datasource(ds_id))
+        _apply_ai_contract("source", rt)
+        repository.update_datasource(ds_id, {"runtime": rt})
+    except AgentError as exc:
+        logger.error("FHIR 源接口分析 Agent 失败: %s", exc)
+        return error(f"接口分析 Agent（AI）语义/契约分析失败: {exc}"), 500
+    except Exception as exc:  # noqa: BLE001 - 确定性探查失败可继续（语义已完成）
+        logger.warning("FHIR 连接探查失败: %s", exc)
+
+    return success({
+        "analysis": analysis, "assets": assets, "asset_count": len(assets),
+        "ai": _ai_semantics_summary(repository.list_assets(ds_id)),
+    }, "Profile 分析完成（AI 语义分析已生成）")
 
 
 @datasources_bp.post("/<ds_id>/test")
@@ -174,18 +256,49 @@ def select_source_tables(ds_id: str):
             "fields": asset.get("fields", []),
             "description": f"SQL 资产 {asset.get('name', '')}",
         })
+    # —— 接口分析 Agent：表/列语义 + 轮询键建议（LLM；失败即显式失败，不静默规则）——
+    ai_items: list[dict] = []
+    try:
+        ai_items = _apply_ai_semantics(assets, "SQL",
+                                       {"tables": saved, "source": "SQL database"})
+    except AgentError as exc:
+        logger.error("SQL 表资产接口分析 Agent 失败: %s", exc)
+        return error(f"SQL 表资产接口分析 Agent（AI）失败: {exc}"), 500
+
     # 自动生成轮询 Query（EnsLib.SQL.Service.GenericService 的 Host 设置）
     first = saved[0]
     qtable = first["table"]
     query = f"SELECT * FROM {first['schema']}.{qtable}" if first["schema"] else f"SELECT * FROM {qtable}"
     key_field = (first["columns"][0]["name"] if first["columns"] else "")
+    # 轮询键采纳 AI 建议（仅当建议列真实存在于轮询表时替换启发式首列）
+    ai_cols = {str(c["name"]).lower() for c in (first.get("columns") or [])}
+    for it in ai_items:
+        if str(it.get("name", "")).lower() != str(qtable).lower():
+            continue
+        hint = str(it.get("key_hint") or "").strip()
+        if hint and hint.lower() in ai_cols:
+            key_field = hint
+            logger.info("轮询键采用接口分析 Agent 建议: %s.%s = %s", first["schema"], qtable, hint)
+        break
     repository.update_datasource(ds_id, {
         "status": "analyzed",
         "tables": saved,
         "config": {**conn, "query": query, "key_field": key_field},
     })
-    return success({"saved": saved, "count": len(saved)},
-                   "数据表已保存（列结构已分析，轮询 Query 已自动生成）")
+    # 连接探查 + 契约解读（刷新运行契约）
+    try:
+        rt = connection_profiler.profile_source(repository.get_datasource(ds_id))
+        _apply_ai_contract("source", rt)
+        repository.update_datasource(ds_id, {"runtime": rt})
+    except AgentError as exc:
+        logger.error("SQL 源契约解读 Agent 失败: %s", exc)
+        return error(f"SQL 源契约解读 Agent（AI）失败: {exc}"), 500
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SQL 连接探查失败: %s", exc)
+    return success({
+        "saved": saved, "count": len(saved),
+        "ai": _ai_semantics_summary(repository.list_assets(ds_id)),
+    }, "数据表已保存（AI 语义分析与轮询键建议完成）")
 
 
 @datasources_bp.get("/<ds_id>/assets")

@@ -264,6 +264,11 @@ async function handleRecommend() {
 
 async function confirmAll() {
   if (!recommendations.value.length) return
+  // 目标类型映射（mapping 必须带 target_type，避免后端默认 DB 导致 SOAP 目标误走 DB 路由）
+  const typeByTable = {}
+  for (const t of targets.value) {
+    if (t && t.table && !(t.table in typeByTable)) typeByTable[t.table] = t.type || 'DB'
+  }
   // 注意：Date.now() 在同一毫秒内多次调用返回相同值，若直接作为 id 会导致
   // 多条映射 id 相同（^demo.Mapping 以 id 为键），后保存的覆盖先保存的。
   // 因此用时间戳 + 序号拼接生成唯一 id。
@@ -272,6 +277,7 @@ async function confirmAll() {
     id: `M${stamp}${idx}`,
     source: rec.asset,
     target_table: rec.target_table,
+    target_type: typeByTable[rec.target_table] || 'DB',
     field_mappings: (rec.field_mappings || []).map((fm) => ({
       source: fm.source,
       target: fm.target,

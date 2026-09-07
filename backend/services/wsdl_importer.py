@@ -22,7 +22,9 @@ DEFAULT_PACKAGES = {
     "msg_package": "demo.soap.msg",
 }
 
-# 默认内置示例 WSDL（当用户输入 /tmp/patient.wsdl 但文件不存在时自动补全）
+# 默认内置示例 WSDL（写入型 SOAP 接口：AddPatient 投递患者实体并返回回执）
+# 数据管道把转换后的目标行（PatientEntity）作为请求消息投递给第三方 HIS；
+# 被调系统由 backend 的 Python mock 承担（services/mock_soap.py），真实接入指向真实 WSDL 即可。
 DEFAULT_SAMPLE_WSDL = """<?xml version="1.0" encoding="UTF-8"?>
 <definitions name="PatientService"
     targetNamespace="http://demo.soap/PatientService"
@@ -40,41 +42,49 @@ DEFAULT_SAMPLE_WSDL = """<?xml version="1.0" encoding="UTF-8"?>
           <xsd:element name="Gender" type="xsd:string"/>
         </xsd:sequence>
       </xsd:complexType>
-      <xsd:element name="GetPatientRequest">
+      <xsd:complexType name="AddPatientResult">
+        <xsd:sequence>
+          <xsd:element name="Code" type="xsd:string"/>
+          <xsd:element name="Message" type="xsd:string"/>
+        </xsd:sequence>
+      </xsd:complexType>
+      <xsd:element name="AddPatientRequest">
         <xsd:complexType>
           <xsd:sequence>
             <xsd:element name="PatientNo" type="xsd:string"/>
+            <xsd:element name="FullName" type="xsd:string"/>
+            <xsd:element name="Gender" type="xsd:string"/>
           </xsd:sequence>
         </xsd:complexType>
       </xsd:element>
-      <xsd:element name="GetPatientResponse">
+      <xsd:element name="AddPatientResponse">
         <xsd:complexType>
           <xsd:sequence>
-            <xsd:element name="Patient" type="tns:PatientEntity"/>
+            <xsd:element name="Result" type="tns:AddPatientResult"/>
           </xsd:sequence>
         </xsd:complexType>
       </xsd:element>
     </xsd:schema>
   </types>
 
-  <message name="GetPatientInput">
-    <part name="parameters" element="tns:GetPatientRequest"/>
+  <message name="AddPatientInput">
+    <part name="parameters" element="tns:AddPatientRequest"/>
   </message>
-  <message name="GetPatientOutput">
-    <part name="parameters" element="tns:GetPatientResponse"/>
+  <message name="AddPatientOutput">
+    <part name="parameters" element="tns:AddPatientResponse"/>
   </message>
 
   <portType name="PatientPortType">
-    <operation name="GetPatient">
-      <input message="tns:GetPatientInput"/>
-      <output message="tns:GetPatientOutput"/>
+    <operation name="AddPatient">
+      <input message="tns:AddPatientInput"/>
+      <output message="tns:AddPatientOutput"/>
     </operation>
   </portType>
 
   <binding name="PatientBinding" type="tns:PatientPortType">
     <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
-    <operation name="GetPatient">
-      <soap:operation soapAction="http://demo.soap/PatientService/GetPatient"/>
+    <operation name="AddPatient">
+      <soap:operation soapAction="http://demo.soap/PatientService/AddPatient"/>
       <input><soap:body use="literal"/></input>
       <output><soap:body use="literal"/></output>
     </operation>
@@ -241,7 +251,9 @@ def import_soap_operation(wsdl: str, service: str = "default",
 
 
 def _save_bo_mapping(service: str, bo_class: str) -> None:
-    """记录 service → BO 类映射到 ^demo.Config("soap", service)，并标记当前激活服务。"""
+    """记录 service → BO 类映射到 ^demo.Config("soap", service)，标记激活服务，
+    并解析 BO 的 MessageMap 登记请求消息类（^demo.Config("soap","request_class")，
+    供 TransformProcess.PackSOAPRequest 构造请求消息）。"""
     import iris
     conn = iris_connector.get_connection()
     try:
@@ -249,6 +261,14 @@ def _save_bo_mapping(service: str, bo_class: str) -> None:
         key = service or "default"
         native.set(bo_class, "^demo.Config", "soap", key)
         native.set(key, "^demo.Config", "soap", "active_service")
+        # 解析 BO MessageMap 的请求消息类（写入型 SOAP 目标需要它来打包转换产物）
+        try:
+            request_class = iris_connector.class_method_value(
+                "demo.WSDLImporter", "GetRequestClass", bo_class)
+        except Exception:  # noqa: BLE001 - 解析失败不影响 BO 映射主流程
+            request_class = ""
+        if request_class:
+            native.set(request_class, "^demo.Config", "soap", "request_class")
     finally:
         conn.close()
 

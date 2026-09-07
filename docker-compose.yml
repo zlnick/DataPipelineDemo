@@ -55,6 +55,7 @@ services:
       - ./init_data.py:/app/init_data.py
       - ./init_fhir_data.py:/app/init_fhir_data.py
       - ./cleanup_demo.py:/app/cleanup_demo.py
+      - ./generate_mock_data.py:/app/generate_mock_data.py
       - ./jdbc:/app/jdbc            # JDBC 驱动 jar（转换目标通用连接）
     depends_on:
       - iris

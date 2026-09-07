@@ -28,9 +28,12 @@ ClassMethod FetchIncremental(endpoint As %String, username As %String, password 
 ClassMethod EnqueueResources(bundleJson As %String, mappingId As %String) As %String [ Language = python ]
 {
     import sys
+    import importlib
     sys.path.insert(0, "/shared/python")
 
+    # 强制重载：Embedded Python 模块缓存跨 job 共享，改文件后需 reload 才生效
     import transform_handler
+    importlib.reload(transform_handler)
     return transform_handler.enqueue_resources(bundleJson, mappingId)
 }
 

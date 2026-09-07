@@ -23,6 +23,9 @@ class Config:
     PORT = int(os.getenv("FLASK_PORT", "5000"))
     # 允许跨域访问的前端来源（逗号分隔）
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")
+    # 演示用第三方 SOAP 服务地址（backend 的 Python mock，见 services/mock_soap.py）。
+    # SOAP 目标的 BO（WSDL 反向生成客户端）在 IRIS 容器内，故用 docker 网络内地址 dataflow-backend。
+    MOCK_SOAP_URL = os.getenv("MOCK_SOAP_URL", "http://dataflow-backend:5000/mock/soap/PatientService")
 
 
 class IRISConfig:

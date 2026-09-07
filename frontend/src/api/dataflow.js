@@ -61,7 +61,8 @@ export const pipelineApi = {
   run: () => http.post('/pipelines/run'),
   logs: (count = 50) => http.get('/pipelines/logs', { params: { count } }),
   mappings: () => http.get('/pipelines/mappings'),
-  targetData: (table = 'Patient', limit = 50) =>
+  viewTables: () => http.get('/pipelines/view-tables'),
+  targetData: (table, limit = 50) =>
     http.get('/pipelines/target-data', { params: { table, limit } }),
   generateMock: (count = 3) => http.post('/pipelines/generate-mock', null, { params: { count } }),
 }

@@ -31,36 +31,61 @@ Method SyncIncremental() As %Status
             Set tMaxCursor = tCursor
             Set tTotal = 0
 
+            // 只拉取「FHIR 数据源的资产」（DataAsset.type=FHIR_RESOURCE）。
+            // SQL 表资产（如 PatientEntity 的 mapping 是给 SQL 源轮询的，不应被 FHIR 同步拉取）
+            Kill tFhirType
+            Set tAid = $Order(^demo.DataAsset(""))
+            While tAid '= "" {
+                Set tAJson = $Get(^demo.DataAsset(tAid))
+                If tAJson '= "" {
+                    Set tA = ##class(%DynamicObject).%FromJSON(tAJson)
+                    If tA.%Get("type") = "FHIR_RESOURCE" {
+                        Set tAtype = tA.%Get("name")
+                        If tAtype '= "" Set tFhirType(tAtype) = 1
+                    }
+                }
+                Set tAid = $Order(^demo.DataAsset(tAid))
+            }
+
             Set tId = $Order(^demo.Mapping(""))
             While tId '= "" {
                 Set tMapJson = $Get(^demo.Mapping(tId))
                 If tMapJson '= "" {
                     Set tMap = ##class(%DynamicObject).%FromJSON(tMapJson)
                     Set tResourceType = tMap.%Get("source")
+                    // SQL 源 mapping（source 不是 FHIR 资源类型）跳过
+                    If tResourceType '= "" && $Data(tFhirType(tResourceType)) {
+                        // 单个资源类型隔离 try：某类型拉取失败只跳过该类型并记录，
+                        // 不中断整轮同步（保证游标仍按成功批次推进，避免重复全量拉取）。
+                        Try {
+                            // 增量拉取（Embedded Python + urllib，_lastUpdated 游标）
+                            Set tResult = ##class(demo.FHIRTransformHelper).FetchIncremental(tEndpoint, tUser, tPass, tResourceType, tCursor)
+                            Set tObj = ##class(%DynamicObject).%FromJSON(tResult)
 
-                    // 增量拉取（Embedded Python + urllib，_lastUpdated 游标）
-                    Set tResult = ##class(demo.FHIRTransformHelper).FetchIncremental(tEndpoint, tUser, tPass, tResourceType, tCursor)
-                    Set tObj = ##class(%DynamicObject).%FromJSON(tResult)
+                            // 逐条写入队列表（Python 侧幂等：同资源已入队则跳过）
+                            Set tEnqueued = ##class(demo.FHIRTransformHelper).EnqueueResources(tObj.bundle.%ToJSON(), tId)
+                            Set tTotal = tTotal + tEnqueued
 
-                    // 逐条写入队列表
-                    Set tEnqueued = ##class(demo.FHIRTransformHelper).EnqueueResources(tObj.bundle.%ToJSON(), tId)
-                    Set tTotal = tTotal + tEnqueued
-
-                    // 推进游标（取本批最大 lastUpdated）
-                    // 注意：%DynamicObject 带下划线属性必须用 %Get() 访问；
-                    // 字符串比较用 ]（follows，字典序），不能用 >（ObjectScript 对含数字字符串做数值比较）
-                    Set tMaxLu = tObj.%Get("max_last_updated")
-                    If tMaxLu '= "" {
-                        If tMaxLu ] tMaxCursor {
-                            Set tMaxCursor = tMaxLu
+                            // 推进游标（取本批最大 lastUpdated）
+                            Set tMaxLu = tObj.%Get("max_last_updated")
+                            If tMaxLu '= "" {
+                                If tMaxLu ] tMaxCursor {
+                                    Set tMaxCursor = tMaxLu
+                                }
+                            }
+                        } Catch e2 {
+                            // 记录单类型失败并继续下一个 mapping（可诊断；游标不停滞）
+                            Set tErrText = $System.Status.GetErrorText(e2.AsStatus())
+                            Set ^demo.Config("sync", "last_error") = $ZDT($H, 3) _ " " _ tMapJson _ " :: " _ tErrText
+                            Set tSC = $$$OK
                         }
                     }
                 }
                 Set tId = $Order(^demo.Mapping(tId))
             }
 
-            // 持久化游标
-            If tMaxCursor '= "" {
+            // 持久化游标（仅在确有推进时写，避免回退）
+            If tMaxCursor ] tCursor {
                 Set ^demo.Config("sync", "cursor") = tMaxCursor
             }
         }

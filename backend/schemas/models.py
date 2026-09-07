@@ -5,6 +5,22 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+class ConnectionRuntime(BaseModel):
+    """数据源/目标运行契约（Connection Contract）——参数归一单一事实源。
+
+    见 docs/ConnectionContract-设计.md。记录以 dict 存储，本模型用于结构约定/校验。
+    """
+
+    kind: str = ""
+    role: str = ""  # source | target
+    connection: dict = Field(default_factory=dict)
+    capabilities: dict = Field(default_factory=dict)
+    assets: list = Field(default_factory=list)
+    poll: dict = Field(default_factory=dict)
+    delivery: dict = Field(default_factory=dict)
+    health: dict = Field(default_factory=lambda: {"ok": False, "checked_at": "", "detail": ""})
+
+
 class AuthConfig(BaseModel):
     """数据源认证配置（方案 A：Basic Auth，IRIS FHIR Server 默认要求认证）。"""
 

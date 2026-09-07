@@ -78,6 +78,18 @@
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column :label="t('datasources.runtimeCol')" min-width="220">
+          <template #default="{ row }">
+            <div class="rt-cell">
+              <span class="gray sm">{{ runtimeSummary(row) }}</span>
+              <el-tooltip :content="runtimeHealthDetail(row)" placement="top">
+                <el-tag size="small" :type="runtimeHealthOk(row) ? 'success' : 'danger'" class="ml4">
+                  {{ runtimeHealthOk(row) ? t('datasources.healthOk') : t('datasources.healthBad') }}
+                </el-tag>
+              </el-tooltip>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column :label="t('datasources.actions')" width="220" fixed="right">
           <template #default="{ row }">
             <template v-if="row.type === 'SQL'">
@@ -206,6 +218,32 @@ async function loadList() {
   } finally {
     loading.value = false
   }
+}
+
+// 运行契约摘要（Connection Contract，后端 analyze/选表后自动刷新）
+function runtimeSummary(row) {
+  const rt = row.runtime || {}
+  const kind = (row.type || '').toUpperCase()
+  const caps = rt.capabilities || {}
+  const poll = rt.poll || {}
+  if (kind === 'FHIR') {
+    const mode = caps.incremental_search
+      ? `增量 ${caps.incremental_search}`
+      : (poll.note ? '全量（增量受限）' : '全量')
+    return `FHIR ${caps.fhir_version || '-'} · ${mode}`
+  }
+  if (kind === 'SQL') {
+    const q = (rt.connection || {}).query || ''
+    const tbl = q.includes('FROM ') ? q.split('FROM ').pop().trim() : ''
+    return `轮询 ${tbl || '-'} · 增量键 ${poll.key_column || '-'}`
+  }
+  return '-'
+}
+function runtimeHealthOk(row) {
+  return !!(row.runtime && row.runtime.health && row.runtime.health.ok)
+}
+function runtimeHealthDetail(row) {
+  return (row.runtime && row.runtime.health && row.runtime.health.detail) || ''
 }
 
 async function handleCreate() {

@@ -87,6 +87,9 @@ export default {
     warnNameEndpoint: "Please fill in name and endpoint URL",
     created: "Data source registered successfully",
     analyzeDone: "Profile analysis done, found {n} data assets",
+    runtimeCol: "Runtime Contract",
+    healthOk: "Healthy",
+    healthBad: "Unchecked",
   },
   assets: {
     title: "Data Assets",
@@ -159,6 +162,7 @@ export default {
     goPipeline: "Generate Pipeline →",
   },
   pipelines: {
+    aiBy: "Pipeline component topology designed by Agent B (LLM)",
     statusTitle: "Pipeline Status",
     statusOps: "Status & Actions",
     generateBtn: "Generate / Rebuild Pipeline",
@@ -200,8 +204,15 @@ export default {
     reserved: "reserved, not implemented",
   },
   agents: {
-    title: "Packaged AI Agents",
-    alert: "The platform packages multiple AI Agents for data transformation generation and pipeline design, invoked automatically in business operations.",
+    title: "AI Capabilities (Skills / Agents)",
+    alert: "6 LLM capabilities: Interface Analyzer / Transformation (A) / Pipeline design (B) / Knowledge Polish are "
+           + "Skills (single-shot LLM skills, single-responsibility, invoked on demand); Transformation validation (C1) "
+           + "& Pipeline validation-fix (C2) are Agents (fact-check tools + LLM fix loops \u22642 rounds + experience "
+           + "learning \u2014 industry-recognized agentic workflow). Knowledge Polish skill dedups/polishes before export to Obsidian vault.",
+    skill: "Skill (single-shot LLM)",
+    agent: "Agent (tools + fix loop)",
+    sectionSkills: "Skills \u00b7 single-shot LLM skills",
+    sectionAgents: "Agents \u00b7 validation-fix loops (fact tools + LLM \u22642 rounds + experience)",
     ready: "Ready",
     input: "Input",
     output: "Output",
