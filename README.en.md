@@ -19,6 +19,37 @@ FHIR/SQL source → interface analysis → register assets
 
 ## Feature Highlights
 
+### ✨ AI Decision Scope: what the LLM decides (and what code does NOT)
+
+All **decisions & generation** run through the LLM at runtime. Code only **reads facts, parameterizes, validates and
+backfills** — there are no hard-coded mapping / topology / conclusion templates:
+
+| Capability | AI (LLM) decides | Code only does |
+| --- | --- | --- |
+| Interface / source analysis | Asset semantics, polling-key hints, target write/read direction, runtime-contract interpretation | Read facts (Capability/columns/WSDL), persist |
+| Data mapping | Asset→target matching & field mappings (incl. `concat()` expressions) | Structure normalization, integrity checks |
+| Data pipeline | Component set & order, naming (per group in multi-pipeline) | Registry fills className/settings; backfills essentials |
+| Validation & fix | Judges whether issues are real + chooses fix actions | Fact-check tools, mechanical pruning, explicit fallback |
+
+**AI red line**: an LLM failure is an *explicit* failure surfaced to the user (missing key / timeout / malformed
+output, with the Agent name) — never a silent rule result. Rules/registry only do ① parameterization
+② completeness validation ③ backfilling essential pieces (flagged `ai_supplemented`). Every generation carries an
+auditable `ai` payload (`driven/components/supplemented/c2_rule_rebuilt`) and token usage is logged.
+
+### ✨ AI Validation & Auto-Repair (fix loops)
+
+- **C1 transformation validation-fix**: after mapping confirmation / before pipeline generation — fact checks + LLM
+  judgment correct field mappings (target columns, paths, semantic mismatches).
+- **C2 pipeline validation-fix**: after generation, automatically validates **topology / compile / start / message
+  flow** (single and multi-pipeline unified).
+- **Auto-repair**: fact-check tools → **LLM decides the fix** → regenerate & revalidate (≤2 rounds); on failure the
+  pipeline is rebuilt once automatically. Unresolved issues are **stored as experience** (`^demo.ValidationIssue`)
+  and **fed back into later AI fixes** so the same pitfall is not repeated.
+- **Observability**: the Pipelines page has an **AI Audit Log** dialog showing the decision source of each
+  generation; backend logs record token usage per Agent.
+- **Knowledge loop**: validation experience is deduplicated and restructured by the **Knowledge Polish Agent (LLM)**
+  and exported to an Obsidian vault (`export_validation_issues.py`).
+
 ### Layered models & AI transformation
 The platform separates conversion into three layers instead of assuming a 1:1 "source → target" mapping:
 1. **Source asset model**: FHIR resources / SQL tables with fields, types, keys and relations.
