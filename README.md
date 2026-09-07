@@ -1,5 +1,7 @@
 # AI 数据自动化转换 Demo
 
+> **[English version → README.en.md](README.en.md)**
+
 基于 **InterSystems IRIS for Health** 与 **AI** 的数据自动化转换演示平台。
 
 用户通过界面指定数据源（FHIR 接口），平台**自动分析端点 Profile** 并注册数据资产；指定转换目标（模拟远端数据库）；通过 **AI（OpenAI 兼容 LLM）** 推荐「资产 → 目标表」匹配与字段映射，经用户确认后**自动生成 IRIS 互操作性生产管道（Production）** 完成数据投放。
