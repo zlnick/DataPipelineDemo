@@ -30,3 +30,4 @@ docs/
 
 # 个人知识库软链（不纳入版本库）
 knowledge
+data/embedding-model/

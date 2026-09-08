@@ -96,6 +96,23 @@ services:
     networks:
       - dataflow-net
 
+  # ---------- 本地 Embedding 服务（术语向量化，Qwen3-Embedding-0.6B 多语言） ----------
+  # OpenAI 兼容 /v1/embeddings；模型文件从 ModelScope 下载（国内可直连）到 ./data/embedding-model
+  embedding:
+    build:
+      context: ./embedding
+      dockerfile: Dockerfile
+    container_name: dataflow-embedding
+    ports:
+      - "8001:8000"       # 宿主调试端口（业务访问走内部 http://embedding:8000）
+    environment:
+      MODEL_DIR: /models/Qwen3-Embedding-0.6B
+      MODEL_SCOPE_ID: Qwen/Qwen3-Embedding-0.6B
+    volumes:
+      - ./data/embedding-model:/models
+    networks:
+      - dataflow-net
+
 # 统一 Docker 网络，三个服务互联
 networks:
   dataflow-net:
