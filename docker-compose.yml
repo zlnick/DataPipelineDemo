@@ -93,6 +93,7 @@ services:
     volumes:
       - ./termsrv:/termsrv:ro            # 术语摄入源文件/脚本只读参考
       - ./data/iris-terminology:/dur     # 数据目录（容器重建后需重导术语）
+      - ./data/terms-inbox:/terms-inbox:ro   # 药品目录术语 TSV（导入用）
     networks:
       - dataflow-net
 
