@@ -1,0 +1,4 @@
+[submodule "termsrv"]
+	path = termsrv
+	url = https://github.com/zlnick/iris-terminology-server.git
+	branch = demo-community

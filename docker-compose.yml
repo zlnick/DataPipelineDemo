@@ -75,6 +75,27 @@ services:
     networks:
       - dataflow-net
 
+  # ---------- 术语服务器（fork 裁剪版 iris-terminology-server） ----------
+  # 仅用于术语「存储 + 检索/校验」（CodeSystem/$lookup $validate-code $subsumes、ValueSet/$expand）；
+  # 术语转换/映射由本平台 AI 数据转换 Skill 负责（不在术语服务器做）。
+  # 裁剪内容见子模块分支 demo-community：community 镜像 / 关闭 vector / 精简依赖。
+  iris-terminology:
+    build:
+      context: ./termsrv
+      dockerfile: iris/Dockerfile
+    container_name: iris-terminology
+    init: true
+    ports:
+      - "52774:52773"   # 术语服务器 Web / FHIR 术语面（与 demo 52773 错开）
+      - "51774:1972"    # 超级服务器（与 demo 1972 错开）
+    environment:
+      IRIS_PASSWORD: SYS    # 与 demo 约定一致的登录凭据 superuser / SYS
+    volumes:
+      - ./termsrv:/termsrv:ro            # 术语摄入源文件/脚本只读参考
+      - ./data/iris-terminology:/dur     # 数据目录（容器重建后需重导术语）
+    networks:
+      - dataflow-net
+
 # 统一 Docker 网络，三个服务互联
 networks:
   dataflow-net:
