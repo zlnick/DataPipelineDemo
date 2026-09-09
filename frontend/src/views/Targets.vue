@@ -42,12 +42,24 @@
         <el-form-item v-if="form.type === 'SOAP'" :label="t('targets.fldService')">
           <el-input v-model="form.service" placeholder="PatientService" style="width: 180px" />
         </el-form-item>
+        <!-- FHIR 目标：US Core 存储库（base_url + 认证） -->
+        <el-form-item v-if="form.type === 'FHIR'" :label="t('targets.fldBaseUrl')">
+          <el-input v-model="form.base_url" :placeholder="t('targets.phFhirBase')" style="width: 460px" />
+        </el-form-item>
+        <template v-if="form.type === 'FHIR'">
+          <el-form-item :label="t('targets.fldUser')">
+            <el-input v-model="form.username" placeholder="superuser" style="width: 150px" />
+          </el-form-item>
+          <el-form-item :label="t('targets.fldPass')">
+            <el-input v-model="form.password" type="password" placeholder="SYS" style="width: 120px" show-password />
+          </el-form-item>
+        </template>
         <el-form-item>
           <el-button type="primary" :loading="creating" @click="handleCreate">{{ t('targets.addBtn') }}</el-button>
         </el-form-item>
       </el-form>
       <el-alert
-        :title="form.type === 'SOAP' ? t('targets.soapInfo') : t('targets.dbInfo')"
+        :title="infoTitle"
         type="info"
         :closable="false"
         show-icon
@@ -213,7 +225,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { TARGET_TYPES } from '../api/constants'
@@ -226,6 +238,12 @@ function typeLabel(v) {
   const map = { DB: t('targets.tDB'), SOAP: t('targets.tSOAP'), FHIR: t('targets.tFHIR'), REST: t('targets.tREST') }
   return map[v] || v
 }
+
+const infoTitle = computed(() => {
+  if (form.type === 'SOAP') return t('targets.soapInfo')
+  if (form.type === 'FHIR') return t('targets.fhirInfo')
+  return t('targets.dbInfo')
+})
 
 const managers = ref([])
 const targetTables = ref([])
@@ -245,6 +263,8 @@ const form = reactive({
   // SOAP 目标配置（WSDL 导入型）
   wsdl: '/tmp/patient.wsdl',
   service: 'PatientService',
+  // FHIR 目标配置（US Core 声明式存储库）
+  base_url: 'http://iris:52773/csp/healthshare/fhirserver/fhir/r4',
 })
 
 async function loadManage() {
@@ -280,18 +300,26 @@ async function handleCreate() {
     ElMessage.warning(t('targets.wsdlNeeded'))
     return
   }
+  if (form.type === 'FHIR' && !form.base_url.trim()) {
+    ElMessage.warning(t('targets.fldBaseUrl'))
+    return
+  }
   creating.value = true
   try {
     const connection = form.type === 'SOAP'
       ? { wsdl: form.wsdl.trim(), service: form.service.trim() || 'default' }
-      : {
-          jdbc_url: form.jdbc_url.trim(),
-          driver_class: form.driver_class.trim(),
-          username: form.username,
-          password: form.password,
-        }
+      : form.type === 'FHIR'
+        ? { base_url: form.base_url.trim(), username: form.username, password: form.password }
+        : {
+            jdbc_url: form.jdbc_url.trim(),
+            driver_class: form.driver_class.trim(),
+            username: form.username,
+            password: form.password,
+          }
     await targetApi.create({ name: form.name.trim(), type: form.type, connection })
-    ElMessage.success(form.type === 'SOAP' ? t('targets.soapCreated') : t('targets.dbCreated'))
+    const okMsg = form.type === 'SOAP' ? t('targets.soapCreated')
+      : form.type === 'FHIR' ? t('targets.fhirCreated') : t('targets.dbCreated')
+    ElMessage.success(okMsg)
     await Promise.all([loadManage(), loadTargetTables()])
   } finally {
     creating.value = false

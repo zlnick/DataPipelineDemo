@@ -330,6 +330,10 @@ export default {
     tSOAP: "SOAP 接口",
     tFHIR: "FHIR 接口",
     tREST: "REST 接口",
+    fldBaseUrl: "FHIR endpoint (base URL)",
+    phFhirBase: "http://iris:52773/csp/healthshare/fhirserver/fhir/r4",
+    fhirInfo: "FHIR 存储库（US Core）：资源以 meta.profile 声明式写入；转换时经术语对照补 SNOMED/RxNorm 双 coding。",
+    fhirCreated: "FHIR 目标添加成功（US Core 目标资源模型已生成）",
   },
   agents: {
     title: "已封装 AI 能力（Skills / Agents）",

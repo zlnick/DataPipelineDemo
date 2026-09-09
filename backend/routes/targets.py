@@ -12,7 +12,8 @@ import logging
 from flask import Blueprint, request
 
 from backend.config import Config
-from backend.services import (connection_profiler, interface_analyzer, iris_connector,
+from backend.services import (connection_profiler, fhir_client, fhir_target_model,
+                              interface_analyzer, iris_connector,
                               jdbc_client, repository, wsdl_importer)
 from backend.services.llm_client import AgentError
 from backend.utils import error, success
@@ -54,8 +55,8 @@ def _apply_ai_contract(kind: str, rt: dict | None) -> dict | None:
     rt.setdefault("note", {})["ai"] = note
     return rt
 
-# 允许的目标类型（DB: JDBC 表；SOAP: WSDL 导入型 BO）
-TARGET_TYPES = ["DB", "SOAP"]
+# 允许的目标类型（DB: JDBC 表；SOAP: WSDL 导入型 BO；FHIR: US Core 声明式写入内置 FHIR BO）
+TARGET_TYPES = ["DB", "SOAP", "FHIR"]
 
 
 def _target_table_rows() -> list[dict]:
@@ -94,6 +95,28 @@ def _target_table_rows() -> list[dict]:
                     "count": 0,
                     "status": tg.get("status", "analyzed"),
                     # 接口分析 Agent（AI）语义产物
+                    "ai_semantics": ent.get("ai_semantics") or "",
+                    "direction": ent.get("direction") or "",
+                    "ai_reason": ent.get("ai_reason") or "",
+                })
+            continue
+        if tg.get("type") == "FHIR":
+            # FHIR 目标：目标实体 = US Core 资源（无 SQL count）
+            for ent in tg.get("tables", []) or []:
+                cols = ent.get("columns", [])
+                col_names = [c["name"] if isinstance(c, dict) else c for c in cols]
+                items.append({
+                    "target_id": tg.get("id"),
+                    "target_name": tg.get("name"),
+                    "table": ent.get("entity_name") or ent.get("table") or "FHIR",
+                    "schema": "FHIR",
+                    "profile": ent.get("profile") or "",
+                    "columns": col_names,
+                    "fields": ent.get("fields") or col_names,
+                    "type": "FHIR",
+                    "enabled": True,
+                    "count": 0,
+                    "status": tg.get("status", "analyzed"),
                     "ai_semantics": ent.get("ai_semantics") or "",
                     "direction": ent.get("direction") or "",
                     "ai_reason": ent.get("ai_reason") or "",
@@ -218,6 +241,39 @@ def create_target():
             "id": target_id, "bo_class": imp["boClass"], "entities": entities,
             "target": repository.get_target(target_id),
         }, "SOAP 目标添加成功（WSDL 已导入生成 BO，AI 实体分析完成）")
+
+    if target_type == "FHIR":
+        base = (conn.get("base_url") or "").strip().rstrip("/")
+        if not base:
+            return error("FHIR 目标需要 base_url（FHIR endpoint 根，如 "
+                         "http://dataflow-iris:52773/csp/healthshare/fhirserver/fhir/r4）"), 400
+        user = conn.get("username") or "superuser"
+        pwd = conn.get("password") or "SYS"
+        res_types = conn.get("resource_types") or fhir_target_model.DEFAULT_RESOURCE_TYPES
+        entities = fhir_target_model.build_entities(res_types)
+        conn = {**conn, "base_url": base, "username": user, "password": pwd,
+                "entities": entities, "profile_base": fhir_target_model.US_CORE_BASE}
+        target_id = repository.create_target(name, "FHIR", conn, tables=entities)
+        repository.update_target(target_id, {"status": "analyzed"})
+        repository.save_target_interface({
+            "id": target_id, "target_id": target_id, "name": name, "type": "FHIR",
+            "tables": entities,
+            "config": {"base_url": base, "username": user,
+                       "resource_types": list(res_types),
+                       "profile_base": fhir_target_model.US_CORE_BASE},
+        })
+        # 可达性探活：拉取 CapabilityStatement（只读，不校验 profile）
+        runtime = {}
+        try:
+            fhir_client.get_capability_statement(base + "/", user, pwd)
+            runtime["health"] = "ok"
+        except Exception as exc:  # noqa: BLE001 - 探活失败不阻断登记
+            logger.warning("FHIR 目标探活失败: %s", exc)
+            runtime["health"] = "unreachable"
+        repository.update_target(target_id, {"runtime": runtime})
+        return success({"id": target_id, "entities": entities,
+                        "target": repository.get_target(target_id)},
+                       "FHIR 目标添加成功（US Core 目标资源模型已生成）")
 
     if not conn.get("jdbc_url"):
         return error("缺少 JDBC 连接信息（jdbc_url）"), 400

@@ -35,6 +35,16 @@ TARGET_COMPONENTS = {
          "import_based": True,
          "host_settings": {}},
     ],
+    "FHIR": [
+        # FHIR 存储库（US Core 声明式）：写入 FHIR server 的官方内置互操作 BO。
+        # BO=HS.FHIRServer.Interop.Operation（IRIS for Health 内置，勿手写类）；
+        # 网络配置落在其 Adapter（EnsLib.HTTP 子类）上：HTTPServer/HTTPPort/Username/Password。
+        {"type": "FHIROperation", "className": "HS.FHIRServer.Interop.Operation",
+         "role": "operation", "comment": "FHIR 资源投放（US Core profile 声明式，内置互操作 BO）",
+         "adapter_settings": {"HTTPServer": "", "HTTPPort": 52773,
+                              "Username": "", "Password": ""},
+         "host_settings": {}},
+    ],
 }
 
 # ---------------- 通用组件（跨类型） ----------------

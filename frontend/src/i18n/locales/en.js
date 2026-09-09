@@ -330,6 +330,10 @@ export default {
     tSOAP: "SOAP Service",
     tFHIR: "FHIR Service",
     tREST: "REST API",
+    fldBaseUrl: "FHIR endpoint (base URL)",
+    phFhirBase: "http://iris:52773/csp/healthshare/fhirserver/fhir/r4",
+    fhirInfo: "FHIR repository (US Core): resources written declaratively via meta.profile; mapping adds SNOMED/RxNorm dual coding.",
+    fhirCreated: "FHIR target added (US Core resource model generated)",
   },
   agents: {
     title: "AI Capabilities (Skills / Agents)",

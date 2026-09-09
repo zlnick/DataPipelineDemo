@@ -16,7 +16,7 @@ export const DATA_SOURCE_TYPES = [
 export const TARGET_TYPES = [
   { value: 'DB', label: '数据库', enabled: true, desc: '远端数据库表（JDBC，示例：模拟远端库）' },
   { value: 'SOAP', label: 'SOAP 接口', enabled: true, desc: 'Web Service SOAP（WSDL 导入生成 BO）' },
-  { value: 'FHIR', label: 'FHIR 接口', enabled: false, desc: 'FHIR 资源投放（预留）' },
+  { value: 'FHIR', label: 'FHIR 接口', enabled: true, desc: 'FHIR 存储库（US Core 声明式写入，内置 FHIR BO）' },
   { value: 'REST', label: 'REST 接口', enabled: false, desc: 'HTTP REST 投放（预留）' },
 ]
 
