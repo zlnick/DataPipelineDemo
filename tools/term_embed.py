@@ -133,6 +133,7 @@ def main():
     ap.add_argument("--top", type=int, default=5)
     ap.add_argument("--save", default=None, help="仅向量化并写出 JSONL（不连 IRIS；先停 iris-terminology 腾内存跑）")
     ap.add_argument("--load", default=None, help="从 JSONL 灌入共享向量表（需 iris-terminology 在线；不调 embedding）")
+    ap.add_argument("--no-delete", action="store_true", help="load 时不清除该 SystemUri 已有向量（追加子集）")
     args = ap.parse_args()
 
     if args.save:
@@ -176,9 +177,10 @@ def main():
                 seen.add(k)
                 uris.add(o["uri"])
                 entries.append(o)
-        for u in uris:
-            cur.execute("DELETE FROM Terminology_Vector.TermEmbedding WHERE SystemUri = ?", (u,))
-        conn.commit()
+        if not args.no_delete:
+            for u in uris:
+                cur.execute("DELETE FROM Terminology_Vector.TermEmbedding WHERE SystemUri = ?", (u,))
+            conn.commit()
         t0 = time.time()
         for i in range(0, len(entries), 500):
             for o in entries[i:i + 500]:
