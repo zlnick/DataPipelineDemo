@@ -12,6 +12,7 @@ export const datasourceApi = {
   schemas: (id) => http.get(`/datasources/${id}/schemas`),
   tables: (id, schema) => http.get(`/datasources/${id}/tables`, { params: { schema } }),
   selectTables: (id, tables) => http.post(`/datasources/${id}/tables`, { tables }),
+  seed: (id, data) => http.post(`/datasources/${id}/seed`, data),
 }
 
 // 独立领域模型（源资产模型 / 目标接口模型 / 转换计划）

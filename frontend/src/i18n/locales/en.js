@@ -56,6 +56,8 @@ export default {
     register: "Register Data Source",
     name: "Name",
     namePlaceholder: "Data source name",
+    genDemo: "Generate demo data (10)",
+    seedOk: "CLINIC demo generated: {p} patients / {e} encounters / {d} diagnoses / {m} meds",
     type: "Type",
     reserved: "(reserved)",
     reservedTip: "(reserved, not implemented)",

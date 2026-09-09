@@ -56,6 +56,8 @@ export default {
     register: "注册数据源",
     name: "名称",
     namePlaceholder: "数据源名称",
+    genDemo: "生成演示数据(10)",
+    seedOk: "CLINIC 演示数据已生成：患者 {p} / 就诊 {e} / 诊断 {d} / 药嘱 {m}",
     type: "类型",
     reserved: "（预留）",
     reservedTip: "（预留，暂未实现）",

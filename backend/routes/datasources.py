@@ -8,8 +8,8 @@ import logging
 from flask import Blueprint, request
 
 from backend.schemas.models import DataSourceIn
-from backend.services import (connection_profiler, fhir_client, interface_analyzer,
-                              jdbc_client, profile_analyzer, repository)
+from backend.services import (clinic_seed, connection_profiler, fhir_client,
+                              interface_analyzer, jdbc_client, profile_analyzer, repository)
 from backend.services.llm_client import AgentError
 from backend.utils import error, success
 
@@ -299,6 +299,31 @@ def select_source_tables(ds_id: str):
         "saved": saved, "count": len(saved),
         "ai": _ai_semantics_summary(repository.list_assets(ds_id)),
     }, "数据表已保存（AI 语义分析与轮询键建议完成）")
+
+
+@datasources_bp.post("/<ds_id>/seed")
+def seed_datasource(ds_id: str):
+    """为 SQL 演示源（CLINIC）生成 n 位患者模拟数据（诊断/药嘱取自中文术语集）。
+
+    幂等：先清四表再写入；返回各表条数。术语连接与 CLINIC 库由 clinic_seed 服务按
+    Docker 网络服务名配置（iris-terminology / iris）。
+    """
+    ds = repository.get_datasource(ds_id)
+    if not ds:
+        return error("数据源不存在"), 404
+    if ds.get("type") != "SQL":
+        return error("仅 SQL 数据源支持生成 CLINIC 演示数据"), 400
+    body = request.get_json(silent=True) or {}
+    try:
+        n = int(body.get("patients", 10) or 10)
+    except (TypeError, ValueError):
+        n = 10
+    try:
+        stat = clinic_seed.generate_clinic_seed(n=n)
+    except Exception as exc:  # noqa: BLE001 - 生成失败返回明确错误
+        logger.error("生成 CLINIC 演示数据失败: %s", exc)
+        return error(f"生成失败: {exc}"), 500
+    return success(stat, "CLINIC 演示数据生成完成（诊断/药品取自中文术语集）")
 
 
 @datasources_bp.get("/<ds_id>/assets")

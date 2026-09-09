@@ -90,9 +90,12 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column :label="t('datasources.actions')" width="220" fixed="right">
+        <el-table-column :label="t('datasources.actions')" width="320" fixed="right">
           <template #default="{ row }">
             <template v-if="row.type === 'SQL'">
+              <el-button size="small" type="primary" :loading="seedingId === row.id" @click="handleSeed(row)">
+                {{ t('datasources.genDemo') }}
+              </el-button>
               <el-button size="small" type="primary" @click="openSourceWizard(row)">{{ t('datasources.selectTables') }}</el-button>
               <el-button size="small" @click="goAssets(row.id)">{{ t('datasources.assets') }}</el-button>
             </template>
@@ -255,6 +258,24 @@ function runtimeHealthOk(row) {
 }
 function runtimeHealthDetail(row) {
   return (row.runtime && row.runtime.health && row.runtime.health.detail) || ''
+}
+
+const seedingId = ref('')
+
+async function handleSeed(row) {
+  if (row.type !== 'SQL') return
+  seedingId.value = row.id
+  try {
+    const data = await datasourceApi.seed(row.id, { patients: 10 })
+    const s = data?.data || {}
+    ElMessage.success(t('datasources.seedOk', {
+      p: s.patients ?? 0, e: s.encounters ?? 0, d: s.diagnoses ?? 0, m: s.medications ?? 0,
+    }))
+  } catch {
+    // 错误已由拦截器提示
+  } finally {
+    seedingId.value = ''
+  }
 }
 
 async function handleCreate() {
