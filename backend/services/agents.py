@@ -126,6 +126,21 @@ AGENTS = [
         "engine": "LLM 单轮 prompt 封装（llm_client.polish_validation_issues），失败即报错",
         "status": "ready",
     },
+    {
+        "id": "mapping-agent",
+        "name": "术语映射判定 Agent（C3）",
+        "kind": "agent",
+        "role": "中国药品名 ↔ RxNorm 术语映射判定专家",
+        "purpose": "把中文药品名（医保/商保目录，可能含剂型）判定为 RxNorm 概念："
+                   "多路召回（chinese-map 词表确定性命中 + 英文名二次向量召回 IN/SCD/SBD/BN + 中文原词兜底）"
+                   "后由 LLM 在候选证据上选最佳 RXCUI（明确 TTY 层）或判无映射",
+        "input": "中文药名 + 可选语境（来源/剂型/商品名）",
+        "output": "判定结果（match/rxcui/tty/enName/reason/confidence/alias_based）+ 召回证据",
+        "trigger": "POST /api/mapping/cn2rx（术语互操作/数据管道目标映射阶段）",
+        "capabilities": ["多路召回合并", "音译/同族混淆判定", "无映射显式拒绝", "证据可审计"],
+        "engine": "确定性多路召回（词表/向量，非决策）+ LLM 单轮判定；召回为空或 LLM 失败均显式返回",
+        "status": "ready",
+    },
 ]
 
 
