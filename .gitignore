@@ -31,3 +31,7 @@ docs/
 # 个人知识库软链（不纳入版本库）
 knowledge
 data/embedding-model/
+
+# RxNorm 向量化中间产物与日志（可随时重新生成，不纳入版本库）
+data/rxnorm_vec_*.jsonl
+data/rxnorm_vec_run.log
