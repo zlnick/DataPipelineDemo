@@ -28,7 +28,7 @@ def dagger_codes() -> set:
     return out
 
 
-def main():
+def main(exclude_z=False):
     dagger = dagger_codes()
     print("dagger 码数:", len(dagger))
 
@@ -37,6 +37,8 @@ def main():
         rd = csv.reader(fh)
         next(rd, None)
         for code, name in rd:
+            if exclude_z and code.strip().startswith("Z"):
+                continue
             rows.append((code.strip(), name.strip(), 1 if code.strip() in dagger else 0))
     print("CSV 行:", len(rows))
 
@@ -57,4 +59,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--exclude-z", action="store_true", help="跳过 Z 章(健康状态/保健因素)条目")
+    a = ap.parse_args()
+    main(a.exclude_z)

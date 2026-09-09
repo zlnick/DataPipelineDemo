@@ -141,6 +141,20 @@ AGENTS = [
         "engine": "确定性多路召回（词表/向量，非决策）+ LLM 单轮判定；召回为空或 LLM 失败均显式返回",
         "status": "ready",
     },
+    {
+        "id": "mapping-agent-dx",
+        "name": "诊断映射判定 Agent（C3-Dx）",
+        "kind": "agent",
+        "role": "中文诊断（国标 ICD-10）↔ SNOMED CT 术语映射判定专家",
+        "purpose": "把中文诊断判定为 SNOMED（US Core 条件池）：zh-map 双语词表先决 + 命中英文二次向量召回 + 中文原词兜底，"
+                   "由 LLM 在候选上选最佳 SNOMED 码或判无映射（词表外/上位同类不冒充）",
+        "input": "中文诊断名 + 可选语境",
+        "output": "判定结果（match/code/display/reason/confidence/alias_based）+ 召回证据",
+        "trigger": "POST /api/mapping/cn2snomed（中文诊断术语互操作演示）",
+        "capabilities": ["词表先决", "病种族/上位混淆识别", "无映射显式拒绝", "证据可审计"],
+        "engine": "确定性召回（词表/向量，非决策）+ LLM 单轮判定；失败显式返回",
+        "status": "ready",
+    },
 ]
 
 
