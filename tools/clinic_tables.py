@@ -48,7 +48,7 @@ DDL = [
         ReasonText   VARCHAR(200)
     )
     """,
-    # 诊断（FHIR Condition, encounter-diagnosis；Rank=主/次诊断）
+    # 诊断（FHIR Condition, encounter-diagnosis；Rank=主/次诊断；Code/Name/CodeSystem 取国标 ICD-10 中文术语）
     """
     CREATE TABLE Diagnosis (
         ID             VARCHAR(20) PRIMARY KEY,
@@ -56,19 +56,21 @@ DDL = [
         PatientID      VARCHAR(20),
         Code           VARCHAR(20),
         Name           VARCHAR(200),
+        CodeSystem     VARCHAR(60),
         Rank           INTEGER DEFAULT 0,
         OnsetDate      VARCHAR(20),
         ClinicalStatus VARCHAR(20) DEFAULT 'active'
     )
     """,
-    # 药嘱（FHIR MedicationRequest）
+    # 药嘱（FHIR MedicationRequest；MedicationCode/Name/CodeSystem 取中文药品目录术语）
     """
     CREATE TABLE MedicationOrder (
         ID            VARCHAR(20) PRIMARY KEY,
         EncounterID   VARCHAR(20),
         PatientID     VARCHAR(20),
-        RxNormCode    VARCHAR(20),
+        MedicationCode VARCHAR(30),
         MedicationName VARCHAR(200),
+        CodeSystem    VARCHAR(60),
         DosageValue   VARCHAR(50),
         DosageUnit    VARCHAR(20),
         Route         VARCHAR(50),
@@ -77,6 +79,23 @@ DDL = [
         Status        VARCHAR(20) DEFAULT 'active'
     )
     """,
+]
+
+# 关键列 CodeSystem 说明（供后续术语对照/LLM 使用）
+COLUMN_COMMENTS = [
+    ("SQLUser.Patient.ID", "患者主键"),
+    ("SQLUser.Patient.MRN", "病历号（映射 us-core-patient.identifier, 体系 http://hospital.example/mrn）"),
+    ("SQLUser.Patient.Gender", "FHIR administrative-gender：male|female|other"),
+    ("SQLUser.Encounter.ID", "就诊主键"),
+    ("SQLUser.Encounter.ClassCode", "v3 ActCode 就诊类别：IMP(住院)/AMB(门诊)/…"),
+    ("SQLUser.Encounter.ReasonCode", "就诊原因=主诊断，CodeSystem=urn:cn-nhsa:icd10-gbt2016（国标 ICD-10）"),
+    ("SQLUser.Encounter.ReasonText", "主诊断中文名（国标 ICD-10）"),
+    ("SQLUser.Diagnosis.Code", "国标 ICD-10 诊断码（GB/T 14396-2016，已剔除 Z 章）"),
+    ("SQLUser.Diagnosis.Name", "国标 ICD-10 诊断中文名"),
+    ("SQLUser.Diagnosis.CodeSystem", "术语集 URI=urn:cn-nhsa:icd10-gbt2016"),
+    ("SQLUser.MedicationOrder.MedicationCode", "中文药品目录编码（如 NRDL-xxxx / CB-xxxx）"),
+    ("SQLUser.MedicationOrder.MedicationName", "中文药品名（医保目录名称）"),
+    ("SQLUser.MedicationOrder.CodeSystem", "术语集 URI=urn:cn-nhsa:drug-nrdl(医保) / urn:cn-nhsa:drug-cbih(商保)"),
 ]
 
 TABLES = ["Patient", "Encounter", "Diagnosis", "MedicationOrder"]
