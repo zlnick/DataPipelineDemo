@@ -1,0 +1,37 @@
+(version 1)
+;; tools/guard/ai-sandbox.sb —— 受限 AI 会话的 macOS 沙箱（文件层）
+;;
+;; 用法（由 tools/guard/ai-session.sh 调用，需传参）：
+;;   sandbox-exec -f tools/guard/ai-sandbox.sb -D REPO=<仓库绝对路径> -D VAULT=<知识库绝对路径> \
+;;                -D CACHES=<~/Library/Caches> bash -i
+;;
+;; 语义：默认允许；**写入**只允许 仓库 / 知识库 / 临时目录，其余（特别是用户目录其余部分、
+;;      /Volumes、/usr、/etc）一律拒绝 → 越界写文件会被内核直接拒绝（Operation not permitted）。
+;; 注意：规则按顺序求值，**后写的优先**，所以「先整体 deny、再逐个 allow」。
+
+(allow default)
+
+;; ① 整体禁止写入
+(deny file-write* (subpath "/Users"))
+(deny file-write* (subpath "/Volumes"))
+(deny file-write* (subpath "/usr"))
+(deny file-write* (subpath "/bin"))
+(deny file-write* (subpath "/sbin"))
+(deny file-write* (subpath "/Library"))
+(deny file-write* (subpath "/private/etc"))
+(deny file-write* (subpath "/private/var/db"))
+
+;; ② 显式放行（本项目仓库 / 知识库）
+(allow file-write* (subpath (param "REPO")))
+(allow file-write* (subpath (param "VAULT")))
+
+;; ③ 临时目录与设备（工具链必需；进程私有的 /private/var/folders 是 TMPDIR）
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/private/var/folders"))
+(allow file-write* (subpath "/dev"))
+
+;; ④ 缓存目录：Apple 自带 python 3.9 会把 .pyc 写到 ~/Library/Caches/com.apple.python，
+;;    各类工具也会写 ~/Library/Caches —— 缓存可再生（非权威数据），放行以保持工具链可用。
+;;    ⚠ 注意：只放行 Caches，Application Support / Preferences 等仍被拒绝。
+(allow file-write* (subpath (param "CACHES")))

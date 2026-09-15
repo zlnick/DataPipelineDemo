@@ -86,7 +86,12 @@ design the Production topology and hand it to IRIS to compile and start.
 ### Pipelines
 - One-click **Production generation**, supporting heterogeneous combos (FHIR→DB / SQL→DB / SQL→SOAP / FHIR→SOAP)
   and **multiple pipelines inside a single Production** (`POST /api/pipelines/generate` body `pipelines: [group1, group2]`).
-- Routing BP `TransformProcess` dispatches by message source (`^demo.Config("pipe", <source BS>)`) to SOAPOp / SQLOp.
+- Conversion BP: **one BP instance per data pipeline** (an Ens business-host identity is the *item Name*, while the
+  class `demo.TransformProcess` is reused — e.g. `TransformProcess__sql2soap`). Each pipeline's source BS points
+  `TargetConfigNames` at **its own** BP, and the BP reads its own parameters from `^demo.Config("bp", <BP name>)`
+  (mapping / target_type / service|table). Pipelines are therefore fully decoupled: each can be enabled/disabled as a
+  whole and releases its license units with it. Only infrastructure is shared — `JavaGateway` (one JDBC gateway),
+  always required.
 - FHIR incremental: `FHIRSyncService` (cursor) → `FHIRQueue` → `FHIRService` (one-by-one, independent sessions).
 - SQL polling: `EnsLib.SQL.Service.GenericService` (Query + KeyFieldName).
 
@@ -226,6 +231,31 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
   message by its source BS to its own target.
 - Do not use the same table as both a SQL source and a FHIR landing target (loop risk; a dedicated `PatientSource`
   table avoids this in the demo).
+
+## AI Guardrails (limits kept, machinery simplified — 2026-09-14)
+
+This repository was hit by an incident where an AI assistant deleted containers **belonging to other
+projects** (7 containers + their networks; one IRIS database was unrecoverable).
+
+1. **Rules (the core)**: an AI may write to / delete **this repo**, **this project's containers**
+   (`dataflow-*` / `iris-terminology`) and **the knowledge vault** only; everything else is read-only and
+   may only be touched after "enumerate → user confirms → execute". See the top of [`AGENTS.md`](AGENTS.md)
+   and [`.clinerules/`](.clinerules/).
+2. **CLI guard**: `source tools/guard/docker_guard.sh` before running docker — destructive operations on
+   objects outside this project are rejected (rc=77); validate paths with
+   `python3 tools/guard/scope_guard.py check <path>...`.
+3. **File sandbox (optional hardening)**: the restricted session started by `./tools/guard/ai-session.sh`
+   (macOS `sandbox-exec`) may only **write** to the repo, the knowledge vault, `/tmp` and `~/Library/Caches`.
+4. **Need full power over other projects?** Use a plain terminal — the boundaries only constrain AI sessions
+   and guarded scripts.
+
+See [`tools/guard/README.md`](tools/guard/README.md) for the full design, verification runs and known pitfalls.
+
+> ⚠ 2026-09-14: an earlier "restricted Docker API proxy" layer (`DOCKER_HOST` pointing at an in-between
+> proxy that ruled on daemon facts) was **rolled back**: too complex, and it fail-closed on `docker cp`
+> streaming bodies (ownership could not be resolved from the streamed tar), which broke everyday work.
+> There is no proxy layer now — docker talks to the real local socket.
+
 
 ## Notes & Limitations
 

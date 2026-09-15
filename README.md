@@ -65,9 +65,16 @@ Production 拓扑并交给 IRIS 编译启动。
 - **AI 智能匹配与转换关系**：AI 推荐「资产 → 目标表/实体」匹配与字段级映射（支持 `concat()` 等表达式），用户确认保存。
 - **数据管道（单 Production 可多管道）**：一键生成 IRIS Production 管道，支持异构组合（FHIR→DB / SQL→DB / SQL→SOAP / FHIR→SOAP）
   以及**单 Production 多套并存**（`POST /api/pipelines/generate` body `pipelines: [组1, 组2]`）：
-  - 路由 BP `TransformProcess` 按**消息来源**（源 BS）查路由表 `^demo.Config("pipe", 源名)` 分发到对应目标（SOAPOp / SQLOp）
+  - 转换 BP **一条管道一个实例**（Ens 业务主机身份 = Item 名，类 `demo.TransformProcess` 可复用，
+    如 `TransformProcess__sql2soap`）：本管道源 BS 的 `TargetConfigNames` 指向**自己的** BP，
+    转换参数写在 `^demo.Config("bp", <BP名>)` —— 管道之间**零耦合**，可整条启停（许可随管道释放）；
+    真正跨管道共享的只剩基础设施 `JavaGateway`（JDBC 网关，恒需）
   - FHIR 增量：`FHIRSyncService`（`_lastUpdated` 游标）→ `FHIRQueue` → `FHIRService`（逐条独立会话）→ 转换 → 投放
   - SQL 轮询：`EnsLib.SQL.Service.GenericService`（Query/KeyFieldName 增量）→ 行 JSON → 转换 → 投放
+- **数据管道 = 受管理的持久实体**：每次生成登记一条管道实体（源数据源 + 目标接口 + 设计 Skill），
+  重复生成**只更新不新增**（记录生成次数）；组件按 Ens `Category` = 管道类别落地，
+  Pipelines 页「数据管道」卡片可**整条启用/停用/删除/同步**，并能看到许可占用（业务主机数 + 后端连接 ≤ 许可单元，
+  超容量显式报错而不是把后端打挂）；被新生成取代的管道标记为**已取代（superseded）**，只允许删除后重新生成。
 - **自动测试-修复闭环**：generate 前置**连通性检查**（用运行时契约）→ C1 转换验证 → C2 管道验证
   （拓扑/编译/启动/消息）→ 分层修复（规则 → AI ≤2 轮 → 回退），多管道同样走 C2。
 - **动态选项**：前端页面（资产/目标/可查看数据表）的选项**由演示过程登记的内容动态生成**（API 驱动，非写死）。
@@ -97,11 +104,14 @@ Production 拓扑并交给 IRIS 编译启动。
 | `PatientEntity` | SOAP 投递结果（Python mock 收到 AddPatient 实体后落库） | mock 写入 |
 | `FHIRQueue` | FHIR 增量抓取队列表（FHIRSyncService 入队，FHIRService 消费） | FHIRSyncService |
 
-**数据管道（Production）**：`TransformProcess`（路由 BP，Embedded Python 字段映射转换，支持 `concat()` 表达式与 `表.列` 前缀）：
-- FHIR 源：`FHIRSyncService`（`_lastUpdated` 增量游标）→ `FHIRQueue` → `FHIRService`（逐条独立会话）→ `TransformProcess`
-- SQL 源：`EnsLib.SQL.Service.GenericService`（JDBC 轮询，Query + KeyFieldName）→ 行 JSON → `TransformProcess`
+**数据管道（Production）**：转换 BP 类 `demo.TransformProcess`（Embedded Python 字段映射转换，支持 `concat()` 表达式与 `表.列` 前缀）——
+**每条数据管道各建一个 BP 实例**（Ens 业务主机身份 = Item 名，如 `TransformProcess__sql2soap`；类可复用，管道互不干扰）：
+- FHIR 源：`FHIRSyncService`（`_lastUpdated` 增量游标）→ `FHIRQueue` → `FHIRService`（逐条独立会话）→ 本管道的转换 BP
+- SQL 源：`EnsLib.SQL.Service.GenericService`（JDBC 轮询，Query + KeyFieldName）→ 行 JSON → 本管道的转换 BP
 - 目标：`SQLOp_<表>`（JDBC `localTarget` UPSERT）；`SOAPOp_<服务>`（WSDL 导入 BO + Adapter WebServiceURL 指向远端/mock）
-- 路由：`TransformProcess` 用消息来源（`SourceConfigName`）查 `^demo.Config("pipe", 源BS名)` 分发（单 Production 多套并存）
+- 参数与路由：BP 读**自己的**配置 `^demo.Config("bp", <BP名>)`（mapping / target_type / service|table），
+  源 BS 经 `TargetConfigNames`（或 `^demo.Config("bp_target", 源BS名)`）投递给本管道的 BP，
+  再由 BP 按 target_type 分发到 `SQLOp_*` / `SOAPOp_*`；旧路由表 `^demo.Config("pipe", 源BS名)` 仅作历史兼容兜底
 
 
 ## 快速启动
@@ -127,6 +137,27 @@ docker compose down
 # 如需同时清除 IRIS 数据目录（含 FHIR 数据与目标表）：
 docker compose down -v
 ```
+
+## AI 操作边界（2026-09-14：保留限制，简化机制）
+
+> 背景：本项目曾发生一次 AI **越界删除其它项目容器**的事故（其它 3 个项目的 7 个容器及其网络被删，
+> 其中一个 IRIS 库不可恢复）。此后为"AI / 脚本的执行通道"立了边界规则。
+
+1. **规则（最根本）**：AI 只能写/删 **本仓库**、**本项目容器**（`dataflow-*` / `iris-terminology`）、**知识库**；
+   其它项目与宿主目录一律只读——只能在"枚举清单 → 用户显式确认 → 执行"之后动。
+   详见 [`AGENTS.md`](AGENTS.md) 顶部与 [`.clinerules/`](.clinerules/)。
+2. **CLI 守卫**：执行 docker 前 `source tools/guard/docker_guard.sh` —— 本项目之外的破坏性操作被拒（rc=77）；
+   路径校验用 `python3 tools/guard/scope_guard.py check <路径>...`。
+3. **文件沙箱（可选强化）**：`./tools/guard/ai-session.sh` 起的受限会话（macOS `sandbox-exec`）**写入**只允许
+   仓库 / 知识库 / `/tmp` / `~/Library/Caches`，其余内核拒绝。
+4. 需要全权操作其它项目：在普通终端执行（边界只约束 AI 会话与受守卫的脚本）。
+
+细节、实测数据与已知坑见 [`tools/guard/README.md`](tools/guard/README.md)。
+
+> ⚠ 2026-09-14：此前还上过一层「受限 Docker API 代理」（`DOCKER_HOST` → 中间代理，按 daemon 事实裁决
+> 破坏性请求）——**已回滚**：过度复杂，且 `docker cp` 的流式上传体被判不了归属而 fail-closed 误拒，
+> 反而打断日常操作。现在不再有代理层，docker 走本机真实 socket。
+
 
 ## 默认访问地址
 
@@ -158,9 +189,15 @@ docker compose down -v
 | POST | `/api/ai/recommend` | AI 推荐（资产→目标表 + 字段映射） |
 | POST | `/api/mappings` | 保存转换关系 |
 | GET | `/api/mappings` | 转换关系列表 |
-| POST | `/api/pipelines/generate` | 生成并启动数据管道（动态生成 Production） |
+| POST | `/api/pipelines/generate` | 生成并启动数据管道（动态生成 Production）；**许可调度**：超许可上限的分组照旧生成但初始停用（响应 `license_budget.scheduled/suspended`） |
 | POST | `/api/pipelines/run` | 触发一次转换 |
 | GET | `/api/pipelines/status` | 管道运行状态 |
+| GET | `/api/pipelines/items` | Production 组件清单（含类别分组、许可单元占用） |
+| POST | `/api/pipelines/items/toggle` | 在线启停单个组件（切换管道占用许可） |
+| GET | `/api/pipelines/instances` | **数据管道实体列表**（状态 active/suspended/superseded、生成次数、按类别分组、许可占用） |
+| POST | `/api/pipelines/instances/<id>/enable` \| `/disable` | 整条管道启用/停用；**一键切换**：许可不足时自动停用其它活动管道腾单元（`disabled_others`），腾不出来才显式失败 |
+| DELETE | `/api/pipelines/instances/<id>` | 删除管道实体（并让其组件让路） |
+| POST | `/api/pipelines/instances/sync` | 按 Production 事实同步/校正管道实体状态 |
 | GET | `/api/pipelines/logs` | 消息流转日志（Ens.MessageHeader） |
 | GET | `/api/pipelines/mappings` | Production 正在执行的转换关系 |
 | GET | `/api/pipelines/target-data` | 目标表落库结果 |

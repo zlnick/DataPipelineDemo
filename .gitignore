@@ -3,8 +3,10 @@ __pycache__/
 *.pyc
 .venv/
 
-# 环境变量（含 API Key，不入库）
+# 环境变量（含 API Key，绝不入库）；只入库无值模板 .env.example
 .env
+.env.*
+!.env.example
 
 # 前端
 node_modules/
@@ -18,6 +20,9 @@ data/iris/*
 # 其他
 .DS_Store
 *.log
+
+# AI 清理/备份工作区（备份 tar、删除清单、docker 守卫审计日志；不入库）
+.trash/
 
 # 知识库软链（避免搜索/版本控制跟随到大量 md）
 knowledge/
@@ -35,3 +40,8 @@ data/embedding-model/
 # RxNorm 向量化中间产物与日志（可随时重新生成，不纳入版本库）
 data/rxnorm_vec_*.jsonl
 data/rxnorm_vec_run.log
+
+# 测试数据工具箱的脚本副本（权威版本在仓库 tools/，不为副本做版本管理；
+# 同步方式见 tools/datakit/README.md 第七节；run.sh 与 README.md 仍入库）
+tools/datakit/host/
+tools/datakit/container/
