@@ -74,7 +74,11 @@ def judge_issues(report: dict, context: dict, past_issues: list[dict]) -> dict:
 
 def _l1_rule_fix(topology: dict | None, source_type: str,
                  target_type: str) -> tuple[dict, bool]:
-    """L1 规则修复：明确机械规则（剔除未知组件、补 className、补必选组件）。
+    """L1 规则修复：只做机械补全（补 className、补必选件），**不删除 AI/Agent 决策组件**。
+
+    红线：规则不得改写 AI 决策的组件构成。未注册类型的组件若已有 className
+    （如 Agent 生成的 BP、设计 Skill 的查询 BO），一律保留（是否精简由 LLM 决策
+    fix_topology 负责）；仅当既未注册、又没有 className（无法参数化）时才剔除。
 
     返回: (修正后的拓扑, 是否有改动)
     """
@@ -86,31 +90,50 @@ def _l1_rule_fix(topology: dict | None, source_type: str,
         templates[c["type"]] = c
     for c in type_registry.get_common_components():
         templates[c["type"]] = c
+    # 设计 Skill 专属组件（sql2fhir 患者聚合 BP 等，类源码由 Agent 生成——平台不预置）
+    for c in type_registry.get_pipeline_asset_components():
+        templates[c["type"]] = c
+    # SQL 源的查询 BO = 现成 EnsLib.SQL.Operation.GenericOperation（读语义），与目标类型无关
+    if source_type == "SQL" or "SQL" in (source_type or []):
+        templates.setdefault("SQLOperation", {
+            "type": "SQLOperation", "className": "EnsLib.SQL.Operation.GenericOperation",
+            "comment": "SQL 查询 BO（读语义，回喂聚合 BP）"})
 
     changed = False
     fixed: list[dict] = []
     for c in components:
         ctype = c.get("type", "")
-        if ctype not in templates:
-            changed = True  # 剔除未知类型组件
-            continue
+        tpl = templates.get(ctype)
         if not c.get("className"):
-            c = {**c, "className": templates[ctype]["className"],
-                 "comment": c.get("comment") or templates[ctype].get("comment", "")}
-            changed = True
+            if tpl and tpl.get("className"):
+                # 已注册类型缺 className → 机械补全
+                c = {**c, "className": tpl["className"],
+                     "comment": c.get("comment") or tpl.get("comment", "")}
+                changed = True
+            else:
+                changed = True  # 既未注册又无 className，无法参数化 → 剔除
+                continue
         fixed.append(c)
 
     seen = {c.get("type") for c in fixed}
-    for req in ("TransformProcess", "JavaGateway"):
-        if req not in seen and req in templates:
-            tpl = templates[req]
-            fixed.append({
-                "type": req, "name": tpl["className"], "className": tpl["className"],
-                "comment": tpl.get("comment", ""),
-                "settings": [{"target": "Host", "name": k, "value": v}
-                             for k, v in tpl.get("settings", {}).items()],
-            })
-            changed = True
+    # 必选件补齐：处理组件（TransformProcess 或 Skill 聚合 BP）+ JavaGateway
+    process_seen = any(t in seen for t in ("TransformProcess", "PatientTxProcess"))
+    required = ([("TransformProcess", "TransformProcess")] if not process_seen else []) \
+        + [("JavaGateway", "JavaGateway")]
+    for key, req in required:
+        if req in seen or req not in templates:
+            continue
+        tpl = templates[req]
+        fixed.append({
+            "type": req, "name": tpl.get("className", req),
+            "className": tpl["className"],
+            "comment": tpl.get("comment", ""),
+            "settings": [{"target": "Host", "name": k, "value": v}
+                         for k, v in (tpl.get("settings") or {}).items()],
+        })
+        seen.add(req)
+        changed = True
+        logger.info("管道 L1 机械补齐必选组件 %s（校验性补齐，不改 AI 决策构成）", key)
 
     new_topo = {
         "production": (topology or {}).get("production")
@@ -121,10 +144,18 @@ def _l1_rule_fix(topology: dict | None, source_type: str,
 
 
 def _default_topology(mappings: list[dict], source_type: str,
-                      target_type: str) -> dict:
-    """L3 回退：按注册表 + 映射重建完整拓扑（等价 build_pipeline_topology）。"""
-    from backend.routes.pipelines import build_pipeline_topology  # 延迟 import 避免循环依赖
-    return build_pipeline_topology(mappings, source_type, target_type)
+                      target_type: str, base_topology: dict | None = None) -> dict:
+    """L3 回退：**保守重建**——保留 AI/Agent 决策组件，只做机械补全。
+
+    红线：规则兜底不得丢弃 Agent 生成组件（如 sql2fhir 的聚合 BP / 查询 BO），
+    因此不再用通用 build_pipeline_topology 整体替换拓扑，而是在现有拓扑基础上
+    补齐 className 与必选件（JavaGateway / 处理组件）后返回。
+    """
+    base = {"production": (base_topology or {}).get("production")
+            or pipeline_validator.PRODUCTION_NAME,
+            "components": list((base_topology or {}).get("components", []))}
+    topo, _ = _l1_rule_fix(base, source_type, target_type)
+    return topo
 
 
 def validate_and_fix_pipeline(mappings: list[dict], topology: dict | None,
@@ -205,7 +236,8 @@ def validate_and_fix_pipeline(mappings: list[dict], topology: dict | None,
             # L3 回退默认：规则重建整拓扑（红线审计：AI 决策被规则默认替换，必须显式标注）
             rule_applied = True
             current_topology = _default_topology(
-                list(mappings or []), source_type, target_type)
+                list(mappings or []), source_type, target_type,
+                base_topology=current_topology)
 
         # 重新生成（L2/L3；none/start 不触发重新生成，start 已单独执行启动）
         if action not in ("none", "start"):

@@ -36,13 +36,16 @@ TARGET_COMPONENTS = {
          "host_settings": {}},
     ],
     "FHIR": [
-        # FHIR 存储库（US Core 声明式）：写入 FHIR server 的官方内置互操作 BO。
-        # BO=HS.FHIRServer.Interop.Operation（IRIS for Health 内置，勿手写类）；
-        # 网络配置落在其 Adapter（EnsLib.HTTP 子类）上：HTTPServer/HTTPPort/Username/Password。
-        {"type": "FHIROperation", "className": "HS.FHIRServer.Interop.Operation",
-         "role": "operation", "comment": "FHIR 资源投放（US Core profile 声明式，内置互操作 BO）",
+        # FHIR 存储库本质是标准 REST 接口（PUT/POST + Content-Type: application/fhir+json
+        # + Basic Auth + body=资源 JSON），无需生成/引用 FHIR 专用 BO。
+        # 通用做法 = EnsLib.HTTP.GenericOperation（USER 可直接引用的内置泛化 HTTP 转发 Operation）：
+        #   - Adapter 配远端（HTTPServer/HTTPPort/SSLConfig），认证放请求 Authorization 头；
+        #   - 请求 = EnsLib.HTTP.GenericMessage（Stream=资源 JSON + HTTPHeaders 头）；
+        #   - 具体 method/path/body 由发送方（TransformProcess 打包器）构造。
+        {"type": "HTTPOperation", "className": "EnsLib.HTTP.GenericOperation",
+         "role": "operation", "comment": "FHIR R4 目标：通用 HTTP Operation（REST PUT，头/体由发送方构造）",
          "adapter_settings": {"HTTPServer": "", "HTTPPort": 52773,
-                              "Username": "", "Password": ""},
+                              "SSLConfig": "", "ResponseTimeout": 30},
          "host_settings": {}},
     ],
 }
@@ -54,6 +57,17 @@ COMMON_COMPONENTS = [
     {"type": "JavaGateway", "className": "EnsLib.JavaGateway.Service",
      "role": "gateway", "comment": "Java 网关（SQL Operation JDBC 连接）",
      "settings": {"%gatewayName": "%Java Server"}},
+]
+
+# ---------------- Skill 专属组件的生成契约（非预置资产） ----------------
+# sql2fhir-patient-tx 的患者聚合 BP：**绝不允许平台预置 BP 资产**——其类源码由
+# 数据管道设计 Agent（LLM）在每次生成该管道时产出（Skill 规范 + 布局驱动），平台只做
+# 注册此"类型 token + 生成类名契约"供拓扑校验/渲染，不提供任何预置实现。
+# 子表查询 BO 复用现成 EnsLib.SQL.Operation.GenericOperation（读语义参数化），无需新组件。
+PIPELINE_ASSET_COMPONENTS = [
+    {"type": "PatientTxProcess", "className": "demo.SqlFhirPatientTxProcess",
+     "role": "process", "comment": "sql2fhir 患者聚合 BP（控制中心）——类源码由 Agent 生成，平台不预置",
+     "settings": {}},
 ]
 
 
@@ -82,3 +96,8 @@ def get_target_components(target_type: str) -> list[dict]:
 def get_common_components() -> list[dict]:
     """通用组件模板列表。"""
     return COMMON_COMPONENTS
+
+
+def get_pipeline_asset_components() -> list[dict]:
+    """设计 Skill 专属运行资产模板（C2 校验放行/className 单一来源；不进 AI 枚举）。"""
+    return PIPELINE_ASSET_COMPONENTS

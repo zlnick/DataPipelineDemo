@@ -104,9 +104,9 @@ class RecommendRequest(BaseModel):
 class FieldMapping(BaseModel):
     """字段映射项。"""
 
-    source: str = Field(..., description="源路径，如 name[0].family")
+    source: Optional[str] = Field(None, description="源路径，如 name[0].family；constant 指令时为 null")
     target: str = Field(..., description="目标列名")
-    transform: Optional[str] = Field(None, description="可选转换规则（如 date）")
+    transform: Optional[str] = Field(None, description="受控转换指令（direct/date/constant:<值>/term_map:<skill> 等）")
 
 
 class MappingItem(BaseModel):

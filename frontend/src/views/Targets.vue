@@ -94,6 +94,10 @@
               <el-tag size="small" type="info">{{ row.connection?.service || 'default' }}</el-tag>
               <span class="ml6 gray">{{ row.connection?.wsdl }}</span>
             </template>
+            <template v-else-if="row.type === 'FHIR'">
+              <el-tag size="small" type="success">FHIR R4</el-tag>
+              <span class="ml6 gray">{{ row.connection?.base_url }}</span>
+            </template>
             <template v-else>{{ row.connection?.jdbc_url }}</template>
           </template>
         </el-table-column>
@@ -107,6 +111,12 @@
               </div>
               <div v-if="row.runtime?.delivery?.note" class="mb4 gray sm">{{ row.runtime.delivery.note }}</div>
             </template>
+            <template v-else-if="row.type === 'FHIR'">
+              <el-tag size="small" type="success">{{ t('targets.fhirPut') }}</el-tag>
+              <span v-if="row.runtime?.candidates?.count" class="ml6 gray sm">
+                {{ t('targets.fhirCand', { n: row.runtime.candidates.count }) }}
+              </span>
+            </template>
             <template v-else><el-tag size="small" type="info">DB UPSERT</el-tag></template>
             <el-tooltip :content="(row.runtime?.health?.detail) || ''" placement="top">
               <el-tag size="small" :type="row.runtime?.health?.ok ? 'success' : 'danger'">
@@ -119,6 +129,9 @@
           <template #default="{ row }">
             <template v-if="row.type === 'SOAP'">
               <el-button size="small" :loading="importingId === row.id" @click="handleImport(row)">{{ t('targets.btnReimport') }}</el-button>
+            </template>
+            <template v-else-if="row.type === 'FHIR'">
+              <el-button size="small" type="primary" :loading="refreshingId === row.id" @click="handleRefresh(row)">{{ t('targets.btnRefreshResources') }}</el-button>
             </template>
             <template v-else>
               <el-button size="small" :loading="testingId === row.id" @click="handleTest(row)">{{ t('targets.test') }}</el-button>
@@ -147,9 +160,19 @@
           </template>
         </el-table-column>
         <el-table-column prop="count" :label="t('targets.colRows')" width="80" />
+        <el-table-column :label="t('targets.colConstraints')" width="110">
+          <template #default="{ row }">
+            <el-button v-if="row.type === 'FHIR'" link type="primary" size="small"
+                       @click="showConstraints(row)">{{ t('targets.viewConstraints') }}</el-button>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
         <el-table-column :label="t('targets.colOps')" width="120" fixed="right">
           <template #default="{ row }">
-            <el-button v-if="row.type !== 'SOAP'" size="small" type="primary" plain @click="showData(row.table)">{{ t('targets.btnView') }}</el-button>
+            <template v-if="row.type === 'DB'">
+              <el-button size="small" type="primary" plain @click="showData(row.table)">{{ t('targets.btnView') }}</el-button>
+            </template>
+            <el-tag v-else-if="row.type === 'FHIR'" size="small" type="success">{{ t('targets.fhirEntity') }}</el-tag>
             <el-tag v-else size="small" type="info">{{ t('targets.soapEntity') }}</el-tag>
           </template>
         </el-table-column>
@@ -221,6 +244,17 @@
       </el-table>
       <div class="mt12">{{ t('targets.rows', { n: rows.length }) }}</div>
     </el-dialog>
+
+    <!-- FHIR 结构约束对话框（choice/数组/引用目标，来自 fhir_target_model） -->
+    <el-dialog v-model="constraintsVisible" :title="constraintsTitle" width="760px">
+      <el-table :data="constraintsRows" border stripe max-height="440" size="small">
+        <el-table-column prop="name" :label="t('targets.cName')" min-width="130" />
+        <el-table-column prop="fh_property" :label="t('targets.cProp')" min-width="150" />
+        <el-table-column prop="value_landing" :label="t('targets.cLanding')" width="100" />
+        <el-table-column prop="reference_target" :label="t('targets.cRef')" width="130" />
+        <el-table-column prop="choice_property" :label="t('targets.cChoice')" min-width="150" />
+      </el-table>
+    </el-dialog>
   </div>
 </template>
 
@@ -252,6 +286,10 @@ const tablesLoading = ref(false)
 const creating = ref(false)
 const testingId = ref('')
 const importingId = ref('')
+const refreshingId = ref('')
+const constraintsVisible = ref(false)
+const constraintsTitle = ref('')
+const constraintsRows = ref([])
 
 const form = reactive({
   name: t('targets.defName'),
@@ -284,6 +322,24 @@ async function loadTargetTables() {
     targetTables.value = data?.items || []
   } finally {
     tablesLoading.value = false
+  }
+}
+
+async function showConstraints(row) {
+  // FHIR 已建模资源的结构约束（choice/数组/引用目标）——由 /targets/fhir-constraints 提供
+  try {
+    const data = await targetApi.fhirConstraints(row.table)
+    const cons = data?.constraints || {}
+    const rows = Object.entries(cons).map(([name, c]) => ({ name, ...c }))
+    if (!rows.length) {
+      ElMessage.warning(t('targets.constraintsMissing', { r: row.table }))
+      return
+    }
+    constraintsRows.value = rows
+    constraintsTitle.value = `${row.table} · ${t('targets.constraintsTitle')}`
+    constraintsVisible.value = true
+  } catch (e) {
+    ElMessage.warning(t('targets.constraintsMissing', { r: row.table }))
   }
 }
 
@@ -348,6 +404,20 @@ async function handleImport(row) {
     // 错误提示已由拦截器处理
   } finally {
     importingId.value = ''
+    await Promise.all([loadManage(), loadTargetTables()])
+  }
+}
+
+async function handleRefresh(row) {
+  refreshingId.value = row.id
+  try {
+    const data = await targetApi.refreshResources(row.id)
+    const n = (data?.resource_types || []).length
+    ElMessage.success(t('targets.refreshOk', { n }))
+  } catch {
+    // 错误提示已由拦截器处理
+  } finally {
+    refreshingId.value = ''
     await Promise.all([loadManage(), loadTargetTables()])
   }
 }

@@ -12,6 +12,10 @@
 #   → 业界称「Skill（单轮 LLM 技能）」
 # - kind=agent：事实检查工具 + LLM 决策 ≤2 轮修复循环 + 经验沉淀注入
 #   → 业界认可为「Agent / agentic workflow（验证-修复循环）」
+# - kind=planner：入口/规划 Agent——LLM 决策（选择/组合 Skill 并绑定参数）+ 编排执行
+#   → 业界称「orchestrator / planner agent（数据管道设计 Agent）」
+# - kind=design-skill：可复用受控实现能力（拓扑/规则/资产），由 planner 选用，executor 参数化执行
+#   → 注册于 backend/services/pipeline_design_skills.py（Skill 执行与 AI 选型分离）
 AGENTS = [
     {
         "id": "interface-analyzer-agent",
@@ -72,17 +76,21 @@ AGENTS = [
     },
     {
         "id": "pipeline-agent",
-        "name": "数据管道设计",
-        "kind": "skill",
-        "role": "IRIS 互操作性架构师",
-        "purpose": "根据确认的转换关系与源/目标运行契约（轮询/投递能力），生成管道组件拓扑——"
-                   "AI 决定组件构成与顺序（含多目标表/多管道并存）；类型注册表只补 className/settings"
-                   "与保底补齐（补齐标注 ai_supplemented），LLM 失败即报错（不静默回退规则）",
-        "input": "确认映射 + 源/目标运行契约（脱敏 connection/poll/delivery）+ 组件枚举（含接口分析 Agent 语义）",
-        "output": "pipeline（组件拓扑：AI 决策构成，注册表参数化）",
-        "trigger": "生成数据管道",
-        "capabilities": ["组件组合设计", "异构源/目标组合", "多管道拓扑", "按来源路由设计", "AI 决策可审计"],
-        "engine": "LLM 生成拓扑（recommend_pipeline）+ 类型注册表参数化/完整性校验",
+        "name": "数据管道设计 Agent（规划师）",
+        "kind": "planner",
+        "role": "数据管道设计入口与规划师",
+        "purpose": "根据「源/目标对 + 已确认映射 + 运行契约」，从「管道设计 Skill 目录」选择/组合适用的"
+                   "设计 Skill 并绑定参数（design_skill 决策），把执行交给所选 Skill（executor 按模板参数化）；"
+                   "AI 决策 = Skill 选型与编排（ai.driven 可审计），类型注册表只做参数化/完整性校验/保底补齐"
+                   "（补齐标注 ai_supplemented），LLM 失败即显式报错（不静默回退规则）",
+        "input": "确认映射 + 源/目标运行契约（脱敏 connection/poll/delivery）+ 管道设计 Skill 目录"
+                 "（pipeline_design_skills，含接口分析 Agent 语义）+ 组件注册表",
+        "output": "design_skill 决策（{skill_id(s), params}）+ 由所选 Skill 参数化生成的组件拓扑",
+        "trigger": "生成数据管道（单/多管道：逐组按源/目标对匹配 Skill，异构组组合后合并共享组件）",
+        "capabilities": ["源/目标对匹配选型", "Skill 选择与组合编排", "参数绑定", "多管道分组",
+                         "拓扑校验衔接 C2", "AI 决策可审计"],
+        "engine": "LLM 选型（recommend_pipeline，输出 design_skill + 组件拓扑；Skill 目录注入上下文）"
+                  " + 类型注册表参数化/完整性校验；Skill executor 通道逐步接入",
         "status": "ready",
     },
     {
@@ -129,6 +137,7 @@ AGENTS = [
     {
         "id": "mapping-agent",
         "name": "术语映射判定 Agent（C3）",
+        "term_id": "cn2rx",
         "kind": "agent",
         "role": "中国药品名 ↔ RxNorm 术语映射判定专家",
         "purpose": "把中文药品名（医保/商保目录，可能含剂型）判定为 RxNorm 概念："
@@ -144,6 +153,7 @@ AGENTS = [
     {
         "id": "mapping-agent-dx",
         "name": "诊断映射判定 Agent（C3-Dx）",
+        "term_id": "cn2snomed",
         "kind": "agent",
         "role": "中文诊断（国标 ICD-10）↔ SNOMED CT 术语映射判定专家",
         "purpose": "把中文诊断判定为 SNOMED（US Core 条件池）：zh-map 双语词表先决 + 命中英文二次向量召回 + 中文原词兜底，"

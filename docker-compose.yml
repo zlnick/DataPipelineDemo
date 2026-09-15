@@ -17,6 +17,13 @@ services:
       - "1972:1972"     # 超级服务器端口
     environment:
       IRIS_PASSWORD: SYS   # 约定：所有 Demo 统一使用 superuser / SYS 登录
+      # 【重要】IRIS 数据目录必须指向挂载卷内的子目录，否则数据落在镜像内 /usr/irissys/mgr：
+      # 容器一旦重建（docker compose up -d iris），FHIR 数据、Production 定义、DSN、CLINIC 演示库全部丢失
+      ISC_DATA_DIRECTORY: /dur/irissys
+      # 内嵌 Java 网关（%Java Server）编码：容器默认 locale 为 POSIX，JVM 会退回 ASCII，
+      # 导致 JDBC 读回的中文在行 JSON 里变成 "?"（SQL 源中文姓名丢失）
+      LANG: C.UTF-8
+      JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8
     volumes:
       - ./iris/init-password.sh:/shared/init-password.sh:ro   # 凭据初始化脚本
       - ./iris/setup.sh:/shared/setup.sh:ro                   # 统一初始化入口
@@ -48,6 +55,8 @@ services:
       FHIR_PASSWORD: SYS
       # LLM（OpenAI 兼容接口）配置，来自宿主 .env
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      # FHIR 演示种子开关：0 = 容器启动时不灌 P001..P010 等示例资源（只验证管道写入）
+      SEED_FHIR: ${SEED_FHIR:-1}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
     volumes:

@@ -164,17 +164,29 @@ def _eval_expr(resource, source_expr):
 
 
 def _extract_value(resource, source_expr, transform):
-    """按映射从源数据提取并转换值（支持 concat 表达式 / 字段路径 / 字面量）。
+    """按映射从源数据提取并转换值（支持受控指令 / concat 表达式 / 字段路径 / 字面量）。
+
+    受控指令（LLM 决策的 transform，平台只执行）：
+      - constant:<值>：无源字段时输出固定值（如 intent=constant:order）；
+      - date：取日期前 10 位；
+      - term_map:<skill>：运行期由判码 Skill 处理（此处返回源值，双 coding 由打包器追加）。
 
     参数:
         resource: 源数据（FHIR 资源 dict / SQL 行 dict）。
-        source_expr: source 表达式（如 concat(Patient.FamilyName, ' ', Patient.GivenName)，
-                     或字段路径如 name[0].given[0]、SQL 行列名）。
-        transform: 可选的转换规则（如 "date" 提取日期前 10 位）。
+        source_expr: source 表达式（concat(...) / 字段路径 / 源列名）；可为 None（配合常量指令）。
+        transform: 可选的受控指令。
 
     返回:
         转换后的值；无法提取返回 None。
     """
+    tr = str(transform or "")
+    if tr.startswith("constant:"):
+        return tr[len("constant:"):]
+    if tr == "constant" and source_expr:
+        # 兼容写法：LLM 有时把常量值放在 source 且 transform 只写 "constant"
+        return str(source_expr)
+    if not source_expr:
+        return None
     val = _eval_expr(resource, source_expr)
     if val is None:
         return None

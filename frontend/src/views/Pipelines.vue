@@ -30,6 +30,177 @@
       </el-col>
     </el-row>
 
+    <!-- 数据管道（受管理实体）：管道 = 源 + 目标 + 设计 Skill；按管道类别折叠分组，可整条启停 -->
+    <el-card shadow="never" class="mb16">
+      <template #header>
+        <span class="card-title">{{ t('pipelines.instancesTitle') }}</span>
+        <el-tag class="ml8" size="small" type="info">
+          {{ t('pipelines.instanceCount') }}: {{ instances.length }}
+        </el-tag>
+        <el-tag v-if="activeInstanceCount" class="ml4" size="small" type="success">
+          {{ t('pipelines.instanceActive') }}: {{ activeInstanceCount }}
+        </el-tag>
+        <el-button size="small" style="float: right" @click="loadInstances">
+          {{ t('pipelines.refreshBtn') }}
+        </el-button>
+        <el-button
+          size="small"
+          type="primary"
+          plain
+          class="mr6"
+          style="float: right"
+          :loading="syncingInstances"
+          @click="handleSyncInstances"
+        >
+          {{ t('pipelines.instanceSync') }}
+        </el-button>
+      </template>
+      <div class="gray">{{ t('pipelines.instancesNote') }}</div>
+      <el-collapse v-if="instances.length" v-model="openGroups" class="mt8">
+        <el-collapse-item v-for="g in instanceGroups" :key="g.category" :name="g.category">
+          <template #title>
+            <el-tag size="small" :type="g.active ? 'success' : 'info'" class="mr6">
+              {{ g.category }}
+            </el-tag>
+            <el-tag v-if="g.active" size="small" type="success" effect="plain" class="mr6">
+              {{ t('pipelines.groupActiveTag') }}
+            </el-tag>
+            <span class="gray">
+              {{ g.items.length }} × {{ t('pipelines.pipelineTag') }}
+              ｜ {{ g.enabled_count }}/{{ g.component_count }} {{ t('pipelines.licenseUsed') }}
+            </span>
+          </template>
+          <el-table :data="g.items" border size="small">
+            <el-table-column prop="id" :label="t('pipelines.colPipeId')" min-width="190" />
+            <el-table-column :label="t('pipelines.colPipeSource')" width="150">
+              <template #default="{ row }">
+                {{ row.source_type }} <span class="gray">{{ row.source_id || '' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column :label="t('pipelines.colPipeTarget')" width="150">
+              <template #default="{ row }">
+                {{ row.target_type }} <span class="gray">{{ row.target_id || '' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column :label="t('pipelines.colPipeSkill')" min-width="180">
+              <template #default="{ row }">
+                <el-tag size="small" effect="plain">{{ row.design_skill }}</el-tag>
+                <el-tag v-if="row.recovered" size="small" type="warning" effect="plain" class="ml4">
+                  {{ t('pipelines.instanceRecovered') }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column :label="t('pipelines.colPipeComponents')" min-width="260">
+              <template #default="{ row }">
+                <el-tag
+                  v-for="(c, i) in (row.component_names || [])"
+                  :key="i"
+                  size="small"
+                  effect="plain"
+                  class="mr4 mt4"
+                >{{ c }}</el-tag>
+                <div v-if="(row.shared_component_names || []).length" class="gray mt4">
+                  {{ t('pipelines.categoryShared') }}: {{ row.shared_component_names.join(', ') }}
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column :label="t('pipelines.colPipeStatus')" width="110">
+              <template #default="{ row }">
+                <el-tag size="small" :type="statusTagType(row.status)">
+                  {{ statusText(row.status) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column :label="t('pipelines.colPipeGen')" width="90" align="center">
+              <template #default="{ row }">{{ row.generation_count || 0 }}</template>
+            </el-table-column>
+            <el-table-column :label="t('pipelines.colPipeUpdated')" min-width="160">
+              <template #default="{ row }">
+                {{ (row.updated_at || '').replace('T', ' ').slice(0, 19) }}
+              </template>
+            </el-table-column>
+            <el-table-column :label="t('pipelines.actions')" width="180" fixed="right">
+              <template #default="{ row }">
+                <!-- 已被取代的管道（组件被其它管道接管/移除）不能原地启停，只能删除记录 -->
+                <el-button
+                  v-if="row.status === 'superseded'"
+                  size="small"
+                  type="danger"
+                  link
+                  @click="handleDeleteInstance(row)"
+                >{{ t('pipelines.instanceDelete') }}</el-button>
+                <template v-else>
+                  <el-button
+                    v-if="row.status !== 'active'"
+                    size="small"
+                    type="success"
+                    link
+                    @click="handleToggleInstance(row, true)"
+                  >{{ t('pipelines.instanceEnable') }}</el-button>
+                  <el-button
+                    v-else
+                    size="small"
+                    type="warning"
+                    link
+                    @click="handleToggleInstance(row, false)"
+                  >{{ t('pipelines.instanceDisable') }}</el-button>
+                  <el-button
+                    size="small"
+                    type="danger"
+                    link
+                    @click="handleDeleteInstance(row)"
+                  >{{ t('pipelines.instanceDelete') }}</el-button>
+                </template>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-collapse-item>
+      </el-collapse>
+      <el-empty v-else :description="t('pipelines.instancesEmpty')" />
+    </el-card>
+
+    <!-- 许可与组件（许可预算）：IRIS 社区版每业务主机常驻占 1 个许可单元 -->
+    <el-card shadow="never" class="mb16">
+      <template #header>
+        <span class="card-title">{{ t('pipelines.licenseTitle') }}</span>
+        <el-tag class="ml8" size="small" type="info">
+          {{ t('pipelines.licenseUnits') }}: {{ licenseUnits }}
+        </el-tag>
+        <el-tag
+          class="ml4"
+          size="small"
+          :type="enabledCount + 1 > licenseUnits ? 'danger' : 'success'"
+        >
+          {{ t('pipelines.licenseUsed') }}: {{ enabledCount }}
+        </el-tag>
+        <el-button size="small" style="float: right" @click="loadItems">
+          {{ t('pipelines.refreshBtn') }}
+        </el-button>
+      </template>
+      <div class="gray">{{ t('pipelines.licenseNote') }}</div>
+      <el-alert
+        v-if="budgetTitle"
+        class="mt8"
+        :type="budget?.over_capacity ? 'warning' : 'success'"
+        :title="budgetTitle"
+        :closable="false"
+        show-icon
+      />
+      <el-table :data="prodItems" border size="small" max-height="280" class="mt8">
+        <el-table-column prop="name" :label="t('pipelines.colItemName')" min-width="200" />
+        <el-table-column prop="className" :label="t('pipelines.colItemClass')" min-width="260" />
+        <el-table-column prop="category" :label="t('pipelines.colItemCategory')" width="170" />
+        <el-table-column :label="t('pipelines.colItemEnabled')" width="130">
+          <template #default="{ row }">
+            <el-switch
+              :model-value="row.enabled === 1"
+              @change="(v) => handleToggleItem(row, v)"
+            />
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
     <!-- 管道验证报告（生成后的拓扑/编译/启动/消息流转检查） -->
     <el-card shadow="never" v-if="validation" class="mb16">
       <template #header><span class="card-title">{{ t('pipelines.valReport') }}</span></template>
@@ -169,7 +340,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { datasourceApi, mappingApi, modelApi, pipelineApi, targetApi } from '../api/dataflow'
 
 const { t } = useI18n()
@@ -195,6 +366,8 @@ function checkLabel(key) {
     compile: t('pipelines.chkCompile'),
     start: t('pipelines.chkStart'),
     smoke: t('pipelines.chkSmoke'),
+    settle: t('pipelines.chkSettle'),
+    target_effect: t('pipelines.chkTarget'),
   }
   return map[key] || key
 }
@@ -222,6 +395,119 @@ const validationType = computed(() => {
 
 let timer = null
 
+// —— 许可与组件（许可预算）：IRIS 社区版 KeyLicenseUnits=8，每个 Ens 业务主机占 1 个 ——
+const prodItems = ref([])        // Production 组件清单（name/className/enabled）
+const licenseUnits = ref(0)      // 许可单元总数（社区版 8）
+const enabledCount = ref(0)      // 当前启用组件数（+1 个后端连接即为占用）
+const budget = ref(null)         // 本次生成的许可预算结果（disabled/over_capacity/note）
+
+// 许可预算提示：本次生成让路的旧管道组件 / 许可调度结果（已启用分组 + 因上限停用的分组）
+const budgetTitle = computed(() => {
+  const b = budget.value
+  if (!b) return ''
+  const parts = []
+  if ((b.disabled || []).length) {
+    parts.push(`${t('pipelines.budgetDisabled')}: ${b.disabled.join(', ')}`)
+  }
+  if ((b.scheduled || []).length) {
+    parts.push(`${t('pipelines.budgetScheduled')}: ${b.scheduled.join(', ')}`)
+  }
+  if (b.over_capacity) parts.push(b.note || t('pipelines.budgetOver'))
+  return parts.join(' ｜ ')
+})
+
+async function loadItems() {
+  const data = await pipelineApi.items()
+  prodItems.value = data?.items || []
+  licenseUnits.value = data?.units || 0
+  enabledCount.value = data?.enabled_count || 0
+}
+
+// —— 数据管道（受管理实体）：管道 = 源 + 目标 + 设计 Skill；类别 = 组件的 Ens Category ——
+const instances = ref([])        // 管道实体清单
+const instanceGroups = ref([])   // 按管道类别的折叠分组
+const openGroups = ref([])       // 展开的类别
+const syncingInstances = ref(false)
+
+const activeInstanceCount = computed(
+  () => instances.value.filter((r) => r.status === 'active').length
+)
+
+// 管道状态三态：active=运行中 / suspended=被许可预算让路（可原地启用）/ superseded=已被新生成取代
+const STATUS_TAG_TYPE = { active: 'success', suspended: 'info', superseded: 'warning' }
+const STATUS_TEXT_KEY = {
+  active: 'pipelines.instanceActive',
+  suspended: 'pipelines.instanceSuspended',
+  superseded: 'pipelines.instanceSuperseded'
+}
+
+function statusTagType(status) {
+  return STATUS_TAG_TYPE[status] || 'info'
+}
+
+function statusText(status) {
+  return t(STATUS_TEXT_KEY[status] || 'pipelines.instanceSuspended')
+}
+
+async function loadInstances() {
+  const data = await pipelineApi.instances()
+  instances.value = data?.items || []
+  instanceGroups.value = data?.groups || []
+  // 默认展开活动管道所在分组（让"谁在吃许可"一眼可见）
+  const actives = instanceGroups.value.filter((g) => g.active).map((g) => g.category)
+  openGroups.value = actives.length ? actives : instanceGroups.value.map((g) => g.category)
+}
+
+async function handleSyncInstances() {
+  syncingInstances.value = true
+  try {
+    const res = await pipelineApi.syncInstances()
+    ElMessage.success(t('pipelines.instanceSyncDone', {
+      created: res?.created ?? 0, updated: res?.updated ?? 0,
+    }))
+  } finally {
+    syncingInstances.value = false
+    await Promise.all([loadInstances(), loadItems()])
+  }
+}
+
+async function handleToggleInstance(row, enabled) {
+  try {
+    if (enabled) {
+      const res = await pipelineApi.enableInstance(row.id)
+      // 一键切换：许可不足时后端自动停用其它管道的组件腾单元（显式告知，不静默）
+      const leaked = res?.disabled_others || []
+      if (leaked.length) {
+        ElMessage.warning(t('pipelines.instanceSwitched', { items: leaked.join(', ') }))
+      } else {
+        ElMessage.success(t('pipelines.instanceEnabledDone'))
+      }
+    } else {
+      await pipelineApi.disableInstance(row.id)
+      ElMessage.success(t('pipelines.instanceDisabledDone'))
+    }
+  } finally {
+    await Promise.all([loadInstances(), loadItems()])
+  }
+}
+
+async function handleDeleteInstance(row) {
+  await ElMessageBox.confirm(
+    t('pipelines.instanceDeleteConfirm'), t('pipelines.instanceDelete'), { type: 'warning' })
+  await pipelineApi.deleteInstance(row.id)
+  ElMessage.success(t('pipelines.instanceDeleteDone'))
+  await loadInstances()
+}
+
+async function handleToggleItem(row, enabled) {
+  try {
+    const res = await pipelineApi.toggleItem({ name: row.name, enabled })
+    ElMessage.success(res?.message || t('pipelines.toggleDone'))
+  } finally {
+    await loadItems()
+  }
+}
+
 async function loadViewTables() {
   // 可查看表 = 演示过程已登记的源表/目标表（动态，非写死）
   const data = await pipelineApi.viewTables()
@@ -234,7 +520,7 @@ async function loadViewTables() {
 async function refreshAll() {
   const st = await pipelineApi.status()
   running.value = st?.running === true
-  await Promise.all([loadViewTables(), loadLogs()])
+  await Promise.all([loadViewTables(), loadLogs(), loadItems(), loadInstances()])
   await loadTargetData()
 }
 
@@ -260,12 +546,14 @@ async function loadTargetData() {
 }
 
 async function buildPipelinesFromMappings(mappings, dsList, targetRows) {
-  // 资产名 → 数据源（类型/ID）
-  const assetDs = {}
+  // 资产名 → 候选数据源（同名资产可能存在于多个数据源，必须消歧）
+  const assetCands = {}
   for (const d of dsList) {
     const assets = (await datasourceApi.assets(d.id))?.items || []
     for (const a of assets) {
-      if (a && a.name) assetDs[a.name] = { dsId: d.id, dsType: d.type || '' }
+      if (!a || !a.name) continue
+      assetCands[a.name] = assetCands[a.name] || []
+      assetCands[a.name].push({ dsId: d.id, dsType: d.type || '' })
     }
   }
   // 目标表/实体 → 目标记录（含 type）
@@ -273,29 +561,36 @@ async function buildPipelinesFromMappings(mappings, dsList, targetRows) {
   for (const t of targetRows || []) {
     if (t && t.table && !tgtByTable[t.table]) tgtByTable[t.table] = t
   }
-  // 按 (源数据源, 目标) 分组
-  const groupKey = (m) => {
-    const ds = assetDs[m.source] || {}
-    const tg = tgtByTable[m.target_table]
-    return `${ds.dsId || ''}::${tg?.target_id || tg?.id || m.target_table}`
-  }
-  const byKey = {}
+  // 先按「目标」分组：同一目标的映射必须归到同一个源数据源；
+  // 数据源选择 = 能覆盖该组源表最多的那个（避免「两个数据源都有同名 Patient 表」把一组映射拆散，
+  // 例如 FHIR 组的 Patient/Encounter/Diagnosis/MedicationOrder 应整体归到同时含这些表的数据源）
+  const byTarget = {}
   for (const m of mappings) {
-    const k = groupKey(m)
-    byKey[k] = byKey[k] || []
-    byKey[k].push(m)
+    const tg = tgtByTable[m.target_table]
+    const key = `${tg?.target_id || tg?.id || m.target_table}`
+    byTarget[key] = byTarget[key] || []
+    byTarget[key].push(m)
   }
-  const pipelines = Object.values(byKey).map((ms) => {
-    const ds = assetDs[ms[0].source] || {}
+  const pipelines = []
+  for (const ms of Object.values(byTarget)) {
+    const score = {}
+    for (const m of ms) {
+      for (const c of (assetCands[m.source] || [])) {
+        score[c.dsId] = (score[c.dsId] || 0) + 1
+      }
+    }
+    const best = Object.entries(score).sort((a, b) => b[1] - a[1])[0]
+    const dsId = best ? best[0] : ''
+    const dsType = ((assetCands[ms[0].source] || []).find((c) => c.dsId === dsId) || {}).dsType || ''
     const tg = tgtByTable[ms[0].target_table] || {}
-    return {
-      source_type: ds.dsType || (ms[0].target_type === 'SOAP' ? 'FHIR' : 'SQL'),
-      source_id: ds.dsId,
+    pipelines.push({
+      source_type: dsType || (ms[0].target_type === 'SOAP' ? 'FHIR' : 'SQL'),
+      source_id: dsId || undefined,
       target_type: ms[0].target_type || (tg.type === 'SOAP' ? 'SOAP' : 'DB'),
       target_id: tg.target_id || tg.id,
       mappings: ms,
-    }
-  })
+    })
+  }
   return pipelines
 }
 
@@ -341,11 +636,21 @@ async function handleGenerate() {
       })
     }
     validation.value = result?.validation || null
+    budget.value = result?.license_budget || null
+    if (result?.pipeline_error) {
+      // 生成成功但管道实体未登记：显式提示（不静默）
+      ElMessage.warning(t('pipelines.pipelineError', { msg: result.pipeline_error }))
+    }
     if (result?.ai) {
       aiInfo.value = result.ai
       aiGeneratedAt.value = new Date().toLocaleString()
     }
-    ElMessage.success(t('pipelines.generateDone'))
+    // 许可调度：超许可上限的分组已生成但处于停用状态 → 明确提示（不营造"全部启动"假象）
+    if (result?.license_budget?.over_capacity) {
+      ElMessage.warning(t('pipelines.generateDonePartial'))
+    } else {
+      ElMessage.success(t('pipelines.generateDone'))
+    }
     await refreshAll()
   } finally {
     generating.value = false

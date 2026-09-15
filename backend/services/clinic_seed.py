@@ -84,7 +84,13 @@ def _patients(n=10):
 
 
 def generate_clinic_seed(n: int = 10) -> dict:
-    """生成 n 位患者模拟数据到 CLINIC（幂等：先清四表）。返回统计。"""
+    """生成 n 位患者模拟数据到 CLINIC（幂等：先清四表）。返回统计。
+
+    生成顺序保证引用链完整：①先生成患者（含患者 key：ID/MRN）；
+    ②再按患者生成就诊 Encounter，用患者 key 填 PatientID；
+    ③最后生成诊断/药嘱，同时用患者 key（PatientID）与就诊 key（EncounterID）填引用；
+    落库后用 SQL 反查孤儿（encounter/diagnosis/medication 的父引用缺失）并返回 integrity_ok。
+    """
     diags, drugs = _load_terms()
     logger.info("术语载入：诊断 %s / 药品 %s", len(diags), len(drugs))
     pats = _patients(n)
@@ -148,8 +154,28 @@ def generate_clinic_seed(n: int = 10) -> dict:
                     "CodeSystem,DosageValue,DosageUnit,Route,Frequency,StartDate,Status) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", m_rows)
     conn.commit()
+
+    # —— 引用完整性自检（生成顺序保证：患者先行 → 就诊引用患者 key → 药/诊断引用患者+就诊 key；
+    #    此处用 SQL 反向校验“无孤儿”，确保下游按患者聚合/引用组装不会悬空）——
+    orphan_sql = {
+        "encounter_patient": "SELECT COUNT(*) FROM Encounter e LEFT JOIN Patient p "
+                             "ON e.PatientID=p.ID WHERE p.ID IS NULL",
+        "diagnosis_patient": "SELECT COUNT(*) FROM Diagnosis d LEFT JOIN Patient p "
+                             "ON d.PatientID=p.ID WHERE p.ID IS NULL",
+        "diagnosis_encounter": "SELECT COUNT(*) FROM Diagnosis d LEFT JOIN Encounter e "
+                               "ON d.EncounterID=e.ID WHERE e.ID IS NULL",
+        "medication_patient": "SELECT COUNT(*) FROM MedicationOrder m LEFT JOIN Patient p "
+                              "ON m.PatientID=p.ID WHERE p.ID IS NULL",
+        "medication_encounter": "SELECT COUNT(*) FROM MedicationOrder m LEFT JOIN Encounter e "
+                                "ON m.EncounterID=e.ID WHERE e.ID IS NULL",
+    }
+    orphans = {}
+    for name, sql in orphan_sql.items():
+        cur.execute(sql)
+        orphans[name] = int(cur.fetchone()[0] or 0)
     conn.close()
     stat = {"patients": len(p_rows), "encounters": len(e_rows),
-            "diagnoses": len(d_rows), "medications": len(m_rows), "missed": missed}
+            "diagnoses": len(d_rows), "medications": len(m_rows), "missed": missed,
+            "orphans": orphans, "integrity_ok": all(v == 0 for v in orphans.values())}
     logger.info("CLINIC 演示数据生成: %s", stat)
     return stat

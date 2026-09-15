@@ -62,6 +62,8 @@ class LLMConfig:
     BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     API_KEY = os.getenv("LLM_API_KEY", "")
     MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    # 单次响应上限（Agent 生成 BP 类源码等长输出需要较大值；截断会被显式判失败）
+    MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "64000"))
 
 
 class FHIRConfig:
@@ -78,4 +80,24 @@ class FHIRConfig:
     )
     USERNAME = os.getenv("FHIR_USERNAME", "superuser")
     PASSWORD = os.getenv("FHIR_PASSWORD", "SYS")
+
+
+def to_internal_url(url: str) -> str:
+    """把「浏览器视角」的回环地址换成容器内可达的 IRIS 主机名。
+
+    演示程序里数据源/目标登记时通常填 http://localhost:52773/...（浏览器视角），
+    但 backend 与 IRIS 分属不同容器，必须走 docker 网络服务名（IRIS_HOST，默认 iris）
+    才能访问 IRIS 的 FHIR / SOAP 端点；否则生成后的校验、探查会 Connection refused，
+    导致 FHIR 目标落地效果检查误报（曾使第二条管道生成被判失败）。
+
+    非回环地址（含已在容器网络内的主机名）原样返回。
+    """
+    text = str(url or "").strip()
+    if not text:
+        return text
+    internal = (os.getenv("IRIS_INTERNAL_HOST") or "iris").strip() or "iris"
+    for loopback in ("localhost", "127.0.0.1", "0.0.0.0"):
+        text = text.replace(f"://{loopback}:", f"://{internal}:")
+        text = text.replace(f"://{loopback}/", f"://{internal}/")
+    return text
 

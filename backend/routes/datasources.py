@@ -39,6 +39,8 @@ def _apply_ai_semantics(assets: list[dict], source_type: str,
             patch["key_hint"] = it["key_hint"]
         if it.get("comment"):
             patch["ai_comment"] = it["comment"]
+        if it.get("field_terms") and isinstance(it["field_terms"], dict):
+            patch["field_terms"] = it["field_terms"]
         repository.update_asset(a["id"], patch)
     return items
 
@@ -191,7 +193,10 @@ def test_datasource(ds_id: str):
     if not result["ok"]:
         return error(f"连接失败: {result['message']}"), 500
     repository.update_datasource(ds_id, {"status": "connected"})
-    return success(result, "连接成功")
+    # 连接已验证 → 自动注册 DSN 并写回数据源（后续生成管道直接引用，无需人工建 DSN）
+    from backend.services import jdbc_dsn
+    result["dsn"] = jdbc_dsn.register_for_datasource(repository.get_datasource(ds_id))
+    return success(result, "连接成功（已自动注册 DSN）")
 
 
 @datasources_bp.get("/<ds_id>/schemas")
@@ -295,10 +300,14 @@ def select_source_tables(ds_id: str):
         return error(f"SQL 源契约解读 Agent（AI）失败: {exc}"), 500
     except Exception as exc:  # noqa: BLE001
         logger.warning("SQL 连接探查失败: %s", exc)
+    # 表已纳入数据源 → 自动注册/复用 DSN 并写回（生成管道时自动引用）
+    from backend.services import jdbc_dsn
+    dsn_name = jdbc_dsn.register_for_datasource(repository.get_datasource(ds_id))
     return success({
         "saved": saved, "count": len(saved),
         "ai": _ai_semantics_summary(repository.list_assets(ds_id)),
-    }, "数据表已保存（AI 语义分析与轮询键建议完成）")
+        "dsn": dsn_name,
+    }, "数据表已保存（AI 语义分析、轮询键建议与 DSN 注册完成）")
 
 
 @datasources_bp.post("/<ds_id>/seed")

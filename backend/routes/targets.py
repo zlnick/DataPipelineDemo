@@ -7,6 +7,7 @@
 返回给 AI 推荐 / 管道投放的目标列表（GET /api/targets）为扁平化目标表列表。
 """
 
+import datetime
 import logging
 
 from flask import Blueprint, request
@@ -14,7 +15,7 @@ from flask import Blueprint, request
 from backend.config import Config
 from backend.services import (connection_profiler, fhir_client, fhir_target_model,
                               interface_analyzer, iris_connector,
-                              jdbc_client, repository, wsdl_importer)
+                              jdbc_client, profile_analyzer, repository, wsdl_importer)
 from backend.services.llm_client import AgentError
 from backend.utils import error, success
 
@@ -54,6 +55,75 @@ def _apply_ai_contract(kind: str, rt: dict | None) -> dict | None:
     note = interface_analyzer.interpret_contract(kind, rt)
     rt.setdefault("note", {})["ai"] = note
     return rt
+
+
+def _discover_fhir_entities(base: str, user: str, pwd: str,
+                            requested: list[str] | None) -> tuple[list[dict], dict]:
+    """FHIR 目标候选实体发现：服务器 CapabilityStatement 支持全集 + 平台 US Core 字段模型。
+
+    候选资源类型由服务器能力驱动（不再写死四类/十一类）：
+    - requested 为 None 时默认取服务器 metadata 支持的全部资源类型（能力全集）；
+    - 平台已建模的类型（US_CORE_RESOURCE_MODELS）带 profile + 字段结构，
+      未建模但服务器支持的类型生成「开放候选」（open=True，无列结构）；
+    - 开放候选的映射字段由 Agent（LLM）在 AI 智能匹配时依 FHIR R4/US Core 规范自定；
+    - 服务器不支持的类型自动剔除；显式指定但全不支持时诚实报错。
+
+    返回 (entities, runtime)。参数错误 / 能力不支持时抛 ValueError（调用方转 4xx）。
+    """
+    runtime: dict = {}
+    cap = None
+    try:
+        cap = fhir_client.get_capability_statement(base + "/", user, pwd)
+        runtime["health"] = {"ok": True, "detail": "FHIR metadata 可达",
+                             "checked_at": datetime.datetime.now().isoformat()}
+    except Exception as exc:  # noqa: BLE001 - 探活失败不阻断登记
+        logger.warning("FHIR 目标探活失败: %s", exc)
+        runtime["health"] = {"ok": False, "detail": str(exc)[:200]}
+    if cap is not None:
+        try:
+            analysis = profile_analyzer.analyze_capability(cap)
+            runtime["capabilities"] = {
+                "fhir_version": analysis.get("fhir_version", ""),
+                "resource_count": analysis.get("resource_count", 0),
+                "resource_types": analysis.get("resource_types", []),
+                "supported_profiles": analysis.get("supported_profiles", []),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("FHIR CapabilityStatement 分析失败: %s", exc)
+
+    supported_list = list((runtime.get("capabilities") or {}).get("resource_types") or [])
+    supported = set(supported_list)
+    if requested is not None:
+        if not isinstance(requested, list) or not requested:
+            raise ValueError("FHIR 目标 resource_types 必须是资源类型数组")
+        candidates = list(requested)
+    elif supported_list:
+        # 默认候选 = 服务器 CapabilityStatement 支持的全部资源类型（能力全集，不写死）：
+        # 已建模类型带字段结构，未建模类型按开放候选交由 Agent 依 FHIR 规范自定字段。
+        candidates = list(supported_list)
+    else:
+        # metadata 不可达（探活失败但登记放行）：退回已建模全集并明确 basis 标注
+        candidates = list(fhir_target_model.DEFAULT_RESOURCE_TYPES)
+    if supported:
+        candidates = [rt for rt in candidates if rt in supported]
+        if requested and not candidates:
+            raise ValueError(f"请求的资源类型 {requested} 均未被服务器支持")
+        if not candidates:
+            # 能力可达但候选全为空：诚实失败，不静默降级
+            raise ValueError("服务器 CapabilityStatement 未声明可映射的资源类型")
+    entities = fhir_target_model.build_entities(candidates)
+    if not entities:
+        raise ValueError("未生成任何 FHIR 目标资源实体（US Core 模型缺失）")
+    modeled_n = sum(1 for e in entities if not e.get("open"))
+    runtime["candidates"] = {
+        "count": len(entities),
+        "modeled_count": modeled_n,
+        "open_count": len(entities) - modeled_n,
+        "resource_types": [e["table"] for e in entities],
+        "basis": "capability_full" if (supported and requested is None)
+                 else ("capability_filtered" if supported else "model_default"),
+    }
+    return entities, runtime
 
 # 允许的目标类型（DB: JDBC 表；SOAP: WSDL 导入型 BO；FHIR: US Core 声明式写入内置 FHIR BO）
 TARGET_TYPES = ["DB", "SOAP", "FHIR"]
@@ -117,6 +187,9 @@ def _target_table_rows() -> list[dict]:
                     "enabled": True,
                     "count": 0,
                     "status": tg.get("status", "analyzed"),
+                    # 开放候选标记：平台未建模但服务器支持的资源类型（字段由 LLM 依 FHIR 规范自定）
+                    "open": bool(ent.get("open")),
+                    "modeled": bool(ent.get("modeled", not ent.get("open"))),
                     "ai_semantics": ent.get("ai_semantics") or "",
                     "direction": ent.get("direction") or "",
                     "ai_reason": ent.get("ai_reason") or "",
@@ -147,6 +220,22 @@ def _target_table_rows() -> list[dict]:
     return items
 
 
+@targets_bp.get("/fhir-constraints")
+def fhir_constraints():
+    """已建模 FHIR 资源的结构约束（选型/映射上下文与前端展示共用）。
+
+    query: resource=Patient（可省略；省略则返回全部已建模资源的约束）
+    """
+    rt = (request.args.get("resource") or "").strip()
+    if rt:
+        cons = fhir_target_model.column_constraints(rt)
+        if not cons:
+            return error(f"未建模资源（无列结构约束）: {rt}"), 404
+        return success({"resource": rt, "constraints": cons})
+    return success({"resources": {k: fhir_target_model.column_constraints(k)
+                                  for k in fhir_target_model.DEFAULT_RESOURCE_TYPES}})
+
+
 @targets_bp.get("")
 def list_targets():
     """目标表列表（扁平化：所有数据目标下已选定的表），供 AI 匹配与管道投放。"""
@@ -155,9 +244,19 @@ def list_targets():
 
 @targets_bp.get("/manage")
 def list_target_managers():
-    """数据目标列表（管理视图：目标 + 连接状态 + 已选表数量）。"""
+    """数据目标列表（管理视图：目标 + 连接状态 + 已选表数量 + 精简运行契约）。"""
     items = []
     for tg in repository.list_targets():
+        rt = tg.get("runtime") or {}
+        # runtime 精简展示（健康/候选/能力/delivery），不回传 connection（含密码）与 assets 明细
+        caps = dict(rt.get("capabilities") or {})
+        caps.pop("resource_types", None)
+        display_rt = {
+            "health": rt.get("health") or {},
+            "candidates": rt.get("candidates") or {},
+            "delivery": rt.get("delivery") or {},
+            "capabilities": caps,
+        }
         items.append({
             "id": tg.get("id"),
             "name": tg.get("name"),
@@ -168,6 +267,7 @@ def list_target_managers():
             # 连接信息脱敏（不回传密码）
             "connection": {k: v for k, v in tg.get("connection", {}).items()
                            if k != "password"},
+            "runtime": display_rt,
         })
     return success({"items": items})
 
@@ -249,8 +349,12 @@ def create_target():
                          "http://dataflow-iris:52773/csp/healthshare/fhirserver/fhir/r4）"), 400
         user = conn.get("username") or "superuser"
         pwd = conn.get("password") or "SYS"
-        res_types = conn.get("resource_types") or fhir_target_model.DEFAULT_RESOURCE_TYPES
-        entities = fhir_target_model.build_entities(res_types)
+        requested = conn.get("resource_types")
+        try:
+            entities, runtime = _discover_fhir_entities(base, user, pwd, requested)
+        except ValueError as exc:
+            return error(str(exc)), 400
+
         conn = {**conn, "base_url": base, "username": user, "password": pwd,
                 "entities": entities, "profile_base": fhir_target_model.US_CORE_BASE}
         target_id = repository.create_target(name, "FHIR", conn, tables=entities)
@@ -259,21 +363,16 @@ def create_target():
             "id": target_id, "target_id": target_id, "name": name, "type": "FHIR",
             "tables": entities,
             "config": {"base_url": base, "username": user,
-                       "resource_types": list(res_types),
+                       "resource_types": [e["table"] for e in entities],
                        "profile_base": fhir_target_model.US_CORE_BASE},
         })
-        # 可达性探活：拉取 CapabilityStatement（只读，不校验 profile）
-        runtime = {}
-        try:
-            fhir_client.get_capability_statement(base + "/", user, pwd)
-            runtime["health"] = "ok"
-        except Exception as exc:  # noqa: BLE001 - 探活失败不阻断登记
-            logger.warning("FHIR 目标探活失败: %s", exc)
-            runtime["health"] = "unreachable"
         repository.update_target(target_id, {"runtime": runtime})
-        return success({"id": target_id, "entities": entities,
-                        "target": repository.get_target(target_id)},
-                       "FHIR 目标添加成功（US Core 目标资源模型已生成）")
+        return success({
+            "id": target_id, "entities": entities,
+            "resource_types": [e["table"] for e in entities],
+            "target": repository.get_target(target_id),
+        }, f"FHIR 目标添加成功（候选 US Core 资源 {len(entities)} 类，"
+            f"由 Agent 在智能匹配时决定具体映射）")
 
     if not conn.get("jdbc_url"):
         return error("缺少 JDBC 连接信息（jdbc_url）"), 400
@@ -342,6 +441,44 @@ def import_target(target_id: str):
     return success({"bo_class": imp["boClass"], "entities": entities},
                    "WSDL 重新导入与实体分析成功（AI 语义已刷新）")
 
+
+
+@targets_bp.post("/<target_id>/refresh-resources")
+def refresh_fhir_resources(target_id: str):
+    """（FHIR 目标）刷新候选资源类型：按最新 US Core 模型 ∩ 服务器能力重新发现。
+
+    服务器新增资源类型 / 平台扩充模型后无需删除重建——刷新候选集即可，
+    具体「源资产 → 哪类 FHIR 资源」仍由 Agent（LLM）在智能匹配时决定。
+    """
+    tg = repository.get_target(target_id)
+    if not tg:
+        return error("数据目标不存在"), 404
+    if tg.get("type") != "FHIR":
+        return error("仅 FHIR 目标支持刷新资源类型"), 400
+    conn = tg.get("connection") or {}
+    base = (conn.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        return error("FHIR 目标缺少 base_url"), 400
+    user = conn.get("username") or "superuser"
+    pwd = conn.get("password") or "SYS"
+    try:
+        entities, runtime = _discover_fhir_entities(base, user, pwd, None)
+    except ValueError as exc:
+        return error(str(exc)), 400
+    conn = {**conn, "entities": entities, "profile_base": fhir_target_model.US_CORE_BASE}
+    repository.update_target(target_id, {"connection": conn, "tables": entities,
+                                         "status": "analyzed", "runtime": runtime})
+    repository.save_target_interface({
+        "id": target_id, "target_id": target_id, "name": tg.get("name"), "type": "FHIR",
+        "tables": entities,
+        "config": {"base_url": base, "username": user,
+                   "resource_types": [e["table"] for e in entities],
+                   "profile_base": fhir_target_model.US_CORE_BASE},
+    })
+    return success({"id": target_id, "entities": entities,
+                    "resource_types": [e["table"] for e in entities],
+                    "target": repository.get_target(target_id)},
+                   f"FHIR 目标候选资源已刷新（{len(entities)} 类，最新 US Core 模型 ∩ 服务器能力）")
 
 
 @targets_bp.post("/<target_id>/test")

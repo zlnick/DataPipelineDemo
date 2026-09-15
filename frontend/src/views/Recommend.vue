@@ -26,17 +26,22 @@
             style="width: 400px"
             :placeholder="t('recommend.targetPlaceholder')"
           >
-            <el-option
-              v-for="t in targets"
-              :key="(t.target_id || '') + '::' + t.table"
-              :value="(t.target_id || '') + '::' + t.table"
-            >
-              <span>{{ t.type === 'SOAP' ? '[SOAP] ' : '[DB] ' }}{{ t.table }}</span>
-              <span class="gray" style="float: right; font-size: 12px">
-                {{ t.target_name ? t.target_name : t.schema }}
-              </span>
-            </el-option>
+            <el-option-group v-for="g in targetGroups" :key="g.label" :label="g.label">
+              <el-option
+                v-for="t in g.items"
+                :key="(t.target_id || '') + '::' + t.table"
+                :value="(t.target_id || '') + '::' + t.table"
+              >
+                <span>{{ targetPrefix(t) }}{{ t.table }}</span>
+                <span class="gray" style="float: right; font-size: 12px">
+                  {{ targetSuffix(t) }}
+                </span>
+              </el-option>
+            </el-option-group>
           </el-select>
+          <el-tooltip v-if="targets.some((x) => x.type === 'FHIR' && !!x.open)" :content="t('recommend.openTooltip')" placement="top">
+            <span class="ml6 gray sm">{{ t('recommend.openLegend') }}</span>
+          </el-tooltip>
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="recommending" @click="handleRecommend">
@@ -166,6 +171,43 @@ const validationType = computed(() => {
   return v.warning_count ? 'warning' : 'success'
 })
 
+// 目标下拉分组：DB/SOAP 目标、FHIR 已建模 US Core、FHIR 开放类型（服务器支持 R4，字段由 LLM 自定）
+const targetGroups = computed(() => {
+  const groups = []
+  const other = targets.value.filter((x) => x.type !== 'FHIR')
+  const modeled = targets.value.filter((x) => x.type === 'FHIR' && !x.open)
+  const open = targets.value.filter((x) => x.type === 'FHIR' && !!x.open)
+  if (other.length) {
+    groups.push({ label: t('recommend.targetBaseGroup'), items: other })
+  }
+  if (modeled.length) {
+    groups.push({ label: t('recommend.targetModeledGroup', { n: modeled.length }), items: modeled })
+  }
+  if (open.length) {
+    groups.push({ label: t('recommend.targetOpenGroup', { n: open.length }), items: open })
+  }
+  return groups
+})
+
+// 目标下拉标签：前缀区分 DB/SOAP/FHIR（FHIR 目标不再误标 [DB]）
+function targetPrefix(row) {
+  if (!row) return ''
+  if (row.type === 'SOAP') return '[SOAP] '
+  if (row.type === 'FHIR') return '[FHIR] '
+  return '[DB] '
+}
+
+// 目标下拉辅助信息：FHIR 开放类型提示交由 LLM；已建模显示 profile 简名；其余显示目标名
+function targetSuffix(row) {
+  if (!row) return ''
+  if (row.type === 'FHIR') {
+    if (row.open) return t('recommend.fhirOpenSuffix')
+    const p = (row.profile || '').split('/StructureDefinition/').pop()
+    return p || (row.target_name ? row.target_name : 'US Core')
+  }
+  return row.target_name ? row.target_name : row.schema
+}
+
 // 资产字段结构（供 AI 推荐使用）：从资产名推断典型字段
 const ASSET_FIELDS = {
   Patient: ['id', 'name[0].family', 'name[0].given[0]', 'gender', 'birthDate', 'telecom[0].value', 'address[0].line[0]', 'address[0].city'],
@@ -189,6 +231,13 @@ function buildRecommendPayload() {
   const targetList = selectedTargetObjs.map((t) => ({
     table: t.table,
     columns: t.columns,
+    type: t.type,
+    schema: t.schema,
+    profile: t.profile || '',
+    open: !!t.open,
+    note: t.open
+      ? '开放 FHIR R4 类型（服务器支持、平台未建模）：映射 target 字段需你依 FHIR R4/US Core 规范自定'
+      : '',
   }))
   const targetModels = selectedTargetObjs.map((t) => ({
     id: t.target_id,
@@ -198,6 +247,8 @@ function buildRecommendPayload() {
     table: t.table,
     schema: t.schema,
     columns: t.columns || [],
+    open: !!t.open,
+    modeled: !!t.modeled || !t.open,
     config: t.type === 'SOAP'
       ? { service: t.table, bo_class: t.bo_class }
       : {},
@@ -231,8 +282,11 @@ async function loadAssets() {
 async function loadTargets() {
   const data = await targetApi.list()
   targets.value = data?.items || []
-  // 默认选中所有可用的转换目标
-  selectedTargets.value = targets.value.map((t) => (t.target_id || '') + '::' + t.table)
+  // 默认勾选：DB/SOAP 全部 + FHIR 已建模类型；FHIR 开放类型（未建模）由用户按需勾选，
+  // 勾选后其映射字段由 Agent 依 FHIR R4 规范自定（避免无关类型撑爆 LLM 上下文）。
+  selectedTargets.value = targets.value
+    .filter((t) => t.type !== 'FHIR' || !t.open)
+    .map((t) => (t.target_id || '') + '::' + t.table)
 }
 
 async function handleRecommend() {
@@ -313,5 +367,7 @@ onMounted(async () => {
 .rec-item { margin-bottom: 16px; padding: 12px; border: 1px solid #ebeef5; border-radius: 6px; }
 .fm-table { margin-bottom: 8px; }
 .gray { color: #909399; }
+.ml6 { margin-left: 6px; }
+.sm { font-size: 12px; }
 .card-title { font-weight: 600; }
 </style>

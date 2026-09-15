@@ -19,7 +19,7 @@ def _enrich_ai_semantics(assets: list[dict], targets: list[dict]) -> tuple[list[
     """
     asset_by_name = {}
     for a in repository.list_assets() or []:
-        if a.get("name") and (a.get("ai_semantics") or a.get("description")):
+        if a.get("name"):
             asset_by_name[str(a["name"]).lower()] = a
     assets = [dict(a) for a in assets]
     for a in assets:
@@ -29,23 +29,45 @@ def _enrich_ai_semantics(assets: list[dict], targets: list[dict]) -> tuple[list[
         a.setdefault("description", rec.get("ai_semantics") or rec.get("description") or "")
         a.setdefault("ai_semantics", rec.get("ai_semantics") or "")
         a.setdefault("key_hint", rec.get("key_hint") or "")
+        if rec.get("field_terms"):
+            a.setdefault("field_terms", rec["field_terms"])
 
-    # 目标（表/实体）语义：方向判定与说明来自目标记录（接口分析 Agent 写回）
+    # 目标（表/实体）语义与字段术语：来自目标记录（接口分析 Agent 写回 + 模型列结构化元数据）
     tg_by_table = {}
+    ft_by_table: dict[str, dict] = {}
     for tg in repository.list_targets() or []:
         for tb in tg.get("tables") or []:
             nm = tb.get("entity_name") or tb.get("table") or ""
-            if nm and (tb.get("ai_semantics") or tb.get("direction")):
-                tg_by_table[str(nm).lower()] = tb
+            if not nm:
+                continue
+            key = str(nm).lower()
+            if tb.get("ai_semantics") or tb.get("direction"):
+                tg_by_table[key] = tb
+            cols = tb.get("columns") or []
+            if cols and key not in ft_by_table:
+                ft = {}
+                for c in cols:
+                    if not isinstance(c, dict) or not c.get("name"):
+                        continue
+                    ft[c["name"]] = {
+                        "type": c.get("type") or "",
+                        "path": c.get("path") or "",
+                        "system": c.get("system") or "",
+                        "note": c.get("note") or "",
+                    }
+                if ft:
+                    ft_by_table[key] = ft
     targets = [dict(t) for t in targets]
     for t in targets:
         nm = t.get("table") or t.get("entity_name") or t.get("name") or ""
-        rec = tg_by_table.get(str(nm).lower())
-        if not rec:
-            continue
-        t.setdefault("ai_semantics", rec.get("ai_semantics") or "")
-        t.setdefault("direction", rec.get("direction") or "")
-        t.setdefault("ai_reason", rec.get("ai_reason") or "")
+        key = str(nm).lower()
+        rec = tg_by_table.get(key)
+        if rec:
+            t.setdefault("ai_semantics", rec.get("ai_semantics") or "")
+            t.setdefault("direction", rec.get("direction") or "")
+            t.setdefault("ai_reason", rec.get("ai_reason") or "")
+        if ft_by_table.get(key):
+            t.setdefault("field_terms", ft_by_table[key])
     return assets, targets
 
 
@@ -82,7 +104,11 @@ def recommend():
     if trans_fix["status"] == "ok":
         normalized = trans_fix["mappings"]
     else:
-        logger.warning("转换验证-修复未完全解决: %s", trans_fix["message"])
+        # 采纳 C1 的部分修复（不丢弃已修正的映射，如引用标注 transform=reference），
+        # 否则前端保存的会是未修复版本，生成阶段又被 FHIR 校验拒绝
+        if trans_fix.get("mappings"):
+            normalized = trans_fix["mappings"]
+        logger.warning("转换验证-修复未完全解决（已采纳部分修复）: %s", trans_fix["message"])
     # 返回时补回 asset 字段（前端 Recommend 页使用 rec.asset）
     out_recs = [{"asset": r.get("source", ""), **r} for r in normalized]
     transformation_plan = result.get("transformation_plan")

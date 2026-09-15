@@ -31,11 +31,15 @@ export const targetApi = {
   create: (data) => http.post('/targets', data),
   test: (id) => http.post(`/targets/${id}/test`),
   import: (id) => http.post(`/targets/${id}/import`),
+  refreshResources: (id) => http.post(`/targets/${id}/refresh-resources`),
   schemas: (id) => http.get(`/targets/${id}/schemas`),
   tables: (id, schema) => http.get(`/targets/${id}/tables`, { params: { schema } }),
   selectTables: (id, tables) => http.post(`/targets/${id}/tables`, { tables }),
   selected: (id) => http.get(`/targets/${id}/selected`),
   data: (table, limit = 50) => http.get(`/targets/${table}/data`, { params: { limit } }),
+  // FHIR 已建模资源的结构约束（choice/数组/引用目标，供映射与展示共用）
+  fhirConstraints: (resource) => http.get('/targets/fhir-constraints',
+    { params: resource ? { resource } : {} }),
 }
 
 // AI 智能推荐
@@ -66,4 +70,14 @@ export const pipelineApi = {
   targetData: (table, limit = 50) =>
     http.get('/pipelines/target-data', { params: { table, limit } }),
   generateMock: (count = 3) => http.post('/pipelines/generate-mock', null, { params: { count } }),
+  // 组件清单与许可容量（社区版每业务主机占 1 个许可单元；生成前自动做许可预算）
+  items: () => http.get('/pipelines/items'),
+  toggleItem: (data) => http.post('/pipelines/items/toggle', data),
+  // 数据管道实体（受管理持久对象）：按 (源,目标,设计 Skill) 判定身份，重复生成只更新不新增
+  instances: () => http.get('/pipelines/instances'),
+  instance: (id) => http.get(`/pipelines/instances/${id}`),
+  enableInstance: (id) => http.post(`/pipelines/instances/${id}/enable`),
+  disableInstance: (id) => http.post(`/pipelines/instances/${id}/disable`),
+  deleteInstance: (id) => http.delete(`/pipelines/instances/${id}`),
+  syncInstances: () => http.post('/pipelines/instances/sync'),
 }

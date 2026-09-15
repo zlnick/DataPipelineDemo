@@ -90,18 +90,311 @@ US_CORE_RESOURCE_MODELS = {
              "note": "dosage[].timing 简写"},
         ],
     },
+    "Observation": {
+        "entity_name": "Observation",
+        "table": "Observation",
+        "schema": "FHIR",
+        "profile": f"{US_CORE_BASE}/us-core-observation-lab",
+        "columns": [
+            {"name": "status", "type": "code", "required": True,
+             "note": "registered|preliminary|final|amended|corrected|cancelled"},
+            {"name": "category", "type": "codeableConcept", "required": True,
+             "note": "vital-signs / laboratory，观察类别"},
+            {"name": "code", "type": "codeableConcept", "required": True,
+             "note": "LOINC 检验/体征代码（源为中文检验名时可双 coding 保留原文）"},
+            {"name": "subject", "type": "Reference(Patient)", "required": True},
+            {"name": "effectiveDateTime", "type": "dateTime", "required": False,
+             "note": "测量/检验时间，可映射源时间列"},
+            {"name": "value", "type": "quantity", "required": False,
+             "note": "valueQuantity.value + unit（数值结果）"},
+            {"name": "interpretation", "type": "codeableConcept", "required": False,
+             "note": "异常标志（SNOMED/abnormal）"},
+        ],
+    },
+    "AllergyIntolerance": {
+        "entity_name": "AllergyIntolerance",
+        "table": "AllergyIntolerance",
+        "schema": "FHIR",
+        "profile": f"{US_CORE_BASE}/us-core-allergyintolerance",
+        "columns": [
+            {"name": "clinicalStatus", "type": "codeableConcept", "required": True,
+             "note": "allergyintolerance-clinical: active|inactive|resolved"},
+            {"name": "verificationStatus", "type": "codeableConcept", "required": True,
+             "note": "unconfirmed|confirmed|refuted"},
+            {"name": "code", "type": "codeableConcept", "required": True,
+             "note": "过敏原：SNOMED/文本 + 中文编码系统对照"},
+            {"name": "patient", "type": "Reference(Patient)", "required": True},
+            {"name": "category", "type": "code", "required": False,
+             "note": "food|medication|environment|biologic"},
+            {"name": "onset", "type": "dateTime", "required": False, "note": "发生时间"},
+        ],
+    },
+    "Procedure": {
+        "entity_name": "Procedure",
+        "table": "Procedure",
+        "schema": "FHIR",
+        "profile": f"{US_CORE_BASE}/us-core-procedure",
+        "columns": [
+            {"name": "status", "type": "code", "required": True,
+             "note": "preparation|in-progress|not-done|on-hold|stopped|completed|entered-in-error|unknown"},
+            {"name": "code", "type": "codeableConcept", "required": True,
+             "note": "操作/手术 SNOMED 代码或中文文本"},
+            {"name": "subject", "type": "Reference(Patient)", "required": True},
+            {"name": "performedDateTime", "type": "dateTime", "required": True},
+            {"name": "encounter", "type": "Reference(Encounter)", "required": False},
+            {"name": "reasonCode", "type": "codeableConcept", "required": False,
+             "note": "可沿用国标 ICD-10 主诊断（双 coding）"},
+        ],
+    },
+    "DiagnosticReport": {
+        "entity_name": "DiagnosticReport",
+        "table": "DiagnosticReport",
+        "schema": "FHIR",
+        "profile": f"{US_CORE_BASE}/us-core-diagnosticreport-note",
+        "columns": [
+            {"name": "status", "type": "code", "required": True,
+             "note": "registered|preliminary|final|amended|corrected|cancelled"},
+            {"name": "category", "type": "codeableConcept", "required": True,
+             "note": "LAB/RAD 报告类别"},
+            {"name": "code", "type": "codeableConcept", "required": True,
+             "note": "报告类型 LOINC 代码"},
+            {"name": "subject", "type": "Reference(Patient)", "required": True},
+            {"name": "effectiveDateTime", "type": "dateTime", "required": False},
+            {"name": "conclusion", "type": "string", "required": False,
+             "note": "诊断报告结论文本"},
+        ],
+    },
+    "Immunization": {
+        "entity_name": "Immunization",
+        "table": "Immunization",
+        "schema": "FHIR",
+        "profile": f"{US_CORE_BASE}/us-core-immunization",
+        "columns": [
+            {"name": "status", "type": "code", "required": True,
+             "note": "completed|entered-in-error|not-done"},
+            {"name": "vaccineCode", "type": "codeableConcept", "required": True,
+             "note": "疫苗代码（CVX/中文疫苗名 + 编码系统对照）"},
+            {"name": "patient", "type": "Reference(Patient)", "required": True},
+            {"name": "occurrenceDateTime", "type": "dateTime", "required": True},
+            {"name": "lotNumber", "type": "string", "required": False},
+        ],
+    },
+    "Organization": {
+        "entity_name": "Organization",
+        "table": "Organization",
+        "schema": "FHIR",
+        "profile": f"{US_CORE_BASE}/us-core-organization",
+        "columns": [
+            {"name": "identifier", "type": "identifier", "required": False,
+             "note": "identifier[].value 机构代码（映射源医院编码）"},
+            {"name": "name", "type": "string", "required": True},
+            {"name": "active", "type": "boolean", "required": False},
+            {"name": "address_line", "type": "string", "required": False,
+             "note": "address[].line"},
+            {"name": "city", "type": "string", "required": False},
+        ],
+    },
+    "Practitioner": {
+        "entity_name": "Practitioner",
+        "table": "Practitioner",
+        "schema": "FHIR",
+        "profile": f"{US_CORE_BASE}/us-core-practitioner",
+        "columns": [
+            {"name": "identifier", "type": "identifier", "required": False,
+             "note": "执业证号/NPI"},
+            {"name": "family", "type": "string", "required": True, "note": "name[0].family"},
+            {"name": "given", "type": "string", "required": True, "note": "name[0].given[]"},
+            {"name": "telecom", "type": "string", "required": False, "note": "telecom[].value"},
+        ],
+    },
 }
 
-# FHIR 目标的默认资源类型（UI 新建时可多选/全选）
-DEFAULT_RESOURCE_TYPES = ["Patient", "Encounter", "Condition", "MedicationRequest"]
+
+
+
+# FHIR 目标的「已建模」候选资源类型（平台内置字段模型，映射质量高、可直接给出字段级映射）。
+# 注册 FHIR 目标时候选集合 = 服务器 CapabilityStatement 支持的全部资源类型
+# （默认全量，不再写死四类）：已建模类型带 profile + FHIRPath 字段结构；
+# 其余未建模但服务器支持的类型按「开放候选」提供（open=True，无列结构），
+# 其映射字段由 Agent（LLM）在 AI 智能匹配时依据 FHIR R4 / US Core 规范自定。
+DEFAULT_RESOURCE_TYPES = [
+    "Patient", "Encounter", "Condition", "MedicationRequest",
+    "Observation", "AllergyIntolerance", "Procedure",
+    "DiagnosticReport", "Immunization", "Organization", "Practitioner",
+]
+
+
+def open_entity(rt: str) -> dict:
+    """为未建模但服务器支持的资源类型构建开放候选实体（无列结构，交由 LLM 自定字段）。"""
+    return {
+        "entity_name": rt,
+        "table": rt,
+        "schema": "FHIR",
+        "profile": "",
+        "modeled": False,
+        "open": True,
+        "columns": [],
+        "fields": [],
+        "note": "服务器支持此 FHIR R4 资源类型；平台未内置字段模型，"
+                "映射字段由 Agent 依 FHIR R4/US Core 规范自定",
+    }
+
+
+# ===== FHIR 组装元数据（平台结构知识，供通用打包器/AI 上下文使用，非决策）=====
+# 说明：字段列已有 name/type；这里补充「值应落入资源 JSON 的路径 path」与部分静态
+# coding system。打包器按此元数据把 LLM 决策的行 JSON 通用序列化成 FHIR 资源，
+# 不再为每个资源类型手写组装器。
+_COLUMN_PATHS: dict[str, dict[str, str]] = {
+    "Patient": {
+        "identifier": "identifier[0]",
+        "family": "name[0].family",
+        "given": "name[0].given[0]",
+        "gender": "gender",
+        "birthDate": "birthDate",
+        "phone": "telecom[0].value",
+        "address_line": "address[0].line[0]",
+        "city": "address[0].city",
+    },
+    "Encounter": {
+        "status": "status",
+        "class_code": "class",
+        "type": "type[0]",
+        "subject": "subject",
+        "period_start": "period.start",
+        "period_end": "period.end",
+        "reason_code": "reasonCode[0]",
+    },
+    "Condition": {
+        "clinicalStatus": "clinicalStatus",
+        "verificationStatus": "verificationStatus",
+        "category": "category[0]",
+        "code": "code",
+        "subject": "subject",
+        "encounter": "encounter",
+        "onset": "onsetDateTime",
+        "recordedDate": "recordedDate",
+    },
+    "MedicationRequest": {
+        "status": "status",
+        "intent": "intent",
+        "medication": "medicationCodeableConcept",
+        "subject": "subject",
+        "authoredOn": "authoredOn",
+        "requester": "requester",
+        "dose": "dosageInstruction[0].doseAndRate[0].doseQuantity",
+        "route": "dosageInstruction[0].route",
+        "frequency": "dosageInstruction[0].text",
+    },
+}
+
+# 静态 coding/system 提示（仅作用于真正序列化为 Coding/CodeableConcept 的列；原始 code 字段不加）
+_COLUMN_SYSTEMS: dict[str, dict[str, str]] = {
+    "Patient": {"identifier": "http://demo/mrn"},
+    "Encounter": {"class_code": "http://terminology.hl7.org/CodeSystem/v3-ActCode"},
+    "Condition": {
+        "clinicalStatus": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+        "verificationStatus": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+        "category": "http://terminology.hl7.org/CodeSystem/condition-category",
+    },
+}
+
+
+def _column_constraints(rt: str, name: str, col: dict) -> dict:
+    """从列元数据（type/path/name）推导机器可读的 FHIR 结构约束。
+
+    供 C1 校验/AI 提示/打包器共用，避免依赖自然语言 note：
+      - reference_target：Reference(X) → X（引用目标资源类型）
+      - choice_property：FHIR choice 元素的真实属性名（如 medication → medicationCodeableConcept）
+      - value_landing：值最终落入的 JSON 形态（scalar / object / array）
+      - array_element：路径末端是否数组元素（如 address[0].line[0] → True）
+    """
+    path = str(col.get("path") or name)
+    ty = str(col.get("type") or "")
+    segs = [s for s in path.split(".") if s]
+    last = segs[-1] if segs else path
+    is_array_elem = "[" in last
+    base_last = last.split("[")[0]
+    # 值形态：数组元素 + 标量类型 → array；对象类型（concept/identifier/reference/quantity）→ object
+    if "concept" in ty.lower() or ty.lower() in ("identifier", "quantity") or ty.startswith("Reference"):
+        landing = "object"
+    elif is_array_elem:
+        landing = "array"
+    else:
+        landing = "scalar"
+    ref_target = None
+    if ty.startswith("Reference(") and ty.endswith(")"):
+        ref_target = ty[len("Reference("):-1]
+    return {
+        "fh_property": base_last,
+        "value_landing": landing,
+        "array_element": is_array_elem,
+        "path_in_array": "[" in path,
+        "reference_target": ref_target,
+        "choice_property": base_last if base_last != name else None,
+    }
+
+
+def _enrich_columns(rt: str, columns: list[dict]) -> list[dict]:
+    """为模型列注入组装元数据（path/system）与结构约束（constraints），不改常量。"""
+    paths = _COLUMN_PATHS.get(rt, {})
+    systems = _COLUMN_SYSTEMS.get(rt, {})
+    out = []
+    for c in columns:
+        name = c.get("name", "")
+        copy = dict(c)
+        # path：显式映射优先；未映射时若 name 已含路径语义（带 . / [ ）直接用，否则放根
+        if name in paths:
+            copy["path"] = paths[name]
+        elif any(ch in name for ch in ".["):
+            copy["path"] = name
+        else:
+            copy["path"] = name
+        if name in systems:
+            copy["system"] = systems[name]
+        copy["constraints"] = _column_constraints(rt, name, copy)
+        out.append(copy)
+    return out
 
 
 def build_entities(resource_types: list[str] | None = None) -> list[dict]:
-    """按资源类型清单构建目标实体（顺序稳定）。"""
+    """按资源类型清单构建目标实体（顺序稳定；未建模类型生成开放候选）。
+
+    已建模实体：深拷贝 + 每列注入组装元数据 path/system（不改模块常量）。
+    """
+    import copy as _copy
     types = resource_types or DEFAULT_RESOURCE_TYPES
     out = []
     for rt in types:
         model = US_CORE_RESOURCE_MODELS.get(rt)
         if model:
-            out.append(model)
+            m = _copy.deepcopy(model)
+            m["columns"] = _enrich_columns(rt, m.get("columns", []))
+            m["fields"] = [c["name"] for c in m["columns"]]
+            out.append(m)
+        else:
+            out.append(open_entity(rt))
     return out
+
+
+def column_constraints(resource_type: str) -> dict[str, dict]:
+    """返回某已建模资源的列结构约束：{列名: {fh_property, value_landing, array_element,
+    reference_target, choice_property}}（供校验/提示/API 共用）。"""
+    ent = next((e for e in build_entities([resource_type]) if e.get("entity_name")), None)
+    if not ent:
+        return {}
+    return {c["name"]: c.get("constraints", {}) for c in ent.get("columns", [])}
+
+
+def model_schema(resource_type: str) -> dict | None:
+    """返回单个已建模资源的组装 schema（含 path/system 的列），供通用打包器/生成端写入。"""
+    ents = build_entities([resource_type])
+    if not ents:
+        return None
+    ent = ents[0]
+    return {
+        "entity_name": ent.get("entity_name"),
+        "table": ent.get("table"),
+        "profile": ent.get("profile", ""),
+        "modeled": True,
+        "columns": ent.get("columns", []),
+    }

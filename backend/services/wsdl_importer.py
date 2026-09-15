@@ -138,7 +138,7 @@ def _ensure_wsdl_in_iris(wsdl: str) -> str:
             file_stream.invoke("LinkToFile", target_path)
             file_stream.invoke("Write", content)
             file_stream.invoke("%Save")
-            conn.close()
+            iris_connector.reset_connections()
             logger.info("已同步 WSDL 内容到 IRIS 容器路径: %s", target_path)
         except Exception as exc:
             logger.error("同步 WSDL 文件到 IRIS 容器失败: %s", exc)
@@ -270,7 +270,7 @@ def _save_bo_mapping(service: str, bo_class: str) -> None:
         if request_class:
             native.set(request_class, "^demo.Config", "soap", "request_class")
     finally:
-        conn.close()
+        iris_connector.reset_connections()
 
 
 def get_bo_class(service: str = "default") -> str:
@@ -281,4 +281,4 @@ def get_bo_class(service: str = "default") -> str:
         native = iris.createIRIS(conn)
         return native.getString("^demo.Config", "soap", service or "default")
     finally:
-        conn.close()
+        iris_connector.reset_connections()

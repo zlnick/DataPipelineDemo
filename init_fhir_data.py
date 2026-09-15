@@ -221,4 +221,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import os
+
+    # 演示种子开关：SEED_FHIR=0 时跳过（避免重启 backend 时把 P001..P010 等种子重新写回 FHIR，
+    # 干扰"只验证管道写入"的场景）；默认 1 保持原行为。
+    if os.getenv("SEED_FHIR", "1") == "0":
+        logger.info("SEED_FHIR=0：跳过 FHIR 演示种子加载")
+    else:
+        main()

@@ -44,7 +44,10 @@ ClassMethod TransformResource(resourceJson As %String, fieldMappingsJson As %Str
     import sys
     sys.path.insert(0, "/shared/python")
 
+    # 强制重载：Embedded Python 模块缓存跨 job 共享，改文件后需 reload 才生效
+    import importlib
     import transform_handler
+    importlib.reload(transform_handler)
     return transform_handler.transform_resource_json(resourceJson, fieldMappingsJson)
 }
 

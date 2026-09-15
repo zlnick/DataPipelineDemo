@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 
 from backend.schemas.models import DataSourceIn, SourceAssetModel, TargetInterfaceModel, TransformationPlan
+from backend.services import iris_connector
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ def set_json(global_name: str, key: str, data: dict) -> None:
     try:
         native.set(json.dumps(data, ensure_ascii=False), global_name, key)
     finally:
-        conn.close()
+        iris_connector.reset_connections()
 
 
 def get_json(global_name: str, key: str) -> dict | None:
@@ -45,7 +46,7 @@ def get_json(global_name: str, key: str) -> dict | None:
         raw = native.get(global_name, key)
         return json.loads(raw) if raw else None
     finally:
-        conn.close()
+        iris_connector.reset_connections()
 
 
 def list_json(global_name: str) -> list[dict]:
@@ -64,7 +65,29 @@ def list_json(global_name: str) -> list[dict]:
                     logger.warning("global %s(%s) 非 JSON，跳过", global_name, _key)
         return items
     finally:
-        conn.close()
+        iris_connector.reset_connections()
+
+
+def list_keys(global_name: str) -> list[str]:
+    """返回 global 的全部一级 key（按 IRIS 排序）。"""
+    native, conn = _get_native()
+    try:
+        return [str(k) for k, raw in native.iterator(global_name) if raw is not None]
+    finally:
+        iris_connector.reset_connections()
+
+
+def delete_json(global_name: str, key: str) -> bool:
+    """删除 global 中一个 key（不存在也返回 True，幂等）。"""
+    native, conn = _get_native()
+    try:
+        native.kill(global_name, key)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("删除 global %s(%s) 失败: %s", global_name, key, exc)
+        return False
+    finally:
+        iris_connector.reset_connections()
 
 
 def _gen_id(prefix: str) -> str:
@@ -126,8 +149,15 @@ def datasource_runtime(ds: dict) -> dict:
             for a in list_assets(ds.get("id") or "") if a.get("name")]
     elif kind == "SQL":
         if cfg.get("jdbc_url"):
+            jdbc = cfg["jdbc_url"]
+            # 命名 DSN 推导：jdbc:IRIS://host:port/<命名空间> → 用命名空间作 DSN 名
+            # （CLINIC 源须连 CLINIC DSN，不能退化为 localTarget/USER）
+            dsn_name = ""
+            if jdbc.lower().startswith("jdbc:iris:"):
+                dsn_name = jdbc.rsplit("/", 1)[-1].strip()
             conn = {
-                "jdbc_url": cfg["jdbc_url"],
+                "jdbc_url": jdbc,
+                "dsn": cfg.get("dsn") or dsn_name or "",
                 "driver_class": cfg.get("driver_class") or "",
                 "username": cfg.get("username") or "",
                 "password": cfg.get("password") or "",
@@ -169,6 +199,36 @@ def target_runtime(tg: dict) -> dict:
     conn0 = tg.get("connection") or {}
     assets = []
     delivery: dict = {}
+    if kind == "FHIR":
+        # FHIR：连接参数归一（base_url 同时以 endpoint 别名输出，供 check_connection 复用），
+        # 能力/健康/候选集沿用注册与 refresh-resources 时保存的运行时（勿丢弃）。
+        base = conn0.get("base_url") or ""
+        conn = {
+            "base_url": base,
+            "endpoint": base,
+            "username": conn0.get("username") or "",
+            "password": conn0.get("password") or "",
+            "profile_base": conn0.get("profile_base") or "",
+        }
+        delivery = {"mechanism": "fhir_put", "target": "FHIR server"}
+        assets = [
+            {"entity_name": (tb.get("entity_name") or tb.get("table")),
+             "table": (tb.get("table")),
+             "schema": tb.get("schema") or "FHIR",
+             "profile": tb.get("profile") or "",
+             "fields": tb.get("fields") or [c.get("name") if isinstance(c, dict) else str(c)
+                                            for c in (tb.get("columns") or [])]}
+            for tb in (tg.get("tables") or []) if tb.get("table")
+        ]
+        return {
+            "kind": kind, "role": "target",
+            "connection": conn,
+            "capabilities": rt.get("capabilities") or {},
+            "assets": assets, "poll": rt.get("poll") or {},
+            "delivery": {**delivery, **(rt.get("delivery") or {})},
+            "health": rt.get("health") or {},
+            "candidates": rt.get("candidates") or {},
+        }
     if kind == "SOAP":
         # SOAP：connection 与 TargetInterface.config 可能字段不全（endpoint 只在一处）——归一补齐
         svc = conn0.get("service") or "default"

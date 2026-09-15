@@ -192,16 +192,25 @@ ClassMethod RenderProduction(pTopoJson As %String) As %String
 }
 
 /// 按组件配置通用渲染单个组件 XData 片段（不再按 type 分发）。
-/// 组件结构 = {"type","name","className","comment",
+/// 组件结构 = {"type","name","className","comment","category",
 ///             "settings":[{"target":"Adapter|Host","name","value"}]}
 /// className 必须非空（由 Python 类型注册表保证；缺失则跳过该组件）。
+/// category = 所属「数据管道」类别（如 sql2fhir-patient-tx / sql2soap；共享组件为 shared），
+/// 渲染为 Ens 业务主机的 Category，供 UI/许可预算按管道分组（为空则不输出该属性）。
 ClassMethod RenderComponent(pCfg As %DynamicObject) As %String
 {
     Set tClass = pCfg.className
     If tClass = "" Quit ""
     Set tName = pCfg.name
     Set tComment = pCfg.comment
-    Set tXml = "<Item Name=""" _ tName _ """ ClassName=""" _ tClass _ """ PoolSize=""1"" Enabled=""true"" Foreground=""false"" Comment=""" _ tComment _ """"
+    Set tCategory = pCfg.category
+    ; enabled 字段（缺省 true）：许可调度下放不下的管道分组渲染为 Enabled="false"
+    ; → 组件生成但处于停用状态（可一键切换），避免 Production 启动即耗尽许可单元
+    Set tEnabled = "true"
+    If 'pCfg.%Get("enabled", 1) Set tEnabled = "false"
+    Set tXml = "<Item Name=""" _ tName _ """ ClassName=""" _ tClass _ """ PoolSize=""1"" Enabled=""" _ tEnabled _ """ Foreground=""false"""
+    If tCategory '= "" Set tXml = tXml _ " Category=""" _ tCategory _ """"
+    Set tXml = tXml _ " Comment=""" _ tComment _ """"
     Set tSettings = pCfg.settings
     If $isobject(tSettings) && (tSettings.%Size() > 0) {
         Set tXml = tXml _ ">"

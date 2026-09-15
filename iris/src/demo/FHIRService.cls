@@ -34,8 +34,12 @@ Method ProcessOneFromQueue() As %Status
                 Set tReq.MappingId = tRset.%Get("MappingId")
                 Set tRowId = tRset.%Get("ID")
 
-                // 发送到转换流程（异步）
-                Do ..SendRequestAsync("TransformProcess", tReq)
+                // 发送到转换流程（异步）——目标 BP 由本 BS 的配置决定，
+                // 以支持「一条数据管道一个 BP」：^demo.Config("bp_target", <本BS名>) = <BP名>；
+                // 缺省回退 "TransformProcess"（旧单管道历史行为）。
+                Set tBpName = $Get(^demo.Config("bp_target", ..%ConfigName), "TransformProcess")
+                If tBpName = "" Set tBpName = "TransformProcess"
+                Do ..SendRequestAsync(tBpName, tReq)
                 // 标记该记录已处理（用 %SQL.Statement 执行 UPDATE，更可靠）
                 Set tUpd = ##class(%SQL.Statement).%New()
                 Do tUpd.%Prepare("UPDATE FHIRQueue SET Status='processed' WHERE ID=?")

@@ -72,4 +72,28 @@ if found=0 { set c = ##class(%SQLConnection).%New() set c.Name = "localTarget" s
 halt
 EOF
 
+# 5. 创建 CLINIC 命名空间与数据库（SQL 演示源：患者/就诊/诊断/药嘱四表）
+# 背景：CLINIC 库此前靠手工创建且不持久 —— 容器重建后即消失，SQL 源 BS 报
+#       ErrOutConnectFailed: Access Denied（JDBC 连不存在的 namespace）。
+# 说明：数据库目录必须预先存在（IRIS 不自动建目录），且放在 ISC_DATA_DIRECTORY 内以持久化。
+echo "=== [setup] 创建 CLINIC 命名空间与数据库 ==="
+/usr/irissys/bin/iris session "$instance" -U %SYS <<'EOF'
+set ex = ##class(Config.Namespaces).Exists("CLINIC")
+if ex { write "CLINIC_NS_EXISTS", ! }
+if 'ex { set dbdir = "/dur/irissys/mgr/CLINIC/" do ##class(%Library.File).CreateDirectoryChain(dbdir) set d = ##class(SYS.Database).%New() set d.Directory = dbdir set sc1 = d.%Save() set props("Directory") = dbdir set sc2 = ##class(Config.Databases).Create("CLINIC", .props) set np("Globals") = "CLINIC" set sc3 = ##class(Config.Namespaces).Create("CLINIC", .np) write "CLINIC_NS_CREATED: ", sc1, "/", sc2, "/", sc3, ! }
+halt
+EOF
+
+# 6. 配置 JDBC 数据源 CLINIC（CLINIC 命名空间演示源，SQL 源 BS 轮询四表用；同 localTarget 模式）
+echo "=== [setup] 配置 JDBC 数据源 CLINIC ==="
+/usr/irissys/bin/iris session "$instance" -U %SYS <<'EOF'
+set rs = ##class(%SQL.Statement).%New()
+do rs.%Prepare("SELECT connection_name FROM %Library.sys_SQLConnection WHERE connection_name=?")
+set r = rs.%Execute("CLINIC")
+set found = r.%Next()
+if found { write "DSN_CLINIC_EXISTS", ! }
+if found=0 { set c = ##class(%SQLConnection).%New() set c.Name = "CLINIC" set c.DSN = "jdbc:IRIS://127.0.0.1:1972/CLINIC" set c.Usr = "superuser" set c.pwd = "SYS" set c.driver = "com.intersystems.jdbc.IRISDriver" set c.URL = "jdbc:IRIS://127.0.0.1:1972/CLINIC" set c.isJDBC = 1 set sc = c.%Save() write "DSN_CLINIC_CREATED: ", $system.Status.GetErrorText(sc), ! }
+halt
+EOF
+
 echo "=== [setup] IRIS 初始化完成 ==="
