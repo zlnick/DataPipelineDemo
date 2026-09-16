@@ -214,7 +214,7 @@ def list_source_schemas(ds_id: str):
 
 @datasources_bp.get("/<ds_id>/tables")
 def list_source_tables(ds_id: str):
-    """（SQL 源）列出指定 schema 的表。"""
+    """（SQL 源）列出指定 schema 的表（并标记已选表，供向导预勾选）。"""
     ds = repository.get_datasource(ds_id)
     if not ds:
         return error("数据源不存在"), 404
@@ -225,7 +225,14 @@ def list_source_tables(ds_id: str):
         tables = jdbc_client.list_tables(ds.get("config") or {}, schema)
     except Exception as exc:  # noqa: BLE001
         return error(f"列出表失败: {exc}"), 500
-    return success({"schema": schema, "items": tables})
+    # 已选表标记：向导据此**预勾选**已保存的表，避免"只勾新表 → 丢旧表"
+    saved = {str(a.get("name") or "").lower()
+             for a in repository.list_assets(ds_id)
+             if (a.get("type") or "SQL_TABLE") == "SQL_TABLE"}
+    for tb in tables:
+        tb["selected"] = str(tb.get("table") or "").lower() in saved
+    return success({"schema": schema, "items": tables,
+                    "saved_tables": sorted(saved)})
 
 
 @datasources_bp.post("/<ds_id>/tables")
@@ -254,7 +261,14 @@ def select_source_tables(ds_id: str):
 
     if not saved:
         return error("未选择有效数据表"), 400
-    assets = repository.save_sql_table_assets(ds_id, saved)
+    # 合并语义（默认 merge）：本次未勾选的**已选表保留**，二次选表不会丢表；
+    # body.mode="replace" 时才按本次提交集合替换数据源已选表清单（不删除资产记录）。
+    _merge = str(body.get("mode") or "merge").lower() != "replace"
+    _res = repository.save_sql_table_assets(ds_id, saved, merge=_merge)
+    assets = _res["assets"]
+    merged = _res["merged"]
+    # 数据源 tables 字段用旧结构 [{schema, table, columns}]（下游 datasource_runtime / 管道生成按此读）
+    merged_tables = _res["tables"]
     for asset in assets:
         repository.save_source_asset({
             **asset,
@@ -271,7 +285,8 @@ def select_source_tables(ds_id: str):
         return error(f"SQL 表资产接口分析 Agent（AI）失败: {exc}"), 500
 
     # 自动生成轮询 Query（EnsLib.SQL.Service.GenericService 的 Host 设置）
-    first = saved[0]
+    # 轮询表 = **合并后第一张表**（= 首次选定的表，通常是患者主表），不随本次勾选顺序漂移
+    first = merged_tables[0]
     qtable = first["table"]
     query = f"SELECT * FROM {first['schema']}.{qtable}" if first["schema"] else f"SELECT * FROM {qtable}"
     key_field = (first["columns"][0]["name"] if first["columns"] else "")
@@ -287,7 +302,7 @@ def select_source_tables(ds_id: str):
         break
     repository.update_datasource(ds_id, {
         "status": "analyzed",
-        "tables": saved,
+        "tables": merged_tables,
         "config": {**conn, "query": query, "key_field": key_field},
     })
     # 连接探查 + 契约解读（刷新运行契约）
@@ -305,9 +320,11 @@ def select_source_tables(ds_id: str):
     dsn_name = jdbc_dsn.register_for_datasource(repository.get_datasource(ds_id))
     return success({
         "saved": saved, "count": len(saved),
+        "total": _res["total"], "merged": [a.get("name") for a in merged],
+        "replaced": _res["replaced"],
         "ai": _ai_semantics_summary(repository.list_assets(ds_id)),
         "dsn": dsn_name,
-    }, "数据表已保存（AI 语义分析、轮询键建议与 DSN 注册完成）")
+    }, f"数据表已保存（合计已选 {_res['total']} 张；AI 语义分析、轮询键建议与 DSN 注册完成）")
 
 
 @datasources_bp.post("/<ds_id>/seed")

@@ -12,7 +12,11 @@
 cd tools/datakit
 
 ./run.sh list                                  # 看全部脚本（含用途）
-./run.sh gen_test_patient.py --count 2 --family 赵 --given 敏 --diagnosis 糖尿病
+
+# 造数据：直接跑（脚本自带落地校验并打印结果），不要先查状态
+./run.sh gen_test_patient.py --source user --count 3              # SQL→SOAP / SQL→DB：造 USER 库 SQLUser.Patient，校验目标落库
+./run.sh gen_test_patient.py --count 2 --family 赵 --given 敏      # FHIR 口径：造 CLINIC 源，校验 FHIR 落地
+
 ./run.sh check_fhir.py                         # 查 FHIR 各资源数量
 ./run.sh diag_msgs.py                          # 查最近消息 + SQL 源扫描凭证
 ./run.sh reset_ui_env.py                       # 一键重置演示环境
@@ -40,7 +44,7 @@ tools/datakit/
 
 | 脚本 | 用途 | 用法示例 |
 |---|---|---|
-| `host/gen_test_patient.py` ★ | **一键造 FHIR 测试数据**：造 CLINIC 患者 → 触发同步 → 校验 FHIR 落地/中文/引用 | `./run.sh gen_test_patient.py --count 2 --family 赵 --given 敏 --diagnosis 糖尿病 --drug 阿司匹林` |
+| `host/gen_test_patient.py` ★ | **一键造测试数据并校验落地**（`--source` 决定造哪一侧）：`clinic`＝造 CLINIC 源 → 校验 FHIR 落地/中文/引用；**`user`＝造 USER 库 `SQLUser.Patient` → 校验 SQL→SOAP / SQL→DB 目标落库**（SOAP 口径看 `SQLUser.PatientEntity`） | `./run.sh gen_test_patient.py --source user --count 3`（FHIR 口径：`./run.sh gen_test_patient.py --count 2 --family 赵 --given 敏 --diagnosis 糖尿病 --drug 阿司匹林`） |
 | `host/seed_clinic.py` | 生成 CLINIC 演示数据（等价界面「生成演示数据」按钮） | `./run.sh seed_clinic.py` |
 | `container/clinic_tables.py` | CLINIC 源库**四表初始化**（幂等，患者/就诊/诊断/药嘱） | `./run.sh clinic_tables.py` |
 | `container/clinic_seed_data.py` | CLINIC 样例数据：10 患者 + 就诊/诊断/药嘱（术语只取中文术语集） | `./run.sh clinic_seed_data.py` |
@@ -53,7 +57,8 @@ tools/datakit/
 
 | 参数 | 说明 |
 |---|---|
-| `--family 赵` / `--given 敏` | 患者姓名（中文，用于校验编码是否正确落地） |
+| `--source user` | **造 USER 库 `SQLUser.Patient`**（供 **SQL→SOAP / SQL→DB** 管道），并校验目标落库（SOAP 口径 = `SQLUser.PatientEntity`）；不传则默认 `clinic`（造 CLINIC 源、校验 FHIR 落地） |
+| `--family 赵` / `--given 敏` | 患者姓名（中文，用于校验编码是否正确落地；`--source user` 时默认「测试/患者N」） |
 | `--count 2` | 生成几位患者 |
 | `--diagnosis 糖尿病` / `--drug 阿司匹林` | 诊断/药品（走中文术语 → 判码链路） |
 | `--force` | 强制全量重扫：停 Production → 清 SQL 源扫描凭证 → 重启 |
@@ -94,7 +99,7 @@ curl -s "http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/Patient?_summ
 
 | 脚本 | 用途 |
 |---|---|
-| `container/reset_ui_env.py` ★ | **一键重置演示环境**（回到零起点）：删 Production → 清 SQL 源扫描凭证 → 清 `^demo.*`（含 `^demo.PipelineInstance` 管道实体，并有「白名单漏项」兜底告警）→ 清 Ens 消息 → 清目标表 → 清 CLINIC 四表 → 删 `/dur/generated` 生成物 → 删 FHIR 测试资源；**服务/命名空间/表结构保留**（凭证清理会**枚举 `^Ens.AppData` 一级下标**，覆盖按管道类别改名/去重的 Item） |
+| `container/reset_ui_env.py` ★ | **一键重置演示环境**（回到零起点）：删 Production（**校验式停止** + `Ens.Config.Production` 记录 + 生成的生产类）→ 清 SQL 源扫描凭证 → 清 `^demo.*`（含 `^demo.PipelineInstance`，有「白名单漏项」兜底告警）→ 清 Ens **内部残留**（消息头/体、`Ens.StreamContainer`、`EnsLib_HTTP.GenericMessage(+/_HTTPHeaders)`、`Ens.BusinessProcess`、`Ens_Util.Log`；`Ens.BusinessProcess` SQL DELETE 被 SQL filer 拒时走 `%KillExtent` 兜底）→ **动态发现**清空 USER / CLINIC 命名空间**全部非系统表**（新增表自动覆盖）→ 按 `/dur/generated/<短名>.cls` **来源指纹**删生成类 + 目录清空重建 → 删 FHIR 测试资源；**服务/命名空间/表结构保留**。末尾输出 **25 项自检 ✅/❌ 清单**（含**与 UI 同源**的 HTTP 接口核对）并 `exit 0/1` —— 不需要人工/模型再判断是否干净；`--check-only` 只查不改、`--skip-fhir` 跳过 FHIR |
 | `container/rescan_sql_source.py` ★ | SQL 源**全量重扫**（**无参 = 自动重置全部 SQL 源 BS**，也可传 Item 名子集）：先走官方 void API（`ClearStaticAppData`/`ClearRuntimeAppData`/`InitializeLastKeyValue`），失败退清 global；**自带「停 Production → 清凭证 → 启 → 核验重扫真的发生」**（`--timeout=90` 调等待上限、`--no-cycle` 只清凭证），`StartProduction != 1` 时**显式报错退出**（⚠ 运行期清凭证＝静默无效：适配器 last key 有内存副本） |
 | `container/check_ens_clear_api.py` | Ens 清理 API 调用语义对照实测（`classMethodVoid` ✓ vs `classMethodValue` ✗，用独立测试 Item，不影响在跑管道） |
 | `container/test_llm.py` ★ | **LLM 连通性自检**：配置 → `/models` → 模型名+max_tokens → `_call_llm` 真实链路 |

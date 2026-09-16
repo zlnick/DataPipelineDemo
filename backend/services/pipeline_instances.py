@@ -244,6 +244,38 @@ def upsert_from_generation(*, source_id: str | None = None, target_id: str | Non
     return get_instance(pid) or rec
 
 
+def rewrite_mapping_id(old_id: str, new_id: str) -> int:
+    """把各管道实例 `mapping_ids` 里对 old_id 的引用改写为 new_id，返回被改写的管道数。
+
+    适用场景：同身份重复映射被 `repository.save_mappings` 归并删除后，管道实体不应该继续
+    挂着已删除的 id（否则 UI 的映射芯片指向不存在的记录 —— F4 类「id 漂移」的展示侧表现）。
+    幂等：old 不存在即无操作；改写后按序去重（避免 new_id 已存在时出现重复项）。
+    """
+    old_id, new_id = str(old_id or "").strip(), str(new_id or "").strip()
+    if not old_id or not new_id or old_id == new_id:
+        return 0
+    changed = 0
+    for rec in list_instances():
+        ids = [str(x) for x in (rec.get("mapping_ids") or [])]
+        if old_id not in ids:
+            continue
+        seen: set[str] = set()
+        rewritten: list[str] = []
+        for x in ids:
+            y = new_id if x == old_id else x
+            if y and y not in seen:
+                seen.add(y)
+                rewritten.append(y)
+        rec["mapping_ids"] = rewritten
+        rec["updated_at"] = datetime.now().isoformat()
+        repository.set_json(GLOBAL, str(rec.get("id")), rec)
+        changed += 1
+    if changed:
+        logger.warning("映射引用改写：%s → %s（影响 %d 条管道实例的 mapping_ids）",
+                       old_id, new_id, changed)
+    return changed
+
+
 def set_enabled(pid: str, enabled: bool) -> dict:
     """启用/禁用一条管道（占用/释放许可单元）。
 
@@ -347,6 +379,9 @@ def set_enabled(pid: str, enabled: bool) -> dict:
             # 运行期双写复核（set_items_enabled）：不一致说明需重启生产才收敛
             "runtime_applied": res.get("runtime_applied") or [],
             "runtime_failed": res.get("runtime_failed") or [],
+            "runtime_restarted": res.get("runtime_restarted") or [],
+            "runtime_still_down": res.get("runtime_still_down") or [],
+            "runtime_still_up": res.get("runtime_still_up") or [],
             "runtime_mismatch": res.get("runtime_mismatch") or []}
 
 

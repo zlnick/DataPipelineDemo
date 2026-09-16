@@ -182,6 +182,22 @@ def class_method_void(className: str, methodName: str, *args) -> None:
     raise last_exc if last_exc else RuntimeError("类方法（void）调用失败")
 
 
+def global_get(*subscripts, default=None):
+    """读取 IRIS global 节点（Native SDK），失败返回 default。
+
+    典型用途：读 `^Ens.Runtime("ConfigItem", <组件名>, "Job")` 判断 Ens 组件主机
+    **是否真的在运行**（配置层 Enabled=1 不等于主机已启动，见 pipeline_validator.set_items_enabled）。
+    """
+    try:
+        import iris  # 延迟导入：仅在需要 Native 访问时加载
+
+        conn = get_connection()
+        return iris.createIRIS(conn).get(*subscripts)
+    except Exception as exc:  # noqa: BLE001 - 读取失败按"未取到"处理
+        logger.debug("读取 global %s 失败: %s", subscripts, exc)
+        return default
+
+
 def ping() -> bool:
     """探测 IRIS 是否可连接。
 

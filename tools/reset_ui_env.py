@@ -1,21 +1,60 @@
 # -*- coding: utf-8 -*-
 """UI 测试环境一键重置（在 dataflow-backend 容器内执行）。
 
-重置范围 = 「从零演示」起点，与 2026-09-09 UI 测试前状态一致：
+重置范围 = 「从零演示」起点，与 2026-09-09 UI 测试前状态一致（**步序以 main() 为准**）：
   ① 停并删除 demo 动态 Production（demo.DataflowProduction + Ens.Config 记录）
-  ② 清空 ^demo.* 登记（数据源/资产/目标/映射/配置/领域模型/验证经验/数据管道实体）
-  ③ 清空 Ens 消息历史（MessageHeader/MessageBody，先停 Production 再清，安全）
-  ④ 清空 demo 目标表数据（PatientEntity/PatientSource/FHIRQueue/Patient/Observation）
-  ⑤ 清空 CLINIC 命名空间四表（MedicationOrder/Diagnosis/Encounter/Patient）
-  ⑥ 清除 FHIR server 测试资源（按常用类型逐个搜索并 DELETE）
+     —— 2026-09-16 加固：停止动作改为**校验式**（`stop_production` 复查 IsProductionRunning，
+     按名停不生效时退化为无参 StopProduction，仍失败则显式告警），避免「删了类但运行态残留 1」
+     导致重置后 /api/pipelines/status 虚报 running=true
+  ② 清 SQL 源扫描凭证与错误行（防重 seed 后零消息）
+  ③ 清空 ^demo.* 登记（数据源/资产/目标/映射/配置/领域模型/验证经验/数据管道实体）
+  ④ 清空 Ens **内部残留**：MessageHeader/MessageBody、`Ens.StreamContainer`（消息流存储）、
+     `EnsLib_HTTP.GenericMessage(+/_HTTPHeaders)`（HTTP 消息体）、`Ens.BusinessProcess`（BP 进程）、
+     `Ens_Util.Log`（事件日志）。事件日志会被运行期校验当"事实"读
+     （`pipeline_validator` 按时间窗查 Ens_Util.Log），不清就把**上一轮报错算到新一轮头上**（假红）
+  ⑤ 删生成物（**来源指纹**判定：`%File.Exists('/dur/generated/<短名>.cls')` → `%SYSTEM.OBJ:Delete`
+     删类 → `RemoveDirectoryTree` + `CreateDirectory` 清空重建目录；无来源文件的手写类**只保留不删**）
+     —— **必须排在清表之前**：生成 BP 自带 SQL 表（`<类>`、`<类>_MessagesReceived/_MessagesSent`），
+     类删掉表就消失；排在后面会被清表步骤命中并报 `-106 Row to DELETE not found` → 假残留（2026-09-16 实测）
+  ⑥ 清空 USER 命名空间**全部非系统表**（动态发现 `INFORMATION_SCHEMA.TABLES`：
+     `SQLUser.*` 演示目标表 + `demo.*` 消息表 + `PatientService_*` SOAP 消息表；
+     以后新增表**自动覆盖**，不需要改脚本）
+  ⑦ 清空 CLINIC 命名空间**全部非系统表**（动态发现，当前为 4 张数据源表）
+  ⑧ 清除 FHIR server 测试资源（按常用类型逐个搜索并 DELETE）
 服务、命名空间、表结构、术语/向量库全部保留。
 
-用法（本机仓库根）：
-    docker cp tools/reset_ui_env.py dataflow-backend:/tmp/reset_ui_env.py
-    docker exec dataflow-backend python /tmp/reset_ui_env.py
+用法（**一条命令**，本机仓库根目录）：
+    bash tools/datakit/run.sh reset_ui_env.py          # 推荐：自动拷入容器并执行
+    # 等价手动两步（容器内执行）：
+    #   docker cp tools/reset_ui_env.py dataflow-backend:/tmp/reset_ui_env.py
+    #   docker exec dataflow-backend python /tmp/reset_ui_env.py
+
+参数：
+    --check-only   只体检不清理（相当于"我现在到底干净吗"，返回同一份清单）
+    --skip-fhir    跳过 FHIR 资源清理（省 ~20s，用于只要清 SQL/Ens 侧）
+
+自检与退出码（**不需要人来判断是否干净**）：
+    脚本末尾输出 ✅/❌ 清单，逐项断言
+      ① `IsProductionRunning()==0` + `Ens_Config.Production` 0 行 + 生成生产类已删
+      ② `^demo.*` 登记全部为空
+      ③ Ens 内部表行数为 0（消息/流存储/HTTP 消息体/BP 进程/事件日志）
+      ④ USER / CLINIC 命名空间非系统表（动态发现）行数为 0
+      ⑤ `/dur/generated` 已清空、生成类无残留
+      ⑥ HTTP 接口与 UI 同源核对：`/pipelines/status.running=false`、
+         `/pipelines/items`、`/pipelines/instances`、`/pipelines/logs`、
+         `/pipelines/validation-issues`、`/datasources`、`/targets`、`/mappings` 全空
+      ⑦ FHIR server 演示资源类型全空
+    自检**一律重新扫描"当前事实"**（不复用清理阶段的清单）：删生成类会让其 SQL 表随之消失，
+    拿旧清单复核会报"表都不存在了却仍有数据"的假 ❌（2026-09-16 实测 -106）
+    任何一项 ❌ → 打印失败原因并 `exit 1`；全 ✅ → `exit 0`（可安全接 CI / 直接开演示）
+    HTTP / FHIR 自检依赖 backend / FHIR 已启动；探测不到会显式标 ⚠ 并给出手工核对命令，不计失败。
 """
+import json
 import logging
 import sys
+import time
+import urllib.error
+import urllib.request
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("reset_ui_env")
@@ -34,8 +73,45 @@ DEMO_GLOBALS = [
     "^demo.PipelineInstance",   # 数据管道实体（受管理持久对象）
 ]
 PRODUCTION_NAME = "demo.DataflowProduction"
+# 演示数据表：**兜底名单**。正常情况下由 INFORMATION_SCHEMA 动态发现全部非系统表，
+# 这里保留是为了「动态发现失败（连不上/权限异常）时仍能清掉核心表」+ 日志可读性。
 DEMO_TARGET_TABLES = ["PatientEntity", "PatientSource", "FHIRQueue", "Patient", "Observation"]
 CLINIC_TABLES = ["MedicationOrder", "Diagnosis", "Encounter", "Patient"]
+# 动态发现时排除的系统 schema 前缀（其余视为演示/生成物表 → 自动清空）
+# ⚠ 比较时统一大写：IRIS 返回的 schema 大小写不一，若常量写成混合大小写再用
+#   `schema.upper().startswith(前缀)` 比较会**永远不匹配**（2026-09-16 实测：把
+#   Ens.StreamContainer / EnsLib_HTTP.* 等内部表当成"非系统表"报错/清理）。
+SYSTEM_SCHEMA_PREFIXES = tuple(p.upper() for p in (
+    "%", "INFORMATION_SCHEMA", "Security", "Config", "IRIS", "HS",   # HS/HSFHIR = FHIR server 存储
+    "Ens", "Ens_", "EnsLib", "EnsPortal", "EnsUtil",                  # Ens 内部表（见 ENS_INTERNAL_TABLES）
+))
+# 需要显式清空的 Ens 内部表（前缀 Ens 已被排除出动态发现，故在此点名）
+# 为什么连这些一起清：它们都是**上一轮运行的残留**（消息流存储/HTTP 消息体/BP 进程/日志），
+# 留着会让「零起点」名不副实，也会干扰运行期校验（校验按时间窗读事件日志与消息）。
+# 清前取证（2026-09-16，.trash/20260916-n11reset/inv_ens2.py）：
+#   Ens.StreamContainer = 上一轮 FHIR JSON 报文；EnsLib_HTTP.GenericMessage = OperationOutcome/请求头；
+#   Ens.BusinessProcess = %ConfigName=SqlFhirPatientTxProcess 的未完成进程 → 均为运行残留。
+# 刻意**不清**（库/运维元数据，非演示数据）：Ens_Config.SearchTableProp、Ens_Deployment.Token、
+#   Ens_Util.LookupTable（内容实测为 `%IRIS_X12ReplyType` 等 IRIS 内置查找表）。
+ENS_INTERNAL_TABLES = [
+    "Ens.MessageBody",                     # 消息体
+    "Ens.MessageHeader",                   # 消息头
+    "Ens.StreamContainer",                 # 消息流存储（删消息后必须清，否则无限增长）
+    "EnsLib_HTTP.GenericMessage",          # HTTP 消息体（历史请求垃圾）
+    "EnsLib_HTTP.GenericMessage_HTTPHeaders",
+    "Ens.BusinessProcess",                 # BP 进程残留（含统计）
+    "Ens_Util.Log",                        # 事件日志（运行期校验会当"事实"读）
+]
+# 上表被 SQL 拒绝删除时的 ObjectScript 兜底动作（2026-09-16 实测）：
+#   `Ens.BusinessProcess` 行删不掉：SQL filer 的 %SQLDelete 要解析行里记录的业务主机类
+#   （`demo.SqlFhirPatientTxProcess`），该类已被删除 → <SQLCODE -415> <CLASS DOES NOT EXIST>；
+#   改用 `%KillExtent` 清空 extent 可行（实测 2 行 → 0 行）。
+ENS_TABLE_FALLBACK = {"Ens.BusinessProcess": ("Ens.BusinessProcess", "%KillExtent")}
+# Ens 库/框架类命名空间前缀：这些不是"应用业务主机类"，枚举生成物时直接跳过
+# （否则日志会刷出 100+ 个 EnsLib.* 库类，看不清真正要保留的手写类）
+LIBRARY_CLASS_PREFIXES = ("%", "Ens.", "EnsLib.", "EnsPortal.", "EnsUtil.", "Ens_")
+GENERATED_DIR = "/dur/generated"          # 生成物源码目录（容器内路径）
+API_BASE = "http://127.0.0.1:5000/api"    # backend 容器内本地端口（宿主映射 5001）
 FHIR_CLEAN_TYPES = [
     "Patient", "Encounter", "Condition", "MedicationRequest", "Medication", "MedicationDispense",
     "Observation", "AllergyIntolerance", "Procedure", "DiagnosticReport", "Immunization",
@@ -48,25 +124,78 @@ def step(name):
     log.info("\n===== %s =====", name)
 
 
+def production_running() -> int:
+    """Ens.Director.IsProductionRunning()：1=在运行，0=未运行，-1=查询失败。"""
+    from backend.services import iris_connector
+    try:
+        return int(iris_connector.class_method_value(
+            "Ens.Director", "IsProductionRunning") or 0)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("IsProductionRunning 查询失败: %s", str(exc)[:120])
+        return -1
+
+
+def stop_production(max_wait: int = 15) -> bool:
+    """停 Production 并**校验**运行态确实已复位（不再是"调完就宣布成功"）。
+
+    2026-09-16 实测坑：原实现调用 `StopProduction` 后不看返回值/不复查就打印「Production 已停止」，
+    而删掉 Production 类之后 Ensemble 的**运行态标记**仍可能残留 1 → 重置后
+    `/api/pipelines/status` 虚报 `running=true`，同时 `/api/pipelines/items` 为空（自相矛盾，
+    从零演示会被误导，且 `StartProduction` 会先收到 ALREADY_RUNNING）。
+
+    策略：① 按名停（timeout=1）→ 复查（最多等 max_wait 秒）；
+    ② 仍未复位 → 无参 `StopProduction()`（停"当前正在跑"的那个，不依赖类是否存在）→ 再复查；
+    ③ 仍失败则**显式告警**（不静默），返回 False。
+    """
+    from backend.services import iris_connector
+    if production_running() == 0:
+        log.info("Production 未在运行，跳过停止")
+        return True
+    for label, args in (("按名停", (PRODUCTION_NAME, 1)), ("无参停（停当前正在跑的）", ())):
+        try:
+            iris_connector.class_method_void("Ens.Director", "StopProduction", *args)
+            log.info("%s：StopProduction 已调用", label)
+        except Exception as exc:  # noqa: BLE001
+            log.info("%s 调用异常（继续用运行态判定）: %s", label, str(exc)[:120])
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            if production_running() == 0:
+                log.info("%s 后运行态已复位（IsProductionRunning=0）", label)
+                return True
+            time.sleep(1)
+    log.warning(
+        "⚠ Production 运行态仍未复位（IsProductionRunning=%s）：重置后 /api/pipelines/status 会虚报 "
+        "running=true。请在 backend 容器内复查一次 Ens.Director.StopProduction(\"\", 1)",
+        production_running())
+    return False
+
+
 def clean_production():
     """停 Production、删 Ens.Config.Production 记录与动态类定义（防 Ens 自动恢复）。"""
     from backend.services import iris_connector
-    try:
-        iris_connector.class_method_value(
-            "Ens.Director", "StopProduction", PRODUCTION_NAME, 1)
-        log.info("Production 已停止")
-    except Exception as exc:  # noqa: BLE001
-        log.info("停 Production 跳过（未运行或不存在）: %s", str(exc)[:120])
+    stop_production()
     try:
         iris_connector.class_method_value("Ens.Config.Production", "%DeleteId", PRODUCTION_NAME)
         log.info("Ens.Config.Production 记录已删除")
     except Exception as exc:  # noqa: BLE001
         log.info("删除 Ens.Config.Production 跳过: %s", str(exc)[:120])
     try:
-        iris_connector.class_method_value("%SYSTEM.OBJ", "Delete", PRODUCTION_NAME, "c")
-        log.info("动态 Production 类定义已删除")
-    except Exception as exc:  # noqa: BLE001
-        log.info("删除动态类定义跳过: %s", str(exc)[:120])
+        exists = int(iris_connector.query(
+            "SELECT COUNT(*) FROM %Dictionary.CompiledClass WHERE Name = ?",
+            [PRODUCTION_NAME])[0][0])
+    except Exception:  # noqa: BLE001 - 探测失败则按"存在"处理，直接尝试删除
+        exists = 1
+    if not exists:
+        # 幂等：二次运行时类已删，直接跳过，避免刷一行 ERROR #5351 噪音
+        log.info("动态 Production 类定义不存在（已删过），跳过")
+    else:
+        try:
+            iris_connector.class_method_value("%SYSTEM.OBJ", "Delete", PRODUCTION_NAME, "c")
+            log.info("动态 Production 类定义已删除")
+        except Exception as exc:  # noqa: BLE001
+            log.info("删除动态类定义跳过: %s", str(exc)[:120])
+    # 删类后再复查一次：实测删类与运行态复位存在时序差，此处兜底
+    stop_production(max_wait=5)
     clean_config_tables()
 
 
@@ -204,76 +333,204 @@ def clear_sql_source_appdata():
         nconn.close()
 
 
-def clear_generated_classes():
-    """删除 Agent 生成的 BP 类与 /dur/generated 源码（下次生成由 Agent 重新产出）。"""
+def _ens_component_classes() -> list:
+    """枚举本命名空间里**应用级** Ens 业务主机类（BP/BS/BO/Production）的名字。
+
+    跳过 Ens 库/框架类（EnsLib.*/Ens.*/%* 等，见 LIBRARY_CLASS_PREFIXES）：
+    生成物与应用类都在业务命名空间（如 demo.*），库类既不可能是生成物，刷出来只会干扰日志。
+    """
     from backend.services import iris_connector
+    rows = iris_connector.query(
+        "SELECT Name FROM %Dictionary.CompiledClass WHERE "
+        "Super LIKE '%Ens.BusinessProcess%' OR Super LIKE '%Ens.BusinessService%' "
+        "OR Super LIKE '%Ens.BusinessOperation%' OR Super LIKE '%Ens.Production%'")
+    return sorted(str(r[0]) for r in rows
+                  if r and r[0] and not str(r[0]).startswith(LIBRARY_CLASS_PREFIXES))
+
+
+def _generated_file_exists(cls: str) -> bool:
+    """该类是否有生成来源文件 `/dur/generated/<短名>.cls`（= Agent 生成物的来源指纹）。"""
+    from backend.services import iris_connector
+    path = f"{GENERATED_DIR}/{cls.split('.')[-1]}.cls"
     try:
-        iris_connector.class_method_value("%SYSTEM.OBJ", "Delete",
-                                          "demo.SqlFhirPatientTxProcess", "c")
-        log.info("BP 类 demo.SqlFhirPatientTxProcess 已删除")
+        return int(iris_connector.class_method_value("%File", "Exists", path) or 0) == 1
     except Exception as exc:  # noqa: BLE001
-        log.info("删除 BP 类跳过: %s", str(exc)[:120])
-    for f in ("/dur/generated/SqlFhirPatientTxProcess.cls",
-              "/dur/generated/DataflowProduction.cls"):
+        log.warning("探测生成来源文件失败（%s）: %s", path, str(exc)[:100])
+        return False
+
+
+def clear_generated_classes() -> list:
+    """删除生成物：**有来源文件**的生成类 + 清空重建 `/dur/generated`。
+
+    判定规则（2026-09-16 实测过链路，见 .trash/20260916-n11reset/probe_objdelete.py）：
+      · 候选 = 命名空间内所有 Ens 业务主机类（BP/BS/BO/Production）；
+      · 生成物一定由 `demo.PipelineQuery:AddGeneratedBpSource` 写到
+        `/dur/generated/<短名>.cls` 再 Load →「`%File.Exists(该路径)`」就是**可信来源指纹**；
+      · 有指纹 → 删类（`%SYSTEM.OBJ:Delete(cls,"c")`，实测删类但**不删源码文件**）→ 再做目录级清空；
+      · 无指纹 → **保留**（仓库手写的 `demo.FHIRService`/`demo.TargetOperation` 等也是 Ens 类型，
+        无差别删会把演示应用删坏），仅在日志里点名。
+
+    为什么不再硬编码 `demo.SqlFhirPatientTxProcess`：类名随 Agent 产出/白名单演进变化，
+    硬编码必漏（漏删 → 旧类残留、新 Production 指向陈旧实现）。
+    返回仍未清掉的生成类清单（供自检断言，正常为空）。
+    """
+    from backend.services import iris_connector
+    candidates = _ens_component_classes()
+    generated = [c for c in candidates if _generated_file_exists(c)]
+    kept = [c for c in candidates if c not in generated]
+    for cls in generated:
         try:
-            iris_connector.class_method_value("%Library.File", "Delete", f)
+            iris_connector.class_method_value("%SYSTEM.OBJ", "Delete", cls, "c")
+            log.info("已删除生成类 %s（来源 %s/%s.cls）", cls, GENERATED_DIR, cls.split(".")[-1])
         except Exception as exc:  # noqa: BLE001
-            log.info("删除 %s 跳过: %s", f, str(exc)[:120])
-    log.info("生成物清理完成（/dur/generated 源码 + BP 类）")
-
-
-def clear_ens_messages():
-    import iris.dbapi
-    conn = iris.dbapi.connect(hostname=IRIS_HOST, port=IRIS_PORT, namespace=USER_NS,
-                              username="superuser", password="SYS")
+            log.warning("删除生成类 %s 失败: %s", cls, str(exc)[:120])
+    # 目录级清空重建：覆盖所有源码文件（含已无对应类的孤儿文件）
     try:
+        if int(iris_connector.class_method_value(
+                "%File", "DirectoryExists", GENERATED_DIR) or 0) == 1:
+            iris_connector.class_method_value("%File", "RemoveDirectoryTree", GENERATED_DIR)
+        iris_connector.class_method_value("%File", "CreateDirectory", GENERATED_DIR)
+        log.info("%s 已清空重建（存在=%s）", GENERATED_DIR,
+                 iris_connector.class_method_value("%File", "DirectoryExists", GENERATED_DIR))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("清空 %s 失败: %s", GENERATED_DIR, str(exc)[:120])
+    if kept:
+        log.info("保留（无生成来源文件，判定为仓库手写/库类）：%s", ", ".join(kept))
+    # 复核：此时目录已空，任何"仍有来源文件"的 Ens 类都是没删掉的残留
+    leftover = [c for c in candidates if _generated_file_exists(c)]
+    if leftover:
+        log.warning("⚠ 生成类残留未清掉：%s", ", ".join(leftover))
+    return leftover
+
+
+
+def _dbapi(ns: str):
+    """建一个 dbapi 连接（backend 容器内用 Docker 网络服务名 iris 访问 IRIS）。"""
+    import iris.dbapi
+    return iris.dbapi.connect(hostname=IRIS_HOST, port=IRIS_PORT, namespace=ns,
+                              username="superuser", password="SYS")
+
+
+def _discover_tables(conn, ns: str) -> list:
+    """列出命名空间内所有「非系统」基表，返回 [(SCHEMA, TABLE), ...]。
+
+    为什么动态发现而不是硬编码表名：演示目标表跟着生成的管道走
+    （同一批数据可能落到 Patient/Encounter/Condition/…，Agent 生成的 BP 还会自带
+    `<类>_MessagesReceived/_MessagesSent` 统计表），硬编码一定漏表 → 重置不干净。
+    系统 schema 前缀见 SYSTEM_SCHEMA_PREFIXES（Ens / HS(FHIR) / % 等）。
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME")
+    rows = cur.fetchall()
+    kept = [(str(s or ""), str(n)) for s, n in rows
+            if not str(s or "").upper().startswith(SYSTEM_SCHEMA_PREFIXES)]
+    log.info("动态发现 %s：基表 %d 张（系统 %d / 非系统 %d）",
+             ns, len(rows), len(rows) - len(kept), len(kept))
+    return kept
+
+
+def clear_namespace_tables(ns: str, label: str, fallback) -> list:
+    """清空命名空间内所有非系统表的数据，保留表结构。
+
+    返回仍非空的表清单（如 ["SQLUser.Patient=3"]），供自检断言用。
+    """
+    conn = _dbapi(ns)
+    try:
+        try:
+            targets = _discover_tables(conn, ns)
+        except Exception as exc:  # noqa: BLE001 - 发现失败则退回兜底名单
+            log.warning("动态发现 %s 表失败，退回兜底名单: %s", ns, str(exc)[:120])
+            targets = [("SQLUser", t) for t in fallback]
+        if not targets:
+            log.info("%s 暂无可清表（尚未建表，属正常）", label)
+        left = []
         cur = conn.cursor()
-        for t in ("Ens.MessageBody", "Ens.MessageHeader"):
+        for sch, name in targets:
+            q = f'"{sch}"."{name}"'
             try:
-                cur.execute(f"DELETE FROM {t}")
-                log.info("消息表 %s 已清空（%s 行）", t,
-                         getattr(cur, "rowcount", 0) or 0)
+                cur.execute(f"DELETE FROM {q}")
+                conn.commit()
+                cur.execute(f"SELECT COUNT(*) FROM {q}")
+                n = cur.fetchone()[0]
+                if n:
+                    left.append(f"{sch}.{name}={n}")
+                    log.warning("%s 表 %s.%s 仍有 %s 行（清不掉，检查权限/触发器）",
+                                label, sch, name, n)
+                else:
+                    log.info("%s 表 %s.%s 已空", label, sch, name)
             except Exception as exc:  # noqa: BLE001
-                log.warning("清空 %s 失败: %s", t, str(exc)[:120])
-        conn.commit()
+                msg = str(exc).splitlines()[0][:100]
+                # DELETE 可能被 SQL filer 拒绝（生成 BP 表实测报 -106 Row to DELETE not found；
+                # Ens.BusinessProcess 报 -415 CLASS DOES NOT EXIST）→ 退回"以行数为准"判定：
+                # 数不出（表已随类删除，-30）或行数为 0 都不算残留，只有真的还有行才是残留。
+                try:
+                    conn.rollback()
+                    cur.execute(f"SELECT COUNT(*) FROM {q}")
+                    n2 = int(cur.fetchone()[0])
+                except Exception:  # noqa: BLE001 - 表已不存在（随生成类一起删除）
+                    log.info("%s 表 %s.%s 已不存在（随类删除），无需清理", label, sch, name)
+                    continue
+                if n2:
+                    left.append(f"{sch}.{name}={n2}")
+                    log.warning("%s 表 %s.%s 清理失败且仍有 %s 行: %s", label, sch, name, n2, msg)
+                else:
+                    log.info("%s 表 %s.%s DELETE 报错但行数已为 0（记为已清）: %s",
+                             label, sch, name, msg)
+        return left
     finally:
         conn.close()
 
 
-def clear_user_tables():
-    import iris.dbapi
-    conn = iris.dbapi.connect(hostname=IRIS_HOST, port=IRIS_PORT, namespace=USER_NS,
-                              username="superuser", password="SYS")
+def clear_ens_internal():
+    """清 Ensemble 内部残留：消息历史 + 流存储 + HTTP 消息体 + BP 进程 + 事件日志。
+
+    为什么要连事件日志一起清：运行期校验直接读 `Ens_Util.Log` 当事实
+    （`pipeline_validator` 按 TimeLogged 过滤），上一轮 ERROR 会被算到新一轮头上 → 假红。
+    2026-09-16 实测：旧版重置后 `Ens_Util.Log` 仍残留 3196 行、`Ens.StreamContainer` 1575 行。
+
+    个别表 SQL DELETE 会被 SQL filer 拒绝（见 ENS_TABLE_FALLBACK），此时走 ObjectScript 兜底。
+    """
+    from backend.services import iris_connector
+    conn = _dbapi(USER_NS)
     try:
-        cur = conn.cursor()
-        for t in DEMO_TARGET_TABLES:
+        for t in ENS_INTERNAL_TABLES:
+            cur = conn.cursor()
             try:
                 cur.execute(f"DELETE FROM {t}")
-                log.info("目标表 %s 数据已清空（%s 行）", t,
-                         getattr(cur, "rowcount", 0) or 0)
+                conn.commit()
             except Exception as exc:  # noqa: BLE001
-                log.warning("目标表 %s 清空失败（可能不存在）: %s", t, str(exc)[:120])
-        conn.commit()
+                log.warning("%s SQL DELETE 失败，尝试兜底: %s", t, str(exc)[:110])
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001 - 回滚失败不影响后续
+                    pass
+                fallback = ENS_TABLE_FALLBACK.get(t)
+                if not fallback:
+                    continue
+                try:
+                    iris_connector.class_method_value(*fallback)
+                    log.info("%s 已用 %s:%s 兜底清理", t, fallback[0], fallback[1])
+                except Exception as exc2:  # noqa: BLE001
+                    log.warning("%s 兜底清理失败: %s", t, str(exc2)[:110])
+            try:
+                cur = conn.cursor()
+                cur.execute(f"SELECT COUNT(*) FROM {t}")
+                log.info("%s 清理后剩余 %s 行", t, cur.fetchone()[0])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s 行数复核失败: %s", t, str(exc)[:110])
     finally:
         conn.close()
 
 
-def clear_clinic_tables():
-    import iris.dbapi
-    conn = iris.dbapi.connect(hostname=IRIS_HOST, port=IRIS_PORT, namespace=CLINIC_NS,
-                              username="superuser", password="SYS")
-    try:
-        cur = conn.cursor()
-        for t in CLINIC_TABLES:
-            try:
-                cur.execute(f"DELETE FROM {t}")
-                log.info("CLINIC 表 %s 数据已清空（%s 行）", t,
-                         getattr(cur, "rowcount", 0) or 0)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("CLINIC 表 %s 清空失败: %s", t, str(exc)[:120])
-        conn.commit()
-    finally:
-        conn.close()
+def clear_user_tables() -> list:
+    """清空 USER 命名空间**全部非系统表**（动态发现；演示目标表 + demo.*/SOAP 消息表）。"""
+    return clear_namespace_tables(USER_NS, "USER", DEMO_TARGET_TABLES)
+
+
+def clear_clinic_tables() -> list:
+    """清空 CLINIC 命名空间**全部非系统表**（动态发现；当前为数据源侧 4 张表）。"""
+    return clear_namespace_tables(CLINIC_NS, "CLINIC", CLINIC_TABLES)
 
 
 
@@ -337,65 +594,262 @@ def purge_fhir_resources():
     log.info("FHIR 测试资源清理合计删除 %s 个", total)
 
 
-def verify():
-    """重置后核对：登记为空、各表计数为 0。"""
-    import iris.dbapi
-    from backend.services import repository
+CHECKS: list = []
 
-    ds = repository.list_datasources()
-    tgs = repository.list_targets()
-    log.info("\n===== 重置核对 =====")
-    log.info("数据源登记数: %s；数据目标登记数: %s", len(ds), len(tgs))
 
-    conn = iris.dbapi.connect(hostname=IRIS_HOST, port=IRIS_PORT, namespace=USER_NS,
-                              username="superuser", password="SYS")
+def check(name: str, ok: bool, detail: str = "", warn: bool = False) -> None:
+    """登记一条自检结论；warn=True 的项不计入失败（如 backend 未启动跳过 HTTP 检查）。"""
+    CHECKS.append({"name": name, "ok": bool(ok), "detail": detail, "warn": warn})
+    log.info("%s %s%s", "✅" if ok else ("⚠" if warn else "❌"), name,
+             f" —— {detail}" if detail else "")
+
+
+def _count(ns: str, table: str) -> int:
+    """表行数（体检用；表不存在时抛异常由调用方处理）。"""
+    conn = _dbapi(ns)
     try:
         cur = conn.cursor()
-        for t in DEMO_TARGET_TABLES:
-            try:
-                cur.execute(f"SELECT COUNT(*) FROM {t}")
-                log.info("目标表 %s 行数: %s", t, cur.fetchone()[0])
-            except Exception as exc:  # noqa: BLE001
-                log.warning("目标表 %s 查询失败（可能不存在）: %s", t, str(exc)[:100])
+        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        return int(cur.fetchone()[0])
     finally:
         conn.close()
 
-    conn2 = iris.dbapi.connect(hostname=IRIS_HOST, port=IRIS_PORT, namespace=CLINIC_NS,
-                               username="superuser", password="SYS")
+
+def _leftover_tables(ns: str, fallback) -> list:
+    """返回命名空间内「仍有数据」的非系统表清单（体检 --check-only 用）。"""
+    conn = _dbapi(ns)
     try:
-        cur = conn2.cursor()
-        for t in CLINIC_TABLES:
-            cur.execute(f"SELECT COUNT(*) FROM {t}")
-            log.info("CLINIC 表 %s 行数: %s", t, cur.fetchone()[0])
+        try:
+            targets = _discover_tables(conn, ns)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("动态发现 %s 表失败，退回兜底名单: %s", ns, str(exc)[:120])
+            targets = [("SQLUser", t) for t in fallback]
+        cur = conn.cursor()
+        left = []
+        for sch, name in targets:
+            try:
+                cur.execute(f'SELECT COUNT(*) FROM "{sch}"."{name}"')
+                n = int(cur.fetchone()[0])
+            except Exception:  # noqa: BLE001 - 单表异常不影响整体体检
+                continue
+            if n:
+                left.append(f"{sch}.{name}={n}")
+        return left
     finally:
-        conn2.close()
+        conn.close()
 
 
-def main():
-    step("1/8 停/删 demo Production（含 Ens 配置表残留清理）")
-    clean_production()
-    step("2/8 清 SQL 源扫描凭证与错误行（防重 seed 后零消息）")
-    clear_sql_source_appdata()
-    step("3/8 清空 ^demo.* 登记")
-    kill_demo_globals()
-    step("4/8 清空 Ens 消息历史")
-    clear_ens_messages()
-    step("5/8 清空 demo 目标表")
-    clear_user_tables()
-    step("6/8 清空 CLINIC 四表")
-    clear_clinic_tables()
-    step("7/8 清生成物（BP 类 + /dur/generated 源码）")
-    clear_generated_classes()
-    step("8/8 清除 FHIR server 测试资源")
-    purge_fhir_resources()
-    verify()
-    log.info("\n重置完成：演示可从零开始（服务/命名空间/表结构保留）")
+def _leftover_generated_classes() -> list:
+    """生成物残留 = 仍有来源文件（/dur/generated/<短名>.cls）的 Ens 业务主机类。"""
+    return [c for c in _ens_component_classes() if _generated_file_exists(c)]
+
+
+def verify_production() -> None:
+    """Production 运行态与配置残留（重置与体检共用；对应历史上"状态自相矛盾"那个坑）。"""
+    running = production_running()
+    check("Production 已停止（IsProductionRunning=0）", running == 0, f"实际={running}")
+    from backend.services import iris_connector
+    try:
+        rows = iris_connector.query("SELECT COUNT(*) FROM Ens_Config.Production")
+        n = int(rows[0][0]) if rows else 0
+        check("Ens_Config.Production 配置记录为 0", n == 0, f"行数={n}")
+    except Exception as exc:  # noqa: BLE001
+        check("Ens_Config.Production 配置记录为 0", False, f"查询失败: {str(exc)[:80]}", warn=True)
+    try:
+        rows = iris_connector.query(
+            "SELECT COUNT(*) FROM %Dictionary.CompiledClass WHERE Name = ?", [PRODUCTION_NAME])
+        n = int(rows[0][0]) if rows else 0
+        check(f"生成的生产类 {PRODUCTION_NAME} 已删除", n == 0, f"仍存在定义={n}")
+    except Exception as exc:  # noqa: BLE001
+        check(f"生成的生产类 {PRODUCTION_NAME} 已删除", False,
+              f"查询失败: {str(exc)[:80]}", warn=True)
+
+
+def verify_iris(user_left, clinic_left, cls_left) -> None:
+    """IRIS 侧自检：登记 / ^demo.* / 消息与事件日志 / 各表行数 / 生成物。"""
+    import iris
+
+    from backend.services import iris_connector, repository
+    ds, tgs = repository.list_datasources(), repository.list_targets()
+    check("数据源/数据目标登记为空", not ds and not tgs,
+          f"datasources={len(ds)} targets={len(tgs)}")
+    conn = iris_connector.get_connection()
+    try:
+        state = _demo_globals_state(iris.createIRIS(conn))
+    finally:
+        conn.close()
+    dirty = [g for g, v in state.items() if v is True]
+    check("^demo.* 登记全部为空", not dirty,
+          f"残留: {', '.join(dirty)}" if dirty else f"{len(state)} 个 global 均空")
+    for t in ENS_INTERNAL_TABLES:
+        try:
+            n = _count(USER_NS, t)
+            check(f"{t} 行数为 0", n == 0, f"行数={n}")
+        except Exception as exc:  # noqa: BLE001
+            check(f"{t} 行数为 0", False, f"查询失败: {str(exc)[:80]}", warn=True)
+    check("USER 命名空间非系统表全部为空", not user_left,
+          f"仍有数据: {', '.join(user_left)}" if user_left else "")
+    check("CLINIC 命名空间非系统表全部为空", not clinic_left,
+          f"仍有数据: {', '.join(clinic_left)}" if clinic_left else "")
+    check("生成类无残留（来源指纹已清）", not cls_left,
+          f"残留: {', '.join(cls_left)}" if cls_left else "")
+    try:
+        exists = int(iris_connector.class_method_value(
+            "%File", "DirectoryExists", GENERATED_DIR) or 0) == 1
+    except Exception:  # noqa: BLE001
+        exists = False
+    check(f"{GENERATED_DIR} 目录存在且已清空", exists, f"DirectoryExists={int(exists)}")
+
+
+def verify_api() -> None:
+    """HTTP 自检：调 backend 接口核对 UI 首屏看到的状态（与 UI 完全同源）。
+
+    为什么值得做：`^demo.*` 为空 ≠ UI 显示为空（历史上出现过「运行态残留导致
+    /pipelines/status 报 running=true 而列表为空」的自相矛盾），这一步才等价于
+    "打开页面看到的是干净的"。
+    """
+    probes = [
+        ("/pipelines/status", lambda d: d.get("running") is False, "running=false"),
+        ("/pipelines/items", lambda d: not d.get("items"), "items 为空"),
+        ("/pipelines/instances", lambda d: not d.get("items"), "items 为空"),
+        ("/pipelines/logs?limit=5", lambda d: not d.get("items"), "items 为空"),
+        ("/pipelines/validation-issues", lambda d: not d.get("items"), "items 为空"),
+        ("/datasources", lambda d: not d.get("items"), "items 为空"),
+        ("/targets", lambda d: not d.get("items"), "items 为空"),
+        ("/mappings", lambda d: not d.get("items"), "items 为空"),
+    ]
+    reachable = 0
+    for path, ok_fn, desc in probes:
+        try:
+            data = _api_get(path).get("data") or {}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("GET %s 探测失败: %s", path, str(exc)[:120])
+            continue
+        reachable += 1
+        ok = bool(ok_fn(data))
+        check(f"GET {path} → {desc}", ok,
+              "" if ok else json.dumps(data, ensure_ascii=False)[:140])
+    if not reachable:
+        check("HTTP 接口核对（backend 未就绪，跳过）", False,
+              f"手工核对: curl -s {API_BASE}/pipelines/status", warn=True)
+
+
+def verify_fhir() -> None:
+    """FHIR 侧自检：演示常用资源类型均为空（_count=1 轻量探测）。"""
+    from backend.services import fhir_client
+    dirty, unreachable = [], 0
+    for rt in FHIR_CLEAN_TYPES:
+        try:
+            bundle = fhir_client._request(f"{FHIR_BASE}/{rt}?_count=1", "superuser", "SYS")
+        except Exception as exc:  # noqa: BLE001
+            unreachable += 1
+            log.warning("FHIR %s 探测失败: %s", rt, str(exc)[:100])
+            continue
+        if len((bundle or {}).get("entry", []) or []):
+            dirty.append(rt)
+    if dirty:
+        check("FHIR 演示资源已清空", False, "仍有: " + ", ".join(dirty))
+    elif unreachable == len(FHIR_CLEAN_TYPES):
+        check("FHIR 演示资源已清空", False, "FHIR server 不可达（跳过）", warn=True)
+    else:
+        check("FHIR 演示资源已清空", True,
+              f"{len(FHIR_CLEAN_TYPES) - unreachable} 个类型探测为空")
+
+
+def _api_get(path: str) -> dict:
+    """调 backend 本地 HTTP 接口（容器内 127.0.0.1:5000，返回 {"code","data","message"}）。"""
+    with urllib.request.urlopen(f"{API_BASE}{path}", timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def report() -> int:
+    """输出自检结论 + 演示起点提示，返回退出码（0=全部通过）。"""
+    fails = [c for c in CHECKS if not c["ok"] and not c["warn"]]
+    warns = [c for c in CHECKS if not c["ok"] and c["warn"]]
+    passed = len(CHECKS) - len(fails) - len(warns)
+    log.info("\n===== 自检结论 =====")
+    log.info("通过 %d 项 / 失败 %d 项 / 待确认 %d 项（共 %d 项）",
+             passed, len(fails), len(warns), len(CHECKS))
+    for c in fails:
+        log.error("❌ %s —— %s", c["name"], c["detail"])
+    for c in warns:
+        log.warning("⚠ %s —— %s", c["name"], c["detail"])
+    if fails:
+        log.error("环境**未达到零起点**：按上面 ❌ 处理后重跑 "
+                  "`bash tools/datakit/run.sh reset_ui_env.py`")
+        return 1
+    log.info("✅ 环境已就绪（服务/命名空间/表结构/术语与向量库保留）——可直接开始演示：")
+    log.info("  · 前端入口        http://localhost/          （docker-compose 映射 80）")
+    log.info("  · 后端接口        http://localhost:5001/api/pipelines/status")
+    log.info("  · 造数 FHIR 源    docker compose exec dataflow-backend python "
+             "/app/generate_mock_data.py --fhir 5")
+    log.info("  · 造数 SQL 源     docker compose exec dataflow-backend python "
+             "/app/generate_mock_data.py --sql 3")
+    log.info("  · 造数 CLINIC 四表 bash tools/datakit/run.sh seed_clinic.py"
+             "   # 等价界面「生成演示数据」按钮")
+    log.info("  · 许可预算        8 个业务主机单元（社区版），设计管道时注意主机数")
+    return 0
+
+
+
+def main() -> int:
+    """一键重置（默认）或只体检（--check-only）；返回退出码。"""
+    check_only = "--check-only" in sys.argv
+    skip_fhir = "--skip-fhir" in sys.argv
+    t0 = time.time()
+    user_left, clinic_left, cls_left = [], [], []
+
+    if check_only:
+        log.info("== 体检模式（--check-only）：只读，不改动任何数据 ==")
+    else:
+        step("1/8 停/删 demo Production（校验式停止 + Ens 配置表残留清理）")
+        clean_production()
+        step("2/8 清 SQL 源扫描凭证与错误行（防重 seed 后零消息）")
+        clear_sql_source_appdata()
+        step("3/8 清空 ^demo.* 登记")
+        kill_demo_globals()
+        step("4/8 清空 Ens 内部残留（消息/流存储/HTTP 消息体/BP 进程/事件日志）")
+        clear_ens_internal()
+        step("5/8 清生成物（来源指纹判定的生成类 + /dur/generated 清空重建）")
+        cls_left = clear_generated_classes()
+        step("6/8 清空 USER 命名空间全部非系统表（动态发现）")
+        user_left = clear_user_tables()
+        step("7/8 清空 CLINIC 命名空间全部非系统表（动态发现）")
+        clinic_left = clear_clinic_tables()
+        if skip_fhir:
+            log.info("已跳过 FHIR 资源清理（--skip-fhir）")
+        else:
+            step("8/8 清除 FHIR server 测试资源")
+            purge_fhir_resources()
+
+    # 自检一律重新扫描"当前事实"，不复用清理阶段的清单：
+    # 清生成类会让其 SQL 表（<类>/<类>_MessagesReceived/Sent）随之消失，用旧清单复核
+    # 会报"表都不存在了却仍有数据"的假 ❌（2026-09-16 实测：-106 Row to DELETE not found）。
+    if user_left or clinic_left or cls_left:
+        log.info("清理阶段记录（下面按当前事实复核）：USER=%s CLINIC=%s 生成类=%s",
+                 user_left or "无", clinic_left or "无", cls_left or "无")
+    user_left = _leftover_tables(USER_NS, DEMO_TARGET_TABLES)
+    clinic_left = _leftover_tables(CLINIC_NS, CLINIC_TABLES)
+    cls_left = _leftover_generated_classes()
+
+    step("自检 A：Production 运行态 / Ens 配置")
+    verify_production()
+    step("自检 B：IRIS 侧数据（登记/global/消息日志/表/生成物）")
+    verify_iris(user_left, clinic_left, cls_left)
+    step("自检 C：HTTP 接口（UI 同源）")
+    verify_api()
+    if not skip_fhir:
+        step("自检 D：FHIR server 演示资源")
+        verify_fhir()
+    rc = report()
+    log.info("耗时 %.1fs（退出码 %d）", time.time() - t0, rc)
+    return rc
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except Exception as exc:  # noqa: BLE001
-        log.error("重置失败: %s", exc)
+        log.error("重置失败（未完成，环境可能处于中间态，可重跑本脚本）: %s", exc)
         sys.exit(1)
 

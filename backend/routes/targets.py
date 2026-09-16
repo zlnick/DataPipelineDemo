@@ -12,7 +12,7 @@ import logging
 
 from flask import Blueprint, request
 
-from backend.config import Config
+from backend.config import Config, to_internal_url
 from backend.services import (connection_profiler, fhir_client, fhir_target_model,
                               interface_analyzer, iris_connector,
                               jdbc_client, profile_analyzer, repository, wsdl_importer)
@@ -57,6 +57,24 @@ def _apply_ai_contract(kind: str, rt: dict | None) -> dict | None:
     return rt
 
 
+def _apply_fhir_target_runtime(target_id: str, entities: list[dict]) -> dict:
+    """（FHIR 目标）实体语义/direction（接口分析 Agent）+ 运行契约探查与 AI 解读。
+
+    与 SOAP/DB 目标同口径：① 实体级 ai_semantics/direction 由 LLM 产出并写回；
+    ② 目标级运行契约（metadata 能力 / 投递语义 / 健康）由确定性探查刷新，note.ai 由 LLM 解读。
+    AI 失败抛 AgentError（调用方转 500，不静默留空）。
+    """
+    modeled = [e for e in entities if not e.get("open")]
+    if modeled:
+        _apply_target_ai(target_id, modeled, "FHIR",
+                         {"协议": "FHIR R4 REST", "写入": "PUT/POST transaction Bundle",
+                          "说明": "目标资源由平台 HTTP BO 以事务 Bundle 投递（write）"})
+    rt = connection_profiler.profile_target(repository.get_target(target_id))
+    _apply_ai_contract("target", rt)
+    repository.update_target(target_id, {"runtime": rt})
+    return rt
+
+
 def _discover_fhir_entities(base: str, user: str, pwd: str,
                             requested: list[str] | None) -> tuple[list[dict], dict]:
     """FHIR 目标候选实体发现：服务器 CapabilityStatement 支持全集 + 平台 US Core 字段模型。
@@ -73,12 +91,17 @@ def _discover_fhir_entities(base: str, user: str, pwd: str,
     runtime: dict = {}
     cap = None
     try:
-        cap = fhir_client.get_capability_statement(base + "/", user, pwd)
-        runtime["health"] = {"ok": True, "detail": "FHIR metadata 可达",
+        # 回环地址归一：用户从浏览器视角登记的是 http://localhost:52773/...，
+        # backend 在独立容器里连不上 → metadata 探测必然失败并退化为"已建模 11 类"候选。
+        # 仅**探测**用内部地址；对外保存的 base_url 仍是用户登记值。
+        probe_base = to_internal_url(base)
+        cap = fhir_client.get_capability_statement(probe_base + "/", user, pwd)
+        runtime["health"] = {"ok": True, "detail": f"FHIR metadata 可达（{probe_base}）",
                              "checked_at": datetime.datetime.now().isoformat()}
     except Exception as exc:  # noqa: BLE001 - 探活失败不阻断登记
         logger.warning("FHIR 目标探活失败: %s", exc)
-        runtime["health"] = {"ok": False, "detail": str(exc)[:200]}
+        runtime["health"] = {"ok": False, "detail": str(exc)[:200],
+                             "checked_at": datetime.datetime.now().isoformat()}
     if cap is not None:
         try:
             analysis = profile_analyzer.analyze_capability(cap)
@@ -367,9 +390,18 @@ def create_target():
                        "profile_base": fhir_target_model.US_CORE_BASE},
         })
         repository.update_target(target_id, {"runtime": runtime})
+        # —— 接口分析 Agent（实体语义/direction）+ 契约探查与解读（AI）：失败即显式失败 ——
+        try:
+            runtime = _apply_fhir_target_runtime(target_id, entities)
+        except AgentError as exc:
+            logger.error("FHIR 目标接口分析/契约解读 Agent 失败: %s", exc)
+            return error(f"FHIR 目标接口分析 Agent（AI）失败: {exc}"), 500
+        except Exception as exc:  # noqa: BLE001 - 契约探查失败不阻断登记（AI 已成功）
+            logger.warning("FHIR 目标契约探查失败: %s", exc)
         return success({
             "id": target_id, "entities": entities,
             "resource_types": [e["table"] for e in entities],
+            "runtime": runtime,
             "target": repository.get_target(target_id),
         }, f"FHIR 目标添加成功（候选 US Core 资源 {len(entities)} 类，"
             f"由 Agent 在智能匹配时决定具体映射）")
@@ -475,18 +507,53 @@ def refresh_fhir_resources(target_id: str):
                    "resource_types": [e["table"] for e in entities],
                    "profile_base": fhir_target_model.US_CORE_BASE},
     })
+    # 刷新时同步刷新实体语义/direction 与运行契约（AI 失败即显式失败）
+    try:
+        runtime = _apply_fhir_target_runtime(target_id, entities)
+    except AgentError as exc:
+        logger.error("FHIR 目标接口分析/契约解读 Agent 失败: %s", exc)
+        return error(f"FHIR 目标接口分析 Agent（AI）失败: {exc}"), 500
+    except Exception as exc:  # noqa: BLE001 - 探查失败不阻断刷新（AI 已成功），但保留已发现的 runtime
+        logger.warning("FHIR 目标契约探查失败: %s", exc)
     return success({"id": target_id, "entities": entities,
                     "resource_types": [e["table"] for e in entities],
+                    "runtime": runtime,
                     "target": repository.get_target(target_id)},
                    f"FHIR 目标候选资源已刷新（{len(entities)} 类，最新 US Core 模型 ∩ 服务器能力）")
 
 
 @targets_bp.post("/<target_id>/test")
 def test_target(target_id: str):
-    """联通测试（JDBC 连接 + SELECT 1）。"""
+    """联通测试（按目标类型分流）。
+
+    - DB：JDBC 连接 + `SELECT 1`（jdbc_client.test_connection）
+    - SOAP / FHIR：走 `connection_profiler.profile_target` 的运行契约探查
+      （SOAP = endpoint HTTP 可达性；FHIR = metadata 能力 + 投递语义）
+
+    实测缺陷（N5）：原先所有目标都走 JDBC 分支，对 FHIR/SOAP 目标必然返回
+    「连接失败: 缺少 jdbc_url」并把目标状态写成 `error`，把一个健康目标标红。
+    """
     tg = repository.get_target(target_id)
     if not tg:
         return error("数据目标不存在"), 404
+    ttype = (tg.get("type") or "DB").upper()
+    if ttype in ("SOAP", "FHIR"):
+        try:
+            rt = connection_profiler.profile_target(tg)
+        except Exception as exc:  # noqa: BLE001 - 探查异常按连接失败返回
+            logger.error("目标运行契约探查失败 %s: %s", target_id, exc)
+            repository.update_target(target_id, {"status": "error"})
+            return error(f"连接失败: {exc}"), 500
+        health = rt.get("health") or {}
+        ok = bool(health.get("ok"))
+        repository.update_target(target_id, {"status": "connected" if ok else "error"})
+        if not ok:
+            return error(f"连接失败: {health.get('detail') or '端点不可达'}"), 500
+        return success({"ok": True, "type": ttype, "health": health,
+                        "delivery": rt.get("delivery") or {},
+                        "capabilities": rt.get("capabilities") or {},
+                        "candidates": rt.get("candidates") or {}},
+                       f"{ttype} 目标连通（{health.get('detail') or 'OK'}）")
     result = jdbc_client.test_connection(tg.get("connection") or {})
     repository.update_target(target_id, {"status": "connected" if result["ok"] else "error"})
     if not result["ok"]:

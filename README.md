@@ -248,7 +248,9 @@ LLM_MODEL=deepseek-chat                        # 模型名
 ## 演示步骤（从零开始，页面选项随演示进度动态出现）
 
 > 系统启动后处于**空白演示态**：无预置数据源/目标/资产/映射；页面（资产/目标/可查看表）只出现你已登记的内容。
-> 重置环境：`python cleanup_demo.py`（清配置/Production/表数据/消息历史）。
+> 重置环境：`bash tools/datakit/run.sh reset_ui_env.py`
+> （一键回到零起点，**脚本自带 25 项自检**：末尾 ✅/❌ 清单 + 退出码 0=干净；只查不改加 `--check-only`。
+> 旧脚本 `python cleanup_demo.py` 已过时：它不清 Ens 内部残留/生成类/动态发现的新表。）
 
 ### A. FHIR → DB（数据源 = FHIR 资源）
 1. **添加 FHIR 数据源**：「数据源管理」→ 端点 `http://iris:52773/csp/healthshare/fhirserver/fhir/r4/`、认证 `superuser/SYS` → 注册 → **Profile 分析**（自动产出运行契约：版本/增量能力/健康）。

@@ -59,6 +59,11 @@ services:
       SEED_FHIR: ${SEED_FHIR:-1}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      # LLM 超时/重试（缺陷 N9）：单次读超时、建连超时、SDK 重试次数、单次调用墙钟总预算
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-240}
+      LLM_CONNECT_TIMEOUT: ${LLM_CONNECT_TIMEOUT:-10}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-1}
+      LLM_TIMEOUT_TOTAL: ${LLM_TIMEOUT_TOTAL:-480}
     volumes:
       - ./backend:/app/backend
       - ./init_data.py:/app/init_data.py

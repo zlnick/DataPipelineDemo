@@ -546,15 +546,30 @@ async function loadTargetData() {
 }
 
 async function buildPipelinesFromMappings(mappings, dsList, targetRows) {
-  // 资产名 → 候选数据源（同名资产可能存在于多个数据源，必须消歧）
+  // 资产键 → 候选数据源（同名资产可能存在于多个数据源，必须消歧）
+  // 键同时登记 **资产名 / 资产 ID / 两者末段**：mapping.source 两种口径都可能出现
+  // （Agent A 可能回填资产 ID DS71120_TSQLUser.Patient），只按资产名索引会让源数据源匹配失败
+  // → source_id 丢失 → 源类型退化成兜底推测（缺陷 N11）
   const assetCands = {}
+  const addCand = (key, dsId, dsType) => {
+    const k = String(key || '').trim()
+    if (!k) return
+    assetCands[k] = assetCands[k] || []
+    if (!assetCands[k].some((c) => c.dsId === dsId)) assetCands[k].push({ dsId, dsType })
+  }
   for (const d of dsList) {
     const assets = (await datasourceApi.assets(d.id))?.items || []
     for (const a of assets) {
-      if (!a || !a.name) continue
-      assetCands[a.name] = assetCands[a.name] || []
-      assetCands[a.name].push({ dsId: d.id, dsType: d.type || '' })
+      if (!a) continue
+      for (const k of [a.name, a.id, String(a.name || '').split('.').pop(), String(a.id || '').split('.').pop()]) {
+        addCand(k, d.id, d.type || '')
+      }
     }
+  }
+  // 映射的源候选：source → asset → source 末段 依次回退
+  const candsOf = (m) => {
+    const s = String(m?.source || '')
+    return assetCands[s] || assetCands[s.split('.').pop()] || assetCands[String(m?.asset || '')] || []
   }
   // 目标表/实体 → 目标记录（含 type）
   const tgtByTable = {}
@@ -575,13 +590,13 @@ async function buildPipelinesFromMappings(mappings, dsList, targetRows) {
   for (const ms of Object.values(byTarget)) {
     const score = {}
     for (const m of ms) {
-      for (const c of (assetCands[m.source] || [])) {
+      for (const c of candsOf(m)) {
         score[c.dsId] = (score[c.dsId] || 0) + 1
       }
     }
     const best = Object.entries(score).sort((a, b) => b[1] - a[1])[0]
     const dsId = best ? best[0] : ''
-    const dsType = ((assetCands[ms[0].source] || []).find((c) => c.dsId === dsId) || {}).dsType || ''
+    const dsType = (candsOf(ms[0]).find((c) => c.dsId === dsId) || {}).dsType || ''
     const tg = tgtByTable[ms[0].target_table] || {}
     pipelines.push({
       source_type: dsType || (ms[0].target_type === 'SOAP' ? 'FHIR' : 'SQL'),

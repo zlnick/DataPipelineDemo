@@ -90,8 +90,35 @@ DESIGN_SKILLS = [
             "请求消息": "BP 发送 Ens.StreamContainer（Stream=含父键属性的 JSON，如 {\"PatientID\":\"P001\"}）",
             "响应消息": "默认无 ResponseClass 时返回 Ens.StreamContainer，Stream=JSON，包含查询全部行；"
                         "写语句（Insert/Update/Delete）响应仅 NumRowsAffected",
+            "响应形态": "查询（SELECT）响应是**一个 JSON 对象**（不是数组），键=行序号字符串 \"1\",\"2\",…（从 1 起），"
+                        "值=该行 {列名:值}：实测 body 原文 {\"1\":{\"ID\":\"E0001\",…},\"2\":{\"ID\":\"E0002\",…}}，"
+                        "单行时同样是 {\"1\":{…}}；官方 ResponseClass 文档的例子即 "
+                        "{\"1\":{\"ID\":\"1\",\"Name\":\"John Smith\"},\"2\":{\"ID\":\"2\",\"Name\":\"Jane Doe\"}}，"
+                        "且说明多行也只生成一条响应消息。行内值为字符串；IRIS NULL 表现为 \"\\u0000\"。",
+            "行集遍历 API（事实，取自类方法清单）": "JSON 对象：%GetIterator() 取迭代器 + it.%GetNext(.k,.v) 逐项枚举；"
+                        "%DynamicArray：%Size() 与 tA.%Get(i)（i 从 0 起）；取值 %Get(\"key\")/%Get(i)。"
+                        "%Next()/%GetData(n) 属于结果集 API（%SQL.StatementResult / %SQL.IResultSet / "
+                        "EnsLib.SQL.Snapshot）——BP 从查询 BO 只拿得到 Ens.StreamContainer"
+                        "（Stream 为 %Stream.Object 字符流），拿不到结果集；在动态对象上写 %Next(tKey) "
+                        "编译不报错，运行期报 <METHOD DOES NOT EXIST>...*%Next,%Library.DynamicObject"
+                        "（该类方法清单里没有 %Next）。",
+            "ObjectScript 语义事实（空值/数值比较，实测）": "`$Get(未定义节点)` 返回空串 \"\"；`(\"\"=0)`、`(0<\"\")`、`(\"\"<0)` 全部为 FALSE"
+                        "（任一侧空串时按字符串比较），`(+\"\"=0)` 为 TRUE → **计数/阈值比较前必须显式转数字**"
+                        "（`Set tN=+$Get(节点)`），判空用 `If (t=\"\")`。BP 中 `If (tCnt=0)` / `While (i<tCnt)` 若未先转数字，"
+                        "会**静默不进分支/循环**（表现为\"子表 0 行 / Bundle 缺资源\"，无任何错误日志）——这是本 Skill "
+                        "曾经的真实故障根因，聚合 BP 必须按此写。",
+            "错误处理（禁止静默吞错）": "每次 `..SendRequestSync/..SendRequestAsync` 后 `If ($$$ISERR(tSC)) { "
+                        "$$$LOGERROR(\"QueryChild 失败 \"_tQBName_\": \"_$System.Status.GetErrorText(tSC)) Quit tSC }`；"
+                        "禁止 `Set tBody=\"\"` 式吞错（空结果与失败必须可区分）；发 Bundle 前核对 layout.bundle.entries "
+                        "声明的资源是否都已产出，缺失记 `$$$LOGWARNING`（不静默返回成功）。",
+            "响应对象类型（实测缺陷）": "OnRequest 的 `Output response As %Library.Persistent` **必须**赋持久消息类"
+                        "（`Set response=##class(Ens.Response).%New()`）；若赋 `%DynamicObject`/%Stream/%DynamicArray，"
+                        "框架收尾（Ens.BusinessProcess.%responseGet）会调 %OpenId 报 "
+                        "`<METHOD DOES NOT EXIST>%OpenId,%Library.DynamicObject` → `ErrBPTerminated`："
+                        "**入站消息被标 Error，而 Bundle 其实已成功投递、目标数据已落地**（极易被误判为管道失败，"
+                        "实测 Condition/Encounter/MedicationRequest 都落地但消息 Status=8）。摘要用 `$$$LOGINFO`。",
             "注意": "SELECT 勿配 ResponseClass（多行只回第一行且丢行）；默认 JSON 响应保留全行；"
-                    "BP 解析行集需兼容 JSON 行对象/行数组形态；DSN 需 JGService 指向 JavaGateway",
+                    "DSN 需 JGService 指向 JavaGateway",
         },
         "assets": {
             "BS": "EnsLib.SQL.Service.GenericService",

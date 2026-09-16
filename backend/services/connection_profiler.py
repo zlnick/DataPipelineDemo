@@ -277,6 +277,44 @@ def profile_target(tg: dict) -> dict:
             delivery["note"] = "目标仅查询型（Get/Query），不建议作为数据管道写入目标"
         health = _http_reachable(conn.get("endpoint") or "")
         health["checked_at"] = datetime.datetime.now().isoformat()
+    elif kind == "FHIR":
+        # FHIR REST 目标：metadata 能力刷新 + 投递语义（事务 Bundle）+ 候选资源事实
+        # （实测缺陷：FHIR 目标行原先无 runtime/direction，UI「运行契约/投递语义」列空白）
+        ep = conn.get("base_url") or conn.get("endpoint") or ""
+        if not ep:
+            health = {"ok": False, "detail": "缺少 base_url",
+                      "checked_at": datetime.datetime.now().isoformat()}
+        else:
+            try:
+                from backend.config import to_internal_url
+                fcaps, _fpoll = _fhir_capabilities(to_internal_url(ep),
+                                                   conn.get("username"), conn.get("password"))
+                caps.update(fcaps)
+                health = {"ok": True, "checked_at": datetime.datetime.now().isoformat(),
+                          "detail": f"FHIR metadata OK（fhir {caps.get('fhir_version', '')}）"}
+            except Exception as exc:  # noqa: BLE001
+                health = {"ok": False, "checked_at": datetime.datetime.now().isoformat(),
+                          "detail": str(exc)[:200]}
+        _rt_names = [a.get("name") for a in assets if a.get("name")]
+        _cand = dict(base.get("candidates") or {})
+        _cand.setdefault("count", len(_rt_names))
+        _cand.setdefault("resource_types", _rt_names)
+        _cand["reachable"] = bool(health.get("ok"))
+        base["candidates"] = _cand
+        # FHIR 目标的候选资源事实在 runtime.candidates（注册/刷新时由 _discover_fhir_entities 写入），
+        # runtime.assets 通常为空 → 说明文案与 resources 用 candidates（实测：原先写"0 类候选资源"）
+        _cand_types = [str(t) for t in (_cand.get("resource_types") or []) if str(t)]
+        _listed = (_cand_types or _rt_names)
+        delivery = {
+            "mechanism": "fhir_transaction",
+            "target": "Bundle(transaction) → FHIR REST",
+            "resources": _listed[:20],
+            "note": (f"FHIR 目标走标准 REST：以 transaction Bundle（PUT/POST + application/fhir+json）"
+                     f"投递（候选资源 {_cand.get('count', len(_listed))} 类，"
+                     f"其中已建模 {_cand.get('modeled_count', 0)} 类；"
+                     f"实际映射由 AI 匹配决定）"
+                     + ("" if health.get("ok") else "；⚠ 端点当前不可达，生成前请确认 base_url")),
+        }
     elif kind == "DB":
         try:
             conn0 = tg.get("connection") or {}

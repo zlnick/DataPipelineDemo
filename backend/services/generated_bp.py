@@ -46,6 +46,27 @@ def static_check_generated_bp(bp: dict | None) -> list[str]:
             errors.append("HTTP 发送必须用 UTF-8 字节流：Set tS=##class(%Stream.GlobalBinary).%New() "
                           "Do tS.Write($ZCONVERT(tJSON,\"O\",\"UTF8\")) Set tMsg.Stream=tS"
                           "（GenericMessage body 是 %RawString，字符流会让中文变 '?'）")
+        # 响应对象必须是**持久消息类**（实测缺陷）：OnRequest 的 `Output response As %Library.Persistent`
+        # 若被赋 %DynamicObject/%Stream 等非持久对象，框架在收尾（Ens.BusinessProcess.%responseGet）
+        # 会调用 %OpenId 而报 <METHOD DOES NOT EXIST>%OpenId,%Library.DynamicObject → ErrBPTerminated，
+        # 入站消息被标 Error（尽管 Bundle 已成功投递、目标数据已落地 —— 极易被误判为管道失败）。
+        import re as _re
+        # 类中所有「动态对象变量」（Set tX=##class(%Dynamic...)...）——用于识别 Set response=tX
+        _dyn_vars = set(_re.findall(
+            r"Set\s+((?:t|p)[A-Za-z0-9_]*)\s*=\s*##class\(\s*%(?:Dynamic|Stream|Array|List)",
+            source, _re.I))
+        for m in _re.finditer(r"Set\s+(response|pResponse)\s*=\s*(.+)", source, _re.IGNORECASE):
+            rhs = m.group(2).strip()
+            bad = bool(_re.search(r"##class\(\s*%(?:Dynamic|Stream|Array|List)", rhs, _re.I)) \
+                or rhs.split(".")[0].strip() in _dyn_vars
+            if not bad:
+                continue
+            errors.append(
+                "response 必须赋**持久消息类**（如 `Set response=##class(Ens.Response).%New()`）："
+                f"当前为 `Set {m.group(1)}={rhs}` —— %DynamicObject/%Stream 等非持久对象会让框架 "
+                "%responseGet 调 %OpenId 失败 → ErrBPTerminated、消息被标 Error（目标数据其实已落地）。"
+                "摘要信息请用 $$$LOGINFO 或赋给 Ens.Response 子类的属性。")
+            break
     return errors
 
 

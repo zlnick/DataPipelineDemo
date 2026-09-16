@@ -167,7 +167,7 @@
 
       <div v-else-if="srcStep === 2">
         <el-alert class="mb12" :title="t('datasources.checkAlert')" type="info" :closable="false" />
-        <el-table :data="srcTables" border max-height="320" @selection-change="onSrcSelChange">
+        <el-table ref="srcTableRef" :data="srcTables" border max-height="320" @selection-change="onSrcSelChange">
           <el-table-column type="selection" width="50" />
           <el-table-column prop="table" :label="t('datasources.colTable')" min-width="160" />
           <el-table-column prop="type" :label="t('datasources.colType')" width="90" />
@@ -186,7 +186,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { nextTick, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
@@ -343,6 +343,7 @@ const srcSchemas = ref([])
 const srcSchema = ref('')
 const srcTables = ref([])
 const srcChecked = ref([])
+const srcTableRef = ref(null)
 
 function openSourceWizard(row) {
   srcCurrentId.value = row.id
@@ -384,6 +385,12 @@ async function loadSourceTables() {
     const data = await datasourceApi.tables(srcCurrentId.value, srcSchema.value)
     srcTables.value = data?.items || []
     srcStep.value = 2
+    // 预勾选**已保存**的表：二次进向导时不会因为"只勾新表"而丢旧表（后端已按 merge 保存）
+    await nextTick()
+    const tRef = srcTableRef.value
+    if (tRef) {
+      srcTables.value.filter((r) => r.selected).forEach((r) => tRef.toggleRowSelection(r, true))
+    }
   } catch {
     // 错误提示已由拦截器处理
   }
@@ -398,7 +405,7 @@ async function saveSourceTables() {
   try {
     const data = await datasourceApi.selectTables(srcCurrentId.value, tables)
     srcStep.value = 3
-    ElMessage.success(t('datasources.savedTables', { n: data?.count || tables.length }))
+    ElMessage.success(t('datasources.savedTables', { n: data?.total || data?.count || tables.length }))
     await loadList()
   } catch {
     // 错误提示已由拦截器处理

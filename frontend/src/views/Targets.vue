@@ -116,6 +116,7 @@
               <span v-if="row.runtime?.candidates?.count" class="ml6 gray sm">
                 {{ t('targets.fhirCand', { n: row.runtime.candidates.count }) }}
               </span>
+              <div v-if="row.runtime?.delivery?.note" class="mb4 gray sm">{{ row.runtime.delivery.note }}</div>
             </template>
             <template v-else><el-tag size="small" type="info">DB UPSERT</el-tag></template>
             <el-tooltip :content="(row.runtime?.health?.detail) || ''" placement="top">
@@ -125,12 +126,14 @@
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column :label="t('targets.colOps')" width="220" fixed="right">
+        <el-table-column :label="t('targets.colOps')" width="300" fixed="right">
           <template #default="{ row }">
             <template v-if="row.type === 'SOAP'">
+              <el-button size="small" :loading="testingId === row.id" @click="handleTest(row)">{{ t('targets.test') }}</el-button>
               <el-button size="small" :loading="importingId === row.id" @click="handleImport(row)">{{ t('targets.btnReimport') }}</el-button>
             </template>
             <template v-else-if="row.type === 'FHIR'">
+              <el-button size="small" :loading="testingId === row.id" @click="handleTest(row)">{{ t('targets.test') }}</el-button>
               <el-button size="small" type="primary" :loading="refreshingId === row.id" @click="handleRefresh(row)">{{ t('targets.btnRefreshResources') }}</el-button>
             </template>
             <template v-else>
@@ -386,7 +389,16 @@ async function handleTest(row) {
   testingId.value = row.id
   try {
     const data = await targetApi.test(row.id)
-    ElMessage.success(t('targets.testOkDetail', { p: data?.product || 'JDBC' }))
+    // 提示里的"连接方式"要按目标类型取真实事实（实测缺陷 N7：原先写死 data.product||'JDBC'，
+    // 对 SOAP/FHIR 目标会显示成"连接成功（JDBC）"，误导用户）：
+    //   DB        → product（如 InterSystems IRIS）
+    //   SOAP/FHIR → delivery.mechanism（soap_operation / fhir_transaction），退化为 health.detail
+    const p = data?.product
+      || (data?.delivery || {}).mechanism
+      || (data?.health || {}).detail
+      || data?.type
+      || 'JDBC'
+    ElMessage.success(t('targets.testOkDetail', { p }))
   } catch {
     // 错误提示已由拦截器处理
   } finally {

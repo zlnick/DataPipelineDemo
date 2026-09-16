@@ -975,22 +975,38 @@ def _datasource_for_mappings(mappings: list[dict] | None, ds_type: str = "") -> 
     用途：调用方未给 source_id（或给的 ID 已失效，如重置环境后重跑旧脚本）时，仍能引用
     正确的数据源 runtime（DSN / jdbc_url / FHIR endpoint），避免默默退化成 localTarget
     去读 USER 库（曾致"源表读不到数据"的假失败）。
+
+    2026-09-16 修缺陷 N11（限定名反查失败）：`mapping.source` 有两种口径 —— LLM/UI 可能落
+    **资产 ID**（`DS71120_TSQLUser.Patient`）或**资产名**（`Patient`）。原实现取 `split(".")[0]`
+    且把 `DS` 开头的名字当噪声跳过 → 资产 ID 形态被整条丢弃 → names 为空 → 返回 None →
+    下游 `_resolve_sql_source_tables` 拿不到资产（columns/key_hint 皆空）→ sql2fhir 布局推导
+    直接 500「患者主表未能判定」。现改为：取**末段**做候选（同时保留原始串），并与资产的
+    `name` **和** `id` 双向、忽略大小写比对。
     """
-    names = set()
+    cands: set[str] = set()
     for m in mappings or []:
         if not isinstance(m, dict):
             continue
-        tbl = str(m.get("source") or "").split(".")[0].strip()
-        if tbl and not tbl.startswith(("DS", "M", "TG", "concat")):
-            names.add(tbl)
-    if not names:
+        raw = str(m.get("source") or m.get("asset") or "").strip()
+        if not raw:
+            continue
+        for part in (raw, raw.split(".")[-1]):
+            part = part.strip()
+            # 目标侧/聚合表达式不是源资产名，排除
+            if part and not part.startswith(("TG", "concat")):
+                cands.add(part.lower())
+    if not cands:
         return None
     best, hit_best = None, 0
     for ds in repository.list_datasources():
         if ds_type and (ds.get("type") or "") != ds_type:
             continue
-        hit = len({str(a.get("name") or "") for a in repository.list_assets(ds.get("id"))
-                   if str(a.get("name") or "") in names})
+        hit = 0
+        for a in repository.list_assets(ds.get("id")):
+            keys = {str(a.get("name") or "").lower(), str(a.get("id") or "").lower()}
+            keys.discard("")
+            if keys & cands:
+                hit += 1
         if hit > hit_best:
             best, hit_best = ds, hit
     return best
@@ -1235,6 +1251,7 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                     _g["ai_components"] = _sfx.build_sql2fhir_components(
                         layout, _g.get("source_config") or {}, _g.get("target_config") or {})
                     _g["_sql2fhir"] = True
+                    _g["_layout"] = layout          # 供 C2 目标落地预期（布局声明的资源）
                     _g["_src_bn"] = f"SQLService_{layout['patient_table']}"
                     logger.info("多管道 sql2fhir 组：布局+Agent BP 就绪（%d 组件）",
                                 len(_g["ai_components"]))
@@ -1290,6 +1307,22 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
         config_json = json.dumps(fhir_cfg, ensure_ascii=False) if fhir_cfg else ""
         _src_types = sorted({g["source_type"] for g in groups})
         _tgt_types = sorted({g["target_type"] for g in groups})
+        # 许可调度把「放不下的分组」标为停用（组件已生成、未启动）→ 这些组的目标必然无数据，
+        # 不能纳入目标落地判定（否则"已生成但停用"会被判为生成失败，实测 500）。
+        _susp_cats = {str(c) for c in (_plan.get("suspended") or [])}
+        _active_tgt_types = sorted({g["target_type"] for g in groups
+                                    if str(g.get("_category") or "") not in _susp_cats})
+        # C2 目标落地预期（布局驱动）：sql2fhir 组声明的资源每条至少 1 个——
+        # 防"Patient 落地、Encounter/Condition/MedicationRequest 全 0"仍判通过（实测静默缺陷）
+        _expect_targets: dict[str, int] = {}
+        for _g in groups:
+            if str(_g.get("_category") or "") in _susp_cats:
+                logger.info("许可调度停用的组 %s → 本次不做目标落地预期（待一键切换启用）",
+                            _g.get("_category"))
+                continue
+            for _r in (((_g.get("_layout") or {}).get("bundle") or {}).get("resource_order") or []):
+                if str(_r):
+                    _expect_targets.setdefault(str(_r), 1)
 
         # 许可预算：社区版 KeyLicenseUnits=8，每个 Ens 业务主机常驻占 1 个；让不属于本次
         # 管道的旧管道组件让出许可（等价于用户手工"生成新管道前先关闭旧管道组件"），
@@ -1315,7 +1348,9 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
             _r = iris_connector.class_method_value(
                 "demo.PipelineGenerator", "Generate", mappings_json, config_json)
             _v = pipeline_validator.run_pipeline_validation(
-                topology, source_types=_src_types, target_types=_tgt_types)
+                topology, source_types=_src_types, target_types=_tgt_types,
+                expect_targets=_expect_targets or None,
+                effect_target_types=_active_tgt_types)
             return _r, _v
 
         result, validation = _gen_and_validate()
@@ -1800,6 +1835,8 @@ def generate():
     # —— sql2fhir-patient-tx 分发（Skill 布局 executor + Agent 生成 BP，无平台预置 BP）——
     # 触发条件：目标=FHIR、Agent B 已选 design_skill=sql2fhir-patient-tx（AI 决策），
     # 且源为 SQL 并映射覆盖患者主表。布局与 BP 由 Skill/Agent 链路完成，平台只做参数化与准入。
+    # C2 目标落地预期（布局驱动，sql2fhir 分支内按布局声明赋值）：{FHIR 资源: 至少条数}
+    _expect_targets: dict[str, int] = {}
     sql2fhir_flow = False
     if (target_type == "FHIR" and design_skill == "sql2fhir-patient-tx"
             and ai_components is not None):
@@ -1812,6 +1849,9 @@ def generate():
             logger.error("sql2fhir 布局推导失败（Skill executor）: %s", _lexc, exc_info=True)
             return error(f"sql2fhir 布局推导失败（Skill executor）: {_lexc}"), 500
         _save_sql2fhir_layout(layout)
+        # 目标落地预期 = 布局声明的资源（每条至少 1 个）：子资源全 0 时不能判"通过"
+        _expect_targets = {str(r): 1
+                           for r in (layout.get("bundle", {}).get("resource_order") or []) if str(r)}
         _tg_rt = (locals().get("tg") or {}).get("runtime") if locals().get("tg") else None
         _bp_ok, _bp_msg = _ensure_sql2fhir_bp(
             p_result, mappings_effective, source_type, target_type,
@@ -1845,6 +1885,15 @@ def generate():
     _susp = _mark_suspended_components(topology, _plan)
     if _susp:
         logger.warning("许可调度：以下组件生成后处于停用状态 %s", _susp)
+    # 本组被调度停用（组件已生成、未启动）→ 目标必然无数据：取消落地预期并跳过落地判定，
+    # 否则"已生成但停用"会被判为生成失败（实测：多/单管道第二条被调度停用 → 500 假失败）
+    _susp_cats = {str(c) for c in (_plan.get("suspended") or [])}
+    _self_suspended = str(_category) in _susp_cats
+    if _self_suspended:
+        logger.warning("许可调度：本管道（%s）生成后处于停用状态 → 本次不做目标落地判定",
+                       _category)
+        _expect_targets = {}
+    _effect_target_types = [] if _self_suspended else [target_type]
     _save_pipeline_topology(topology)
     _save_fhir_runtime_config(topology, target_config)
     # 以及管道目标类型（TransformProcess 路由权威依据，防止 mapping.target_type 缺省 DB 误路由）
@@ -1904,7 +1953,8 @@ def generate():
 
     # Agent C2：管道验证（拓扑/编译/启动/消息流转 + 目标落地效果 + 运行期错误分类）
     validation = pipeline_validator.run_pipeline_validation(
-        topology, source_type, target_type)
+        topology, source_type, target_type, expect_targets=_expect_targets or None,
+        effect_target_types=_effect_target_types)
 
     # 运行期错误回喂（有界 1 次）：FHIR 结构类错误 → C1 修映射后重生成；
     # BP 代码类错误 → 记录 method_updates 修复建议（自动 patch 由 Skill 通道执行）。
@@ -1926,7 +1976,9 @@ def generate():
                         "demo.PipelineGenerator", "Generate",
                         json.dumps(mappings_effective, ensure_ascii=False), config_json)
                     validation = pipeline_validator.run_pipeline_validation(
-                        topology, source_type, target_type)
+                        topology, source_type, target_type,
+                        expect_targets=_expect_targets or None,
+                        effect_target_types=_effect_target_types)
                     logger.info("运行期回喂重生成结果: result=%s 验证ok=%s",
                                 result, validation.get("ok"))
             elif "bp_code" in _kinds:
@@ -1950,7 +2002,9 @@ def generate():
                         "demo.PipelineGenerator", "Generate",
                         json.dumps(mappings_effective, ensure_ascii=False), config_json)
                     validation = pipeline_validator.run_pipeline_validation(
-                        topology, source_type, target_type)
+                        topology, source_type, target_type,
+                        expect_targets=_expect_targets or None,
+                        effect_target_types=_effect_target_types)
                 else:
                     logger.warning("BP 方法修复未通过: %s", _reps.get("message"))
         except Exception as _re:  # noqa: BLE001 - 回喂失败不阻断主流程

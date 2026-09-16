@@ -466,11 +466,16 @@ def _pipeline_has_messages(minutes: int = 60) -> int:
 
 def check_target_effect(target_types: list[str] | None = None,
                         expected: dict[str, int] | None = None,
-                        fhir_base: str = "") -> dict:
+                        fhir_base: str = "",
+                        strict: bool = True) -> dict:
     """目标侧落地效果事实检查（FHIR：资源计数；DB：目标表行数）。
 
     用于 C2 判断"事务是否真的落库"——避免"消息 Completed 但目标为空"（如 FHIR 200 + OperationOutcome 回滚）。
     expected: {资源类型/表名: 预期行数}；缺省只做"全为 0"的探测。
+    strict: True=有业务消息流转时"低于预期"判 **error**；False（如消息尚未 settle）只判 warning。
+
+    实测缺陷：`expected` 未按管道布局传入时，`Patient=3 / Encounter=Condition=MedicationRequest=0`
+    会被判"通过"（口径太宽）——调用方应传布局声明的资源集合（见 routes/pipelines.py）。
     """
     import base64
     import json as _json
@@ -480,12 +485,18 @@ def check_target_effect(target_types: list[str] | None = None,
     types = [str(t).upper() for t in (target_types or [])]
     issues: list[dict] = []
     counts: dict[str, int] = {}
+    _fhir_handled: set[str] = set()      # 已按 FHIR 资源判定的预期名（防同名 DB 表重复/覆盖判定）
+    _flowing = _pipeline_has_messages() > 0
     if "FHIR" in types:
         from backend.config import to_internal_url
         base = to_internal_url(fhir_base or FHIRConfig.BASE_URL or "").rstrip("/") + "/"
         auth = base64.b64encode(
             f"{FHIRConfig.USERNAME}:{FHIRConfig.PASSWORD}".encode()).decode()
-        for rt in ("Patient", "Encounter", "Condition", "MedicationRequest"):
+        # 计数集合 = 平台核心资源 ∪ 调用方声明的预期资源（布局驱动，避免"只数四类"漏判）
+        _rt_list = list(dict.fromkeys(
+            ["Patient", "Encounter", "Condition", "MedicationRequest"]
+            + [str(k) for k in (expected or {}).keys() if str(k)]))
+        for rt in _rt_list:
             try:
                 req = urllib.request.Request(
                     base + rt + "?_summary=count",
@@ -499,7 +510,7 @@ def check_target_effect(target_types: list[str] | None = None,
                                "message": f"FHIR {rt} 计数失败: {exc}"})
         pos = [v for v in counts.values() if v >= 0]
         if pos and all(v == 0 for v in pos):
-            if _pipeline_has_messages() == 0:
+            if not _flowing:
                 # 尚无业务消息流转（如源表为空/未点「生成演示数据」、源适配器尚未首次轮询）：
                 # 目标为空属正常，只报 warning 并给出可操作提示，避免误报"生成失败"
                 issues.append({"severity": "warning", "item": "FHIR",
@@ -511,16 +522,24 @@ def check_target_effect(target_types: list[str] | None = None,
                                "message": "FHIR 目标全部资源为 0：事务可能被拒（OperationOutcome）或未投递"})
         for rt, n in (expected or {}).items():
             got = counts.get(rt, -1)
+            _fhir_handled.add(str(rt))
             if got >= 0 and got < int(n):
-                issues.append({"severity": "error", "item": rt,
+                issues.append({"severity": "error" if (strict and _flowing) else "warning",
+                               "item": rt,
                                "message": f"FHIR {rt} 落地数 {got} < 预期 {n}"
-                                          "（事务可能被拒或部分未投递）"})
+                                          + ("（事务可能被拒或部分未投递；若为子资源为 0，"
+                                             "优先查聚合 BP 是否真的发起了子表查询）" if _flowing
+                                             else "（尚无业务消息流转，仅提示）")})
     if "DB" in types and expected:
         for tbl, n in expected.items():
+            # 同名冲突：expected 来自 FHIR 布局时（如 "Patient" 既是 FHIR 资源又是 DB 目标表），
+            # 该预期已由 FHIR 分支判定 → 不得再用 DB 表计数覆盖/重复报错（实测会把 FHIR Patient=3 判成 0）
+            if str(tbl) in _fhir_handled:
+                continue
             try:
                 rows = iris_connector.query(f"SELECT COUNT(*) FROM SQLUser.{tbl}")
                 got = int(rows[0][0]) if rows else -1
-                counts[tbl] = got
+                counts.setdefault(tbl, got)
                 if got >= 0 and got < int(n):
                     issues.append({"severity": "error", "item": tbl,
                                    "message": f"目标表 {tbl} 行数 {got} < 预期 {n}"})
@@ -531,6 +550,49 @@ def check_target_effect(target_types: list[str] | None = None,
     return {"ok": not errors, "issues": issues, "counts": counts}
 
 
+def check_query_dispatch(topology: dict | None = None) -> dict:
+    """事实检查：聚合 BP 收到业务消息后，是否**真的向查询 BO 派发过子表查询**。
+
+    背景（实测静默缺陷）：BP 用 `If (tCnt=0)` / `While (i<tCnt)` 比较空值（ObjectScript
+    `(""=0)` 为 FALSE）→ 子查询循环一次都不进、Bundle 只含 Patient，而消息全 Completed、
+    目标 Patient 有数、既有校验全绿——"零消息派发"是唯一可见线索。本检查看运行期
+    `Ens.MessageHeader` 里是否存在 `→ {查询 BO}`（SourceConfigName 非 Ens.*）的派发记录。
+
+    返回: {"ok", "checked", "bp_messages", "missing": [...], "issues": [...]}
+    - checked=False：拓扑里没有「查询 BO + 聚合 BP」组合（如 SQL→SOAP/DB 管道），跳过；
+    - 聚合 BP 尚无业务消息：只报 info/warning（源适配器可能还没首次轮询），不判失败。
+    """
+    comps = (topology or {}).get("components") or []
+    bos = [c.get("name") for c in comps if c.get("type") == "SQLOperation" and c.get("name")]
+    bps = [c.get("name") for c in comps if c.get("type") == "PatientTxProcess" and c.get("name")]
+    if not bos or not bps:
+        return {"ok": True, "checked": False, "issues": [], "missing": []}
+    def _count(target: str) -> int:
+        rows = iris_connector.query(
+            "SELECT COUNT(*) FROM Ens.MessageHeader WHERE TargetConfigName = ? "
+            "AND SourceConfigName NOT LIKE 'Ens.%'", [target])
+        return int(rows[0][0]) if rows else 0
+    try:
+        in_bp = sum(_count(bp) for bp in bps)
+        if in_bp == 0:
+            return {"ok": True, "checked": False, "bp_messages": 0, "missing": [],
+                    "issues": [{"severity": "warning", "item": "query_dispatch",
+                                "message": "聚合 BP 尚无业务消息，跳过子表查询派发检查"}]}
+        missing = [bo for bo in bos if _count(bo) == 0]
+        issues: list[dict] = []
+        if missing:
+            issues.append({"severity": "error", "item": ";".join(missing),
+                           "message": f"聚合 BP 已收到 {in_bp} 条消息，但从未向查询 BO 派发子表查询："
+                                      f"{missing}——Bundle 必然缺子资源（多为 BP 代码缺陷："
+                                      "空值比较使循环一次都不进，或子查询错误被静默吞掉）"})
+        return {"ok": not missing, "checked": True, "bp_messages": in_bp,
+                "missing": missing, "issues": issues}
+    except Exception as exc:  # noqa: BLE001 - 检查失败不影响主判定
+        return {"ok": True, "checked": False, "issues": [
+            {"severity": "warning", "item": "query_dispatch",
+             "message": f"子表查询派发检查失败: {str(exc)[:150]}"}]}
+
+
 def classify_runtime_error(text: str) -> dict:
     """把运行期错误文本分类并给出修复方向（用于回喂对应 Agent）。"""
     t = str(text or "")
@@ -539,7 +601,9 @@ def classify_runtime_error(text: str) -> dict:
                  "UnexpectedPropertyName", "InvalidResource")
     code_kw = ("SUBSCRIPT", "INVALID OREF", "UNDEFINED", "CLASS DOES NOT EXIST", "MPP5377",
                "QUIT argument", "PROPERTY DOES NOT EXIST", "PYTHON EXCEPTION", "INVALID CLASS",
-               "ILLEGAL VALUE", "Invalid command")
+               "ILLEGAL VALUE", "Invalid command",
+               # 实测缺口：对象方法不存在是**运行期**错误（编译期不报），原先未列入 → BP 修复不触发
+               "METHOD DOES NOT EXIST", "ErrBPTerminated")
     if any(k in t for k in schema_kw):
         return {"kind": "fhir_schema",
                 "advice": "修正字段映射/转换指令（C1 update_mapping）后重新生成"}
@@ -572,12 +636,17 @@ def run_pipeline_validation(topology: dict | None, source_type: str = "FHIR",
                             production: str = PRODUCTION_NAME,
                             source_types: list[str] | None = None,
                             target_types: list[str] | None = None,
-                            expect_targets: dict[str, int] | None = None) -> dict:
+                            expect_targets: dict[str, int] | None = None,
+                            effect_target_types: list[str] | None = None) -> dict:
     """数据管道专项验证（供管道验证-修复 Agent C2 使用）。
 
     覆盖：拓扑完整性 + 编译 + 启动 + 消息流转 + **目标落地效果**（FHIR/DB 计数）
     + **运行期错误分类**（fhir_schema / bp_code，供回喂对应 Agent）。
     expect_targets: {资源类型或表名: 预期数量}（可选，用于判定"是否真的落库"）。
+    effect_target_types: 目标落地检查**只看这些类型**（缺省 = target_types）。
+        调用方在有分组被许可调度停用时传「未被停用分组的类型」——那些分组组件已生成但未启动，
+        目标必然无数据，若纳入判定会把"已生成但停用"误判为失败（实测缺陷：多管道第二条
+        管道被调度停用 → 500，用户以为生成失败）。
     多管道场景传 source_types/target_types（并集）。
     """
     # 生成/重启后消息仍在队列或处理中 → 有界等待（并重投挂起消息），避免误判为失败
@@ -593,12 +662,19 @@ def run_pipeline_validation(topology: dict | None, source_type: str = "FHIR",
                    "message": f"等待消息处理 {_settle.get('waited')}s"
                               f"（未完成 {_settle.get('pending')} 条）"},
         "smoke": check_smoke(),
+        # 子表查询派发事实检查（聚合 BP 是否真的调过查询 BO）——防"消息全 Completed 但 Bundle 缺资源"
+        "query_dispatch": check_query_dispatch(topology),
     }
     # 目标侧落地效果（FHIR/DB 计数）—— 防"消息 Completed 但目标为空"
-    _ttypes = target_types or ([target_type] if target_type else [])
-    if expect_targets or _ttypes:
+    _ttypes = (list(effect_target_types) if effect_target_types is not None
+               else (target_types or ([target_type] if target_type else [])))
+    # 显式传 effect_target_types=[]（如本次分组全被许可调度停用）⇒ **完全跳过**落地判定；
+    # 若只传空预期而仍带类型，则退化为"全为 0 探测"（保留原有语义）
+    _skip_effect = effect_target_types is not None and not effect_target_types
+    if not _skip_effect and (expect_targets or _ttypes):
         eff = check_target_effect(_ttypes, expect_targets or {},
-                                  _fhir_base_from_topology(topology))
+                                  _fhir_base_from_topology(topology),
+                                  strict=bool(_settle.get("settled")))
         results["target_effect"] = {"ok": eff.get("ok"), "issues": eff.get("issues", []),
                                     "counts": eff.get("counts", {}),
                                     "message": f"目标计数: {eff.get('counts', {})}"}
@@ -606,6 +682,14 @@ def run_pipeline_validation(topology: dict | None, source_type: str = "FHIR",
     # 只看最近 3 分钟的运行期错误：生成/重启后立即校验，3 分钟足以覆盖本次产生的错误，
     # 避免把「生成之前的历史错误」当成本次错误去触发 BP 修复循环
     _rerr = collect_runtime_errors(8, minutes=3)
+    # 事实检查发现"BP 从未发起子表查询"（消息全 Completed 但 Bundle 缺资源）→ 归 bp_code，
+    # 触发既有修复通道（repair_from_runtime_errors 的 method_updates 增量修复）
+    _qd = results.get("query_dispatch") or {}
+    for _it in (_qd.get("issues") or []):
+        if _it.get("severity") == "error":
+            _rerr.append({"kind": "bp_code", "config": "PatientTxProcess",
+                          "text": str(_it.get("message", "")),
+                          "advice": "聚合 BP 代码缺陷（子表查询未发起/错误被吞）：method_updates 增量修复"})
     if _rerr:
         kinds = sorted({e.get("kind", "") for e in _rerr})
         results["runtime"] = {
@@ -799,6 +883,19 @@ def apply_license_budget(active_items: list[str] | None = None,
     return out
 
 
+def _item_running(name: str) -> bool:
+    """Ens 组件主机**是否真的在运行**（`^Ens.Runtime("ConfigItem", <name>, "Job")=1`）。
+
+    为什么不能只看配置/`IsItemEnabled`：配置 `Enabled=1` 与「主机进程已起」是两回事——
+    `EnableConfigItem` 在配置已启用时会直接返回 "...already enabled..." 而**不启动主机**
+    （实测：`IsItemEnabled=1` 但 `Job=0`、源 BS 不轮询）。运行态事实以 `Job` 为准。
+    """
+    try:
+        return int(iris_connector.global_get("^Ens.Runtime", "ConfigItem", name, "Job") or 0) == 1
+    except Exception:  # noqa: BLE001 - 读取失败按"未运行"处理（保守）
+        return False
+
+
 def set_items_enabled(names: list[str], enabled: bool,
                       production: str = PRODUCTION_NAME) -> dict:
     """批量启用/禁用 Production 组件（**配置层 + 运行期双写**，供用户切换管道占用许可）。
@@ -843,7 +940,36 @@ def set_items_enabled(names: list[str], enabled: bool,
             applied.append(n)
         else:
             failed.append({"name": n, "result": txt})
-    # ③ 复核运行态，返回差异（调用方/UI 可据此提示"需重启生产"）
+    # ③ 复核**真正的运行态**：配置 Enabled=1 ≠ 主机已起。
+    #    实测（2026-09-15）：组件生成时 Enabled="false"（许可调度停用），用户一键启用时平台先写
+    #    配置 Enabled=1 再调 EnableConfigItem → 后者看到配置已启用，直接返回
+    #    `<Ens>ErrGeneral ... already enabled in Production ...` **而不启动主机** →
+    #    UI 显示已启用、IsItemEnabled=1、runtime_applied 非空，但 `^Ens.Runtime("ConfigItem",n,"Job")=0`、
+    #    源 BS 完全不轮询（静默不生效）。故此处按 Job 事实复核，必要时做「停用→启用」对来真正拉起主机。
+    restarted: list[str] = []
+    still_down: list[str] = []
+    still_up: list[str] = []
+    for n in names:
+        want_up = bool(enabled)
+        up = _item_running(n)
+        if up == want_up:
+            continue
+        if want_up:
+            # 配置已启用但主机未起 → 先运行期停用再启用（实测这一对能真正拉起主机）
+            try:
+                iris_connector.class_method_value("Ens.Director", "EnableConfigItem", n, 0, 1)
+                iris_connector.class_method_value("Ens.Director", "EnableConfigItem", n, 1, 1)
+                restarted.append(n)
+            except Exception as exc:  # noqa: BLE001 - 重启失败进 still_down，由用户重启生产收敛
+                logger.warning("运行期拉起组件 %s 失败: %s", n, exc)
+        if _item_running(n) != want_up:
+            (still_down if want_up else still_up).append(n)
+    if restarted:
+        logger.info("运行期「停用→启用」拉起主机: %s", restarted)
+    if still_down or still_up:
+        logger.warning("运行期启停未完全生效（请重启 Production 收敛，或检查许可单元）: "
+                       "未起=%s 未停=%s", still_down, still_up)
+    # ④ 复核配置-运行一致性，返回差异（调用方/UI 可据此提示"需重启生产"）
     mismatch: list[str] = []
     want = 1 if enabled else 0
     for n in names:
@@ -858,7 +984,8 @@ def set_items_enabled(names: list[str], enabled: bool,
     return {"ok": config_ok, "result": str(res), "units": license_units(),
             "enabled": bool(enabled), "items": names,
             "runtime_applied": applied, "runtime_failed": failed,
-            "runtime_mismatch": mismatch}
+            "runtime_restarted": restarted, "runtime_still_down": still_down,
+            "runtime_still_up": still_up, "runtime_mismatch": mismatch}
 
 
 def save_validation_issue(pattern: str, resolution: str,

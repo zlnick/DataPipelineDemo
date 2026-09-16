@@ -2,8 +2,9 @@
 
 import json
 import logging
+import time
 
-from openai import OpenAI
+from openai import OpenAI, Timeout
 
 from backend.config import LLMConfig
 from backend.services import pipeline_design_skills
@@ -87,7 +88,9 @@ SYSTEM_PROMPT_PIPELINE = (
     "c) 患者行=##class(demo.TransformProcess).UnpackSource(request)；患者 UUID=SHA1('Patient:'_患者ID) 取32hex分8-4-4-4-12；"
     "d) 子表查询：向 bo_name 组件（现成 EnsLib.SQL.Operation.GenericOperation）发送 Ens.StreamContainer，"
     "其 Stream 为 JSON {fk_col:父key值}（depth=1 用患者ID、depth=2 先得 Encounter 行 UUID 再用其 ID）；"
-    "响应 Stream 为 JSON 行集（兼容 {\"1\":{...}} 对象 与 [...] 数组两种形态），逐行处理；"
+    "响应 Stream 为 JSON 行集，实测 body 与官方文档口径一致：**一个序号键对象** "
+    "{\"1\":{列名:值},\"2\":{列名:值},…}（键为字符串、从 1 起，非数组；行内值为字符串；"
+    "NULL 表现为 \"\\u0000\"），按该事实逐行处理（遍历 API 见 h）；"
     "e) 每行资源组装：mapping=^demo.Mapping(mapping_id) 的 field_mappings；转换="
     "##class(demo.FHIRTransformHelper).TransformResource(行JSON, fmsJSON)；组装="
     "##class(demo.TransformProcess).BuildFHIRResource(target_resource, 转换后JSON, 行JSON, fmsJSON)；"
@@ -122,6 +125,13 @@ SYSTEM_PROMPT_PIPELINE = (
     "g) 调用 ..SendRequestSync / ..SendRequestAsync 的方法**必须声明为 Method（实例方法）**，"
     "不得放在 ClassMethod 内（否则 MPP5377）；纯工具函数（UUID/取值/查找/组装 entry）才用 ClassMethod；"
     "h) 访问 %DynamicObject **必须用 %Get(\"key\") / %Set(\"key\",值) / %Size() / %Get(n)**，"
+    "**枚举一个 JSON 对象的全部键用 %GetIterator() 取迭代器 + it.%GetNext(.k,.v)**"
+    "（数组用 %Size()/%Get(i)，i 从 0 起）；"
+    "事实：%Library.DynamicObject / %DynamicArray 的方法清单里**没有 %Next()、没有 %GetData()**——"
+    "那两个属于结果集 API（%SQL.StatementResult / %SQL.IResultSet / EnsLib.SQL.Snapshot），"
+    "而 BP 从查询 BO 只拿得到 Ens.StreamContainer（Stream 为 %Stream.Object 字符流），拿不到结果集；"
+    "在动态对象上写 %Next(tKey) 编译不报错、运行期报 "
+    "<METHOD DOES NOT EXIST>...*%Next,%Library.DynamicObject；"
     "**禁止点号属性访问**（如 layout.patient_id_col、patient.ID 会 #UNDEFINED）；"
     "**也禁止多维下标访问**（如 layout(\"patient_id_col\")、obj(\"k\") 会报 INVALID CLASS ... does not support "
     "MultiDimensional）；数组用 %Get(i) 且下标从 0 起；"
@@ -174,6 +184,13 @@ SYSTEM_PROMPT_PIPELINE = (
     "    Set tObj=##class(%DynamicObject).%FromJSON(tB),tArr=tObj.%Get(\"entry\"),tOk=1,tBad=\"\",i=0\n"
     "    If $IsObject(tArr) { While (i<tArr.%Size()) { Set tOne=tArr.%Get(i),tRO=tOne.%Get(\"response\"),tSt=tRO.%Get(\"status\") If ($EXTRACT(tSt,1,1)'=\"2\") { Set tOk=0 Set tBad=tSt_\" \"_tRO.%Get(\"location\") } Set i=i+1 } }\n"
     "    If ('tOk) Quit $$$ERROR($$$GeneralError,\"FHIR entry failed: \"_tBad)"
+    "r2) **OnRequest/方法的 `Output response` 必须是持久消息类**（本环境实测）：可写 "
+    "`Set response=##class(Ens.Response).%New()`（Ens.Response 是持久消息类）或自定义 %Persistent 消息类；"
+    "**绝不能** `Set response=##class(%DynamicObject).%New()` 或把 %Stream/%DynamicArray 赋给它——"
+    "框架收尾时（Ens.BusinessProcess.%responseGet）会调 %OpenId 并报 "
+    "`<METHOD DOES NOT EXIST>%OpenId,%Library.DynamicObject` → `ErrBPTerminated`，"
+    "**入站消息被标 Error（而 Bundle 其实已成功投递、目标数据已落地）**，会被误判为管道失败。"
+    "摘要信息写 `$$$LOGINFO`，或放进 Ens.Response 子类的持久属性。\n"
     "s) **不要定义 OnResponse 方法**（Ens.BusinessProcess 父类已实现；本 BP 用 SendRequestSync 同步调用，无需覆盖）。"
     "如确要覆盖，必须使用完整签名：Method OnResponse(request As %Library.Persistent, ByRef response As %Library.Persistent, "
     "callrequest As %Library.Persistent, callresponse As %Library.Persistent, pCompletionKey As %String) As %Status "
@@ -183,6 +200,20 @@ SYSTEM_PROMPT_PIPELINE = (
     "\"source\":\"该方法的完整源码（含 Method/ClassMethod 声明与结束花括号）\"}]}——只包含需要修复的方法，"
     "未列出的方法由平台保持原样；**不要输出整类 source**；每个方法的 source 必须自身可编译。"
     "非 sql2fhir-patient-tx 场景不要输出 generated_bp。"
+    "u) **ObjectScript 空值与数值比较事实（本环境实测；违反会静默少查数据且不报错）**："
+    "$Get(未定义节点) 返回 \"\"（空串）；`(\"\"=0)`、`(0<\"\")`、`(\"\"<0)`、`(0=\"\")` 全部为 **FALSE**"
+    "（任一侧是空串时按**字符串比较**），而 `(+\"\"=0)` 为 TRUE。所以：① 判空写 `If (tX=\"\")`；"
+    "② 参与数值比较/算术前必须显式转数字 `Set tN=+$Get(节点)`（或 `$Get(节点,0)` 后 `Set tN=+tN`）；"
+    "③ **禁止** `If (tCnt=0)` / `While (i<tCnt)` 这类未先转数字的空值比较——空值会让分支/循环"
+    "**一次都不进**且无任何错误（表现为\\\"子表 0 行 / Bundle 缺资源\\\"）；正例（父级计数兜底按此写）：\\n"
+    "    Set tCnt=+$Get(tIdsCnt(tParentTable)) If (tCnt=0) { Set tCnt=+$Get(tLevelCnt(tDepth-1)) }\\n"
+    "    Set i=0 While (i<tCnt) { Set tKey=$Get(tLevelIds(tDepth-1,i)) … Set i=i+1 }\\n"
+    "v) **子查询/发送失败禁止静默吞错**：每次 ..SendRequestSync/..SendRequestAsync 之后必须"
+    "`If ($$$ISERR(tSC)) { $$$LOGERROR(\"QueryChild 失败 \"_tQBName_\": \"_$System.Status.GetErrorText(tSC)) Quit tSC }`"
+    "（或在 OnRequest 顶层 `Quit $$$ERROR(...)`）；**禁止** `Set tBody=\"\"` 之类的吞错写法"
+    "（空结果与失败必须可区分，失败要么上抛、要么至少写 `^demo.Trace` 与事件日志）；"
+    "发 Bundle 前核对 `layout.bundle.entries` 声明的资源是否都已产出，缺失时 `$$$LOGWARNING`"
+    "（勿静默返回成功）；"
     "严格输出 JSON（不要输出其他文字），格式："
     '{"design_skill":"fhir2db","pipeline":{"components":[{"type":"FHIRSyncService","name":"FHIRSyncService"},'
     '{"type":"FHIRService","name":"FHIRService"},'
@@ -194,13 +225,35 @@ SYSTEM_PROMPT_PIPELINE = (
 
 # ===== 公共调用逻辑（token 日志 + 一次重试） =====
 def _call_llm(system_prompt: str, user_content: str, agent_name: str) -> dict:
-    """调用 LLM 一次并解析 JSON 返回。"""
+    """调用 LLM 一次并解析 JSON 返回。
+
+    超时策略（缺陷 N9 修复）：单次读超时 + 墙钟总预算双重兜底。
+    实测一次生成请求在上游"连接存活但长时间不吐数据"时挂了 4.5 小时，
+    最后只回 "Connection error."，页面全程无反馈；现在最坏情况会被
+    总预算截断为可解释的失败。
+    """
     if not LLMConfig.API_KEY or LLMConfig.API_KEY.startswith("sk-xxxx"):
         raise AgentError("未配置 LLM_API_KEY，请在 .env 中设置（OpenAI 兼容服务）")
-    client = OpenAI(base_url=LLMConfig.BASE_URL, api_key=LLMConfig.API_KEY, timeout=600.0)
+    client = OpenAI(
+        base_url=LLMConfig.BASE_URL,
+        api_key=LLMConfig.API_KEY,
+        timeout=Timeout(LLMConfig.TIMEOUT, connect=LLMConfig.CONNECT_TIMEOUT),
+        max_retries=LLMConfig.MAX_RETRIES,
+    )
+    deadline = time.monotonic() + LLMConfig.TOTAL_TIMEOUT
     for attempt in range(2):
+        remaining = deadline - time.monotonic()
+        if remaining <= 5:
+            raise AgentError(
+                f"AI 调用超出总预算 {LLMConfig.TOTAL_TIMEOUT:.0f}s（上游长时间无响应），请稍后重试")
+        per_attempt = min(LLMConfig.TIMEOUT, remaining)
+        started = time.monotonic()
+        logger.info("[%s] 调用 LLM（第 %d 次，单次读超时 %.0fs，剩余预算 %.0fs）",
+                    agent_name, attempt + 1, per_attempt, remaining)
         try:
-            resp = client.chat.completions.create(
+            resp = client.with_options(
+                timeout=Timeout(per_attempt, connect=LLMConfig.CONNECT_TIMEOUT)
+            ).chat.completions.create(
                 model=LLMConfig.MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -224,17 +277,22 @@ def _call_llm(system_prompt: str, user_content: str, agent_name: str) -> dict:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             if attempt == 0:
-                logger.warning("[%s] LLM 返回非 JSON，重试一次: %s", agent_name, exc)
+                logger.warning("[%s] LLM 返回非 JSON（耗时 %.1fs），重试一次: %s",
+                               agent_name, time.monotonic() - started, exc)
                 continue
             raise AgentError(f"LLM 返回内容解析失败: {exc}") from exc
         except Exception as exc:
+            elapsed = time.monotonic() - started
             # 截断属确定性失败（同一请求再试仍会截断），不重试以省成本
             if isinstance(exc, AgentError) and "截断" in str(exc):
                 raise
             if attempt == 0:
-                logger.warning("[%s] LLM 调用失败，重试一次: %s", agent_name, exc)
+                logger.warning("[%s] LLM 调用失败（耗时 %.1fs），重试一次: %s", agent_name, elapsed, exc)
                 continue
-            raise AgentError(f"AI 调用失败: {exc}") from exc
+            raise AgentError(
+                f"AI 调用失败（耗时 {elapsed:.0f}s，{type(exc).__name__}: {exc}）；"
+                f"单次读超时 {LLMConfig.TIMEOUT:.0f}s、总预算 {LLMConfig.TOTAL_TIMEOUT:.0f}s，请稍后重试"
+            ) from exc
     raise AgentError("AI 调用失败")
 
 

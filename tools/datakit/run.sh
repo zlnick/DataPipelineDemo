@@ -46,7 +46,7 @@ list_scripts() {
     "seed_target_tables.py"      "★往 USER 的 Patient/Observation 目标表造测试数据（--count N --obs M --clear）" \
     "init_fhir_data.py"          "向 FHIR Server 提交示例资源（transaction Bundle）" \
     "rescan_sql_source.py"       "★SQL 源全量重扫（停 Production→清凭证→启→核验）" \
-    "reset_ui_env.py"            "★一键重置演示环境（回到零起点，8 步）" \
+    "reset_ui_env.py"            "★一键重置演示环境（零起点；自带 25 项自检 + 退出码 0=干净；--check-only 只查不改）" \
     "test_llm.py"                "★LLM 连通性自检（配置/端点/模型/真实链路）" \
     "list_prod_items.py"         "列出 Production 组件名与启用状态" \
     "diag_msgs.py"               "★查最近消息 + SQL 源扫描凭证（判断重扫是否发生）" \
@@ -64,7 +64,8 @@ list_scripts() {
     "uscore_condition_import.py" "术语库：US Core Condition SNOMED 值集导入"
   echo
   echo "示例: ./run.sh gen_test_patient.py --family 赵 --given 敏 --count 2 --diagnosis 糖尿病"
-  echo "      ./run.sh reset_ui_env.py          # 在容器内重置演示环境"
+  echo "      ./run.sh reset_ui_env.py          # 在容器内重置演示环境（自带自检清单）"
+  echo "      ./run.sh reset_ui_env.py --check-only   # 只体检（不改数据，看现在干不干净）"
   echo "      ./run.sh check_fhir.py            # 在宿主机查 FHIR 落地情况"
 }
 

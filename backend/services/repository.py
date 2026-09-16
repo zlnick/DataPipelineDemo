@@ -338,33 +338,80 @@ def save_assets(ds_id: str, resource_types: list[str]) -> list[dict]:
     return assets
 
 
-def save_sql_table_assets(ds_id: str, tables: list[dict]) -> list[dict]:
+def _sql_table_asset_id(ds_id: str, schema: str, table: str) -> str:
+    """SQL 表资产的**稳定 id**（按表名派生，而非提交序号）。
+
+    背景（实测缺陷）：原实现用 `{ds_id}_T{序号}`——二次选表时同一序号会指向另一张表，
+    新表把旧表资产**静默覆盖**（`^demo.DataAsset` 以 id 为键），导致已选表丢失、
+    后续 AI 匹配缺源资产。改为按 `schema.table` 派生：同一张表永远同一个 id。
+    """
+    key = f"{schema}.{table}" if schema else str(table)
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in key)
+    return f"{ds_id}_T{safe}"
+
+
+def save_sql_table_assets(ds_id: str, tables: list[dict],
+                          merge: bool = True) -> dict:
     """保存 SQL 数据源选定的表资产（name=表名，fields=列名）。
 
     参数:
         ds_id: 数据源 ID。
-        tables: [{"schema": "...", "table": "...", "columns": [{"name", "type", "size"}]}]
+        tables: [{"schema": "...", "table": "...", "columns": [{"name","type","size"}]}]
+        merge: True=与**已选表合并**（本次未提交的已选表保留 → 二次选表不丢表，默认）；
+               False=按本次提交集合替换（显式清理）。
+
+    返回:
+        {"assets": 本次保存的资产, "merged": 合并后的全部 SQL 表资产（顺序=已选在前、新表在后）,
+         "total": 合并后数量, "replaced": 被本次替换（未提交）移除的表名}
     """
     ds = get_datasource(ds_id)
-    assets = []
-    for idx, tb in enumerate(tables):
-        asset_id = f"{ds_id}_T{idx + 1:03d}"
+    prior = [a for a in list_assets(ds_id) if (a.get("type") or "SQL_TABLE") == "SQL_TABLE"]
+    by_name = {str(a.get("name") or "").lower(): a for a in prior if a.get("name")}
+    saved: list[dict] = []
+    for tb in tables:
+        table = str(tb.get("table") or "")
+        schema = str(tb.get("schema") or "")
+        if not table:
+            continue
+        existing = by_name.get(table.lower()) or {}
+        asset_id = existing.get("id") or _sql_table_asset_id(ds_id, schema, table)
         record = {
             "id": asset_id,
             "source_id": ds_id,
-            "name": tb.get("table", ""),
+            "name": table,
             "type": "SQL_TABLE",
             "fields": [c["name"] for c in tb.get("columns", [])],
             "structure": {
-                "schema": tb.get("schema", ""),
-                "table": tb.get("table", ""),
+                "schema": schema,
+                "table": table,
                 "columns": tb.get("columns", []),
             },
             "source_name": ds.get("name", "") if ds else "",
         }
+        # 复用既有资产时保留接口分析 Agent 的语义产物（ai_semantics/key_hint/ai_analysis）
+        for k, v in (existing or {}).items():
+            if k.startswith("ai_") or k in ("key_hint", "description"):
+                record.setdefault(k, v)
         set_json("^demo.DataAsset", asset_id, record)
-        assets.append(record)
-    return assets
+        saved.append(record)
+        by_name[table.lower()] = record
+
+    saved_ids = {a["id"] for a in saved}
+    merged: list[dict] = []
+    for a in prior:
+        merged.append(next((s for s in saved if s["id"] == a["id"]), a))
+    merged.extend(a for a in saved if a["id"] not in {p["id"] for p in prior})
+    replaced = [a.get("name") for a in prior if a.get("id") not in saved_ids] if not merge else []
+    # 数据源 `tables` 字段沿用旧结构 [{schema, table, columns}]（下游 datasource_runtime /
+    # 管道生成按此结构读取）——资产记录（含 id/structure）在 assets 中返回，两者形状区分清楚。
+    merged_tables = [{
+        "schema": ((a.get("structure") or {}).get("schema") or ""),
+        "table": (a.get("name") or ""),
+        "columns": ((a.get("structure") or {}).get("columns") or []),
+    } for a in merged]
+    return {"assets": saved, "merged": merged, "tables": merged_tables,
+            "total": len(merged_tables), "replaced": replaced}
+
 
 
 def list_assets(ds_id: str | None = None) -> list[dict]:
@@ -382,20 +429,126 @@ def get_asset(asset_id: str) -> dict | None:
 
 # ---------------- 转换关系 ----------------
 
-def save_mappings(mappings: list[dict]) -> int:
-    """保存转换关系列表，返回保存数量。"""
-    # 兜底：同一批次内 id 重复会导致后保存覆盖先保存（^demo.Mapping 以 id 为键），
-    # 自动加后缀唯一化，避免 AI 确认多条转换关系时丢失。
-    used: set[str] = set()
+def _identity_part(text) -> str:
+    """身份比对用的名称归一：小写、去空格、**取末段**（剥掉 schema/数据源前缀）。
+
+    2026-09-16 修 N10（同身份重复映射再生）：源资产名存在两种写法 —— 早期分析产物是
+    `Patient`，重新选表/分析后变成 `DS71120_TSQLUser.Patient`（数据源_模式.表）。
+    原身份判定直接用原字符串比较，于是 `Patient` ≠ `DS71120_TSQLUser.Patient` 被判成
+    「不同身份」，保存时 id 撞号 → 派生 `R1_3 / R2_2 / R3_2 / R5_2` 这类重复行，
+    映射列表翻倍（布局层虽已按 (源表, 目标资源) 去重、生成不受影响，但登记层不该脏）。
+    取末段与 `sql2fhir_executor.normalize_mappings` 的折叠口径保持一致。
+    """
+    s = str(text or "").strip().lower().strip('"').strip("[]")
+    if not s:
+        return ""
+    return s.rsplit(".", 1)[-1]
+
+
+def _mapping_identity(m: dict) -> tuple:
+    """映射身份 = (源, 目标实体, 目标类型)：同一身份视为同一条转换关系。
+
+    `source`/`target_table` 都按 `_identity_part` 归一（剥 schema/数据源前缀），
+    使 `Patient` 与 `DS71120_TSQLUser.Patient` 归为同一身份（N10）。
+    """
+    if not isinstance(m, dict):
+        return ()
+    src = _identity_part(m.get("source") or m.get("asset") or m.get("source_table") or "")
+    tgt = _identity_part(m.get("target_table") or m.get("target") or m.get("target_entity") or "")
+    tt = str(m.get("target_type") or "").strip().lower()
+    return (src, tgt, tt) if (src or tgt) else ()
+
+
+def _unique_mapping_id(base: str, used: set) -> str:
+    """为 base 找一个未被占用的派生命名（R1 → R1_2 → R1_3 …）。"""
+    base = str(base).strip() or _gen_id("M")
+    if base not in used:
+        return base
+    n = 2
+    while f"{base}_{n}" in used:
+        n += 1
+    return f"{base}_{n}"
+
+
+def save_mappings(mappings: list[dict], overwrite: bool = False, report: dict | None = None) -> int:
+    """保存转换关系列表，返回保存数量。
+
+    id 冲突规则（实测缺陷：Agent A 每轮都从 R1 起编号，跨批次保存会**静默覆盖**旧映射，
+    并让已生成管道的 mapping_ids 指向被改写的 id）：
+      1) 同一身份（源→目标实体/类型）已存在 → 复用其 id（重复保存 = 幂等更新，不新增）；
+      2) 身份不同但 id 已被占用（跨批次撞号）→ 派生新 id（R1 → R1_2 → …），**绝不覆盖**；
+      3) 同批次内重复 id 同样派生（原有行为保留）。
+
+    2026-09-15 修 N6（重复身份的历史副本不被收敛）：原先 `by_identity` 用字典推导式构建，
+    同一身份存在多条时**后写覆盖前写**，导致保存永远落在"孪生兄弟"中的任意一条上，另一条
+    （内容陈旧）长期留存；下游按 /mappings 全量取映射时可能选中陈旧那条。
+    现在：同一身份的所有行都收集起来，优先复用与提交 id 同名者、否则用最早落库的一条，
+    并把该身份的**其余重复行一并删除**（报告写入 report["collapsed"]）。
+
+    2026-09-16 修 N10（同身份重复映射再生）：身份判定前先把名称归一到「末段」（剥掉 schema/
+    数据源前缀），使 `Patient` 与 `DS71120_TSQLUser.Patient` 归为同一身份 —— 原先两者被判成
+    不同身份，保存时 id 撞号 → 派生 `R1_3 / R2_2 / R3_2 / R5_2` 等重复行，映射列表翻倍。
+    归并删除副本时，同时把管道实例 `mapping_ids` 里对被删 id 的引用改写为幸存 id
+    （`pipeline_instances.rewrite_mapping_id`），保证引用不悬空。
+
+    参数:
+        mappings: 待保存的转换关系（就地补全 id/status）。幂等：安全重复提交。
+        overwrite: True=显式按给定 id 覆盖（用户明确的"就地改写"语义，如编辑既有映射）。
+        report: 可选出参，回填 {"collapsed": [被归并删除的 id]}，供 API 层提示用户。
+    """
+    existing = [m for m in list_mappings() if isinstance(m, dict)]
+    used: set[str] = {str(m.get("id")) for m in existing if m.get("id")}
+    by_identity: dict[tuple, list[dict]] = {}
+    for m in existing:
+        key = _mapping_identity(m)
+        if key:
+            by_identity.setdefault(key, []).append(m)
+
+    collapsed: list[str] = []
     for m in mappings:
-        mid = m.get("id") or _gen_id("M")
-        if mid in used:
-            mid = f"{mid}_{len(used)}"
+        mid = str(m.get("id") or "").strip() or _gen_id("M")
+        key = _mapping_identity(m)
+        same = None
+        if key and not overwrite:
+            cands = by_identity.get(key) or []
+            # 规范化选择：优先复用与提交 id 同名那条，否则用列表序最早的一条（稳定、可预测）
+            same = next((c for c in cands if str(c.get("id")) == mid), None) or (cands[0] if cands else None)
+        if same is not None and same.get("id"):
+            # 同一条转换关系（源→目标相同）：更新内容、沿用原 id，不新增、不改名
+            mid = str(same["id"])
+        elif mid in used and not overwrite:
+            # id 撞号但身份不同 → 派生新 id（否则会覆盖别的映射）
+            mid = _unique_mapping_id(mid, used)
+            logger.warning("映射 id 冲突：%s 已被其它转换关系占用，改用 %s（不覆盖既有映射）",
+                           m.get("id"), mid)
         used.add(mid)
         m["id"] = mid
         m.setdefault("status", "confirmed")
         set_json("^demo.Mapping", mid, m)
+        if key:
+            # 归并同身份的陈旧重复行（保留本次落库这条）
+            for dup in by_identity.get(key) or []:
+                dup_id = str(dup.get("id") or "")
+                if dup_id and dup_id != mid and dup_id in used:
+                    if delete_json("^demo.Mapping", dup_id):
+                        used.discard(dup_id)
+                        collapsed.append(dup_id)
+                        logger.warning("映射 %s 与 %s 身份相同（%s），已归并删除陈旧副本",
+                                       dup_id, mid, key)
+                        # 已生成管道的 mapping_ids 可能引用被删的 id → 改写为幸存 id，
+                        # 避免展示侧出现指向不存在映射的悬空芯片（F4 类 id 漂移）。
+                        # 惰性导入：pipeline_instances 模块级已 import repository，避免循环导入。
+                        try:
+                            from backend.services import pipeline_instances as _pi
+
+                            _pi.rewrite_mapping_id(dup_id, mid)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("映射引用改写失败（%s → %s）：%s", dup_id, mid, exc)
+            by_identity[key] = [m]
+    if report is not None:
+        report["collapsed"] = collapsed
     return len(mappings)
+
 
 
 def list_mappings() -> list[dict]:

@@ -71,6 +71,34 @@ def _enrich_ai_semantics(assets: list[dict], targets: list[dict]) -> tuple[list[
     return assets, targets
 
 
+def _asset_name_index(assets: list[dict]) -> dict[str, str]:
+    """建立 资产 ID / 资产名 / 末段表名 → **规范资产名** 的索引（键统一小写）。
+
+    2026-09-16 缺陷 N11：`mapping.source` 有两种口径 —— Agent A 可能回填**资产 ID**
+    （`DS71120_TSQLUser.Patient`）也可能回填**资产名**（`Patient`），而下游（前端按资产名选源
+    数据源、`_resolve_sql_source_tables`/sql2fhir 布局按表名取列与 key_hint）都按资产名匹配，
+    口径不一致会让管道组 source_id 丢失，最终 sql2fhir 布局推导 500「患者主表未能判定」。
+    """
+    idx: dict[str, str] = {}
+    for a in assets or []:
+        nm = str(a.get("name") or "").strip()
+        if not nm:
+            continue
+        for k in (a.get("id"), a.get("name"), str(a.get("id") or "").split(".")[-1]):
+            key = str(k or "").strip().lower()
+            if key:
+                idx.setdefault(key, nm)
+    return idx
+
+
+def _canonical_source(idx: dict[str, str], raw: str) -> str:
+    """把映射 source 归一到**资产名**（命中不了则原样返回，保持参数化宽容）。"""
+    s = str(raw or "").strip()
+    if not s:
+        return s
+    return idx.get(s.lower()) or idx.get(s.split(".")[-1].lower()) or s
+
+
 @ai_bp.post("/recommend")
 def recommend():
     """Agent A：数据转换推荐（资产→目标表匹配 + 字段映射）。"""
@@ -109,6 +137,12 @@ def recommend():
         if trans_fix.get("mappings"):
             normalized = trans_fix["mappings"]
         logger.warning("转换验证-修复未完全解决（已采纳部分修复）: %s", trans_fix["message"])
+    # 源资产口径归一（缺陷 N11）：把 source 统一成**资产名**（LLM 可能回填资产 ID），
+    # 否则前端按资产名选源数据源会匹配失败 → source_id 丢失 → sql2fhir 布局推导 500
+    src_name_idx = _asset_name_index([*(assets or []), *(source_models or [])])
+    for r in normalized:
+        if isinstance(r, dict) and r.get("source"):
+            r["source"] = _canonical_source(src_name_idx, r["source"])
     # 返回时补回 asset 字段（前端 Recommend 页使用 rec.asset）
     out_recs = [{"asset": r.get("source", ""), **r} for r in normalized]
     transformation_plan = result.get("transformation_plan")

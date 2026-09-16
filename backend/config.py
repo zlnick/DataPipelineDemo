@@ -64,6 +64,17 @@ class LLMConfig:
     MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
     # 单次响应上限（Agent 生成 BP 类源码等长输出需要较大值；截断会被显式判失败）
     MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "64000"))
+    # 单次请求的**读超时**（秒）。实测缺陷：原先写死 timeout=600.0 且 SDK 默认再重试 2 次，
+    # 一次上游"连接存活但长时间不吐数据"的调用会把生成接口挂住 40+ 分钟（页面无限转圈、
+    # 用户完全看不到失败），所以这里显式收紧并限制重试次数。
+    TIMEOUT = float(os.getenv("LLM_TIMEOUT", "240"))
+    # 建连超时（秒）
+    CONNECT_TIMEOUT = float(os.getenv("LLM_CONNECT_TIMEOUT", "10"))
+    # SDK 层重试次数（平台 _call_llm 自己还会再试一轮，两层相乘需保持有界）
+    MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
+    # 单次 _call_llm 的**墙钟总预算**（秒，含全部重试）。实测一次生成请求曾挂 4.5 小时后
+    # 才失败并只回 "Connection error."，必须由平台自己兜底，不能依赖上游/传输层。
+    TOTAL_TIMEOUT = float(os.getenv("LLM_TIMEOUT_TOTAL", "480"))
 
 
 class FHIRConfig:

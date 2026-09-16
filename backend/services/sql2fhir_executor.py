@@ -53,13 +53,21 @@ def _column_names(meta) -> set[str]:
 
 
 def normalize_mappings(mappings: list[dict]) -> list[dict]:
-    """规整 mapping → [{source_table, target_resource}]（仅已建模 FHIR 资源）。"""
+    """规整 mapping → [{source_table, target_resource}]（仅已建模 FHIR 资源）。
+
+    同一 (源表, 目标资源) 只保留一条：映射登记可能因多轮 AI 推荐产生**重复身份**的条目
+    （实测：Encounters→Encounter 被另存为 R2 与 R3_2 两条），若原样传入布局推导会生成
+    重复的查询 BO 与重复的 Bundle entry（resource_order 出现 Encounter ×2），
+    子表被查两遍、条目被投两遍 —— 语义上仍是一条转换关系，故此处去重。
+    """
     known = set(fhir_target_model.US_CORE_RESOURCE_MODELS)
     out = []
+    seen: set[tuple[str, str]] = set()
     for m in mappings or []:
         src = _table_from_source(str(m.get("source") or ""))
         tgt = _canonical(str(m.get("target_table") or m.get("target") or ""), known)
-        if src and tgt:
+        if src and tgt and (src, tgt) not in seen:
+            seen.add((src, tgt))
             out.append({"source_table": src, "target_resource": tgt})
     return out
 
