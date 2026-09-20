@@ -58,6 +58,8 @@ def main_in_container():
     ap.add_argument("--timeout", type=int, default=90)
     args = ap.parse_args()
 
+    # 校验的是 FHIR **目标**仓库（演示默认 = FHIRSERVER，转换结果落这里）；
+    # FHIR **源**仓库默认是 DemoFHIR（见 backend/config.py 的 FHIRConfig）。
     FHIR = "http://iris:52773/csp/healthshare/fhirserver/fhir/r4"
     AUTH = base64.b64encode(b"superuser:SYS").decode()
 

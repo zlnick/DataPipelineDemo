@@ -46,7 +46,7 @@ def get_sql_connection():
 def reset_connections() -> None:
     """兼容接口：清理可能残留的连接（当前实现为"用后即关"，无需缓存清理）。
 
-    保留该函数是为了让上层（repository / pipelines / wsdl_importer / term_cache）
+    保留该函数是为了让上层（repository / pipelines / wsdl_importer / term_precheck）
     在原本 `conn.close()` 的位置调用统一的释放入口。
     """
     return None

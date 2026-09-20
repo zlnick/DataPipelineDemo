@@ -49,14 +49,17 @@ services:
       IRIS_NAMESPACE: USER
       IRIS_USERNAME: superuser   # 约定：所有 Demo 统一使用 superuser / SYS 登录
       IRIS_PASSWORD: SYS
-      # FHIR 数据源（IRIS 自带 FHIR Server），经 Docker 网络访问
-      FHIR_BASE_URL: http://iris:52773/csp/healthshare/fhirserver/fhir/r4/
+      # FHIR 仓库（演示默认：**源 = DemoFHIR 第二个独立仓库，目标 = FHIRSERVER 实例自带**），经 Docker 网络访问
+      FHIR_BASE_URL: http://iris:52773/csp/healthshare/demofhir/fhir/r4/
+      FHIR_TARGET_BASE_URL: http://iris:52773/csp/healthshare/fhirserver/fhir/r4/
       FHIR_USERNAME: superuser
       FHIR_PASSWORD: SYS
       # LLM（OpenAI 兼容接口）配置，来自宿主 .env
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
-      # FHIR 演示种子开关：0 = 容器启动时不灌 P001..P010 等示例资源（只验证管道写入）
-      SEED_FHIR: ${SEED_FHIR:-1}
+      # FHIR 演示种子开关：默认 0 = 启动不灌种子（演示数据一律用时现造）。
+      # 说明：播种脚本已移出启动链（见 tools/seed_fhir_demo.py），此变量仅对
+      # "重建前旧镜像内嵌的 init_fhir_data.py" 生效，作兼容保留。
+      SEED_FHIR: ${SEED_FHIR:-0}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
       # LLM 超时/重试（缺陷 N9）：单次读超时、建连超时、SDK 重试次数、单次调用墙钟总预算
@@ -67,7 +70,6 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./init_data.py:/app/init_data.py
-      - ./init_fhir_data.py:/app/init_fhir_data.py
       - ./cleanup_demo.py:/app/cleanup_demo.py
       - ./generate_mock_data.py:/app/generate_mock_data.py
       - ./jdbc:/app/jdbc            # JDBC 驱动 jar（转换目标通用连接）

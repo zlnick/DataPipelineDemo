@@ -37,6 +37,35 @@ FHIR 端点 → 自动分析 Profile → 注册数据源 → 发现数据资产(
 - **可观察**：Pipelines 页「🧾 AI 审计日志」按钮展示每次生成的决策来源；backend 日志留每个 Agent 的 token 用量。
 - **知识闭环**：验证经验经**知识润色 Agent（LLM）**去重研读，导出为 Obsidian 知识库笔记，供人沉淀复用（`export_validation_issues.py`）。
 
+### ✨ 管道增量生成（以管道为单位）
+
+生成不再"每次全量重算"，而是**以数据管道为单位增量**：
+
+- **身份稳定**：同一 `(源数据源, 目标)` 恒为**同一条管道** —— 无论提交几次、Agent 选了哪个设计 Skill，
+  都只更新既有管道（不新增、不产生"两套实例"）。
+- **未变更即跳过**：输入（映射内容 / 源·目标契约）没变 → **复用已存组件定义、不重跑 Agent B、不重启 Production**
+  （响应 `unchanged=true` / `render_skipped=true`，界面提示"所有数据管道均已存在且未变更"）。
+- **只生成变更组**：界面只提交新增/变更的组；**未提交的既有管道按存储定义自动并入**（不会被"整份替换"清掉），
+  其运行态（启停 / 许可 / 扫描凭证）保持不变。
+- **重复提交免疫**：提交里出现同身份重复组时自动合并为一条，响应回报 `dup_merged`（可审计）。
+- **强制重建**：需要重新设计时打开界面 **「强制重新生成」**（`force=true`）。
+
+### ✨ AI 能力目录（Tools / Workflows / Skills / Agents + Skill 目录）
+
+「AI Agents」页按业界口径（Anthropic《Building effective agents》）把平台能力**归类并逐条给出依据**：
+
+| 归类 | 含义 | 本项目条目 |
+| --- | --- | --- |
+| **Tool** | 确定性、**无 LLM** 的可调用单元 | 连接探查 / 连通门禁 / 事实检查（`pipeline_validator.check_*`）/ 规则检查 / BP 静态准入 / 术语缺口盘点 / 目标列与主键事实 / WSDL 实体分析 / 术语检索 BO（`demo.TerminologyOperation`）/ 类型与 FHIR 模型注册表 |
+| **Workflow** | LLM 参与，但**执行路径由代码预定** | 接口分析（工具采集 + 单轮 LLM 归纳）、数据管道设计 Agent B（决策一次 → 平台代码路径渲染） |
+| **Skill** | 打包的指令/知识，**单步**、无工具循环 | 数据转换生成（A）、知识润色、术语判定（C3 / C3-Dx：单轮判定 + 术语检索 Tool） |
+| **Agent** | **工具 + 多轮自主循环 + 目标** | 转换验证-修复（C1）、管道验证-修复（C2） |
+
+页面同时展示 **Skill 目录**（= AI 决策用的受控清单，`GET /api/agents/skills`）：
+**管道设计 Skill ×6**（`sql2fhir-patient-tx` / `sql2db` / `fhir2db` / `sql2soap` / `fhir2soap` / `fhir2fhir`，
+含适用"源 → 目标"、状态与组件拓扑角色）与 **术语判码 Skill ×2**（`cn2snomed` / `cn2rx`，含源·目标体系与判定 Agent），
+并显示**使用次数**（当前环境实际命中）。口径：平台只按目录**参数化**，选哪个 Skill 仍由 AI 决定。
+
 ### 分层模型与 AI 转换
 
 平台将数据转换拆分为三个独立层次，而不是假设“源表 → 目标实体”一一对应：
@@ -92,8 +121,14 @@ Production 拓扑并交给 IRIS 编译启动。
 | AI | OpenAI 兼容接口（`base_url` / `api_key` / `model` 可配） |
 | 编排部署 | Docker Compose（三容器） |
 
-**IRIS 双角色（单实例）**：
-- **FHIRSERVER namespace**：FHIR Server（数据源），承载 CapabilityStatement 与示例资源（Patient / Observation 等）
+**IRIS 多角色（单实例）**：
+- **FHIRSERVER namespace**：FHIR Server（实例自带）——**演示默认的 FHIR 目标仓库**（转换结果落这里），
+  端点 `http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/`
+- **DEMOFHIR namespace（第二个 FHIR 存储库）**：与 FHIRSERVER 同构的**独立** FHIR 仓库（主库 `DEMOFHIR` +
+  数据仓库库 `DEMOFHIRX0001R/V`），端点 `http://localhost:52773/csp/healthshare/demofhir/fhir/r4/`；
+  与 FHIRSERVER **数据完全隔离**（同一资源 id 互不可见）——**演示默认的 FHIR 源仓库**（UI 数据源表单、
+  `FHIRConfig.BASE_URL`、模拟数据脚本都默认指向它）。
+  创建：`iris/setup.sh` 步骤 2b（容器启动即幂等创建）；运行中的实例可重复执行 `python3 tools/create_fhir_repo.py`（带 15 项自检）
 - **USER namespace**：转换平台——目标表（模拟远端库/落库）、互操作性 Production、Mapping 与运行契约配置
 
 **演示数据表（SQLUser schema，结构与语义）**：
@@ -104,11 +139,16 @@ Production 拓扑并交给 IRIS 编译启动。
 | `PatientEntity` | SOAP 投递结果（Python mock 收到 AddPatient 实体后落库） | mock 写入 |
 | `FHIRQueue` | FHIR 增量抓取队列表（FHIRSyncService 入队，FHIRService 消费） | FHIRSyncService |
 
+> **命名空间默认口径（2026-09-16）**：演示默认 **SQL 源 = `USER` 命名空间**（`SQLUser.Patient` / `PatientSource`）、
+> **SQL 目标 = `CLINIC` 命名空间**（跨库写入演示）；两边 DSN 都由登记 jdbc_url 的命名空间推导
+> （`jdbc:IRIS://iris:1972/CLINIC` → DSN `CLINIC`）。要写平台内置目标表（`Patient`/`Observation`，在 `USER`）
+> 就把 DB 目标的 URL 改回 `jdbc:IRIS://iris:1972/USER`。
+
 **数据管道（Production）**：转换 BP 类 `demo.TransformProcess`（Embedded Python 字段映射转换，支持 `concat()` 表达式与 `表.列` 前缀）——
 **每条数据管道各建一个 BP 实例**（Ens 业务主机身份 = Item 名，如 `TransformProcess__sql2soap`；类可复用，管道互不干扰）：
 - FHIR 源：`FHIRSyncService`（`_lastUpdated` 增量游标）→ `FHIRQueue` → `FHIRService`（逐条独立会话）→ 本管道的转换 BP
 - SQL 源：`EnsLib.SQL.Service.GenericService`（JDBC 轮询，Query + KeyFieldName）→ 行 JSON → 本管道的转换 BP
-- 目标：`SQLOp_<表>`（JDBC `localTarget` UPSERT）；`SOAPOp_<服务>`（WSDL 导入 BO + Adapter WebServiceURL 指向远端/mock）
+- 目标：`SQLOp_<表>`（JDBC UPSERT；**DSN 按目标登记 jdbc_url 的命名空间推导** —— 演示默认 SQL 目标 = `CLINIC` 命名空间 → DSN `CLINIC`，无 jdbc_url 才回落 `localTarget`）；`SOAPOp_<服务>`（WSDL 导入 BO + Adapter WebServiceURL 指向远端/mock）
 - 参数与路由：BP 读**自己的**配置 `^demo.Config("bp", <BP名>)`（mapping / target_type / service|table），
   源 BS 经 `TargetConfigNames`（或 `^demo.Config("bp_target", 源BS名)`）投递给本管道的 BP，
   再由 BP 按 target_type 分发到 `SQLOp_*` / `SOAPOp_*`；旧路由表 `^demo.Config("pipe", 源BS名)` 仅作历史兼容兜底
@@ -166,8 +206,13 @@ docker compose down -v
 | 前端应用 | http://localhost | Vue 3 + Element Plus（六模块） |
 | 后端 API | http://localhost:5001 | REST API（nginx 代理 http://localhost/api/*） |
 | IRIS 管理门户 | http://localhost:52773/csp/sys/UtilHome.csp | 账号 `superuser`，密码 `SYS` |
-| FHIR endpoint | http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/ | `/metadata` 匿名；资源读写需 Basic Auth |
+| FHIR endpoint（实例自带 = 默认**目标**仓库） | http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/ | `/metadata` 匿名；资源读写需 Basic Auth；转换结果默认落这里 |
+| FHIR endpoint（第二个仓库 = 默认**源**仓库） | http://localhost:52773/csp/healthshare/demofhir/fhir/r4/ | 独立命名空间 `DEMOFHIR`；数据源表单/`FHIRConfig.BASE_URL` 默认指向它；与上一行数据**互不可见**；自检 `python3 tools/create_fhir_repo.py --check` |
 | IRIS 超级服务器 | localhost:1972 | Native SDK / DB-API 连接端口 |
+| **术语服务器：术语集清单页（内置网页）** | http://localhost:52774/terminology/ | 标题「术语服务器 · 术语集」；列出 4 个术语集（中文药品 / RxNorm / 国标 ICD-10 / SNOMED US Core 样本）与各自检索端点；JSON 版 `http://localhost:52774/terminology/systems`；账号 `superuser` / 密码 `SYS` |
+| 术语服务器：原生 REST（浏览器可直接看） | http://localhost:52774/terminology/… | 例 `/terminology/icd10/search?q=糖尿病`、`/terminology/drug/search?q=阿司匹林`、`/terminology/uscore-condition/zh-map?q=糖尿病`、`/terminology/vector/search?q=diabetes`；全量路由见 `termsrv/iris/src/Terminology/Production/API.cls` |
+| 术语服务器：管理门户 / Production 配置 | http://localhost:52774/csp/sys/UtilHome.csp ｜ http://localhost:52774/csp/user/EnsPortal.ProductionConfig.zen?$NAMESPACE=TERMINOLOGY | 生产 = `Terminology.Production`；⚠ Ensemble 门户挂在 `/csp/user/`（`/csp/sys/` 版 404） |
+| 术语服务器：上游 React 演示 UI（Terminology Explorer） | http://localhost:5173（**本环境未部署**） | 需宿主装 Node 后 `cd termsrv/ui && npm install && VITE_API_BASE_URL=http://localhost:52774 npm run dev`；上游另需 `webgateway` 容器（8080） |
 
 > **前端与管理门户的分工**：Demo 前端负责**业务配置**（数据源/资产/AI 映射/生成管道）与**业务监控**（消息日志、目标表落库）；
 > 生成的 Production 是标准 `Ens.Production`，其**技术管理**（组件配置、启停、消息详情、错误排查）请登录
@@ -201,6 +246,8 @@ docker compose down -v
 | GET | `/api/pipelines/logs` | 消息流转日志（Ens.MessageHeader） |
 | GET | `/api/pipelines/mappings` | Production 正在执行的转换关系 |
 | GET | `/api/pipelines/target-data` | 目标表落库结果 |
+| GET | `/api/agents` | 已封装 AI 能力（Skills / Agents） |
+| GET | `/api/agents/skills` | **Skill 目录**（管道设计 Skill + 术语判码 Skill，含适用源→目标 / 状态 / 使用次数） |
 
 ## LLM（AI 推荐）配置
 
@@ -222,7 +269,8 @@ LLM_MODEL=deepseek-chat                        # 模型名
 ├── docker-compose.yml        # 一键编排（IRIS + 后端 + 前端）
 ├── .env.example              # 环境变量模板（IRIS/FHIR/LLM）
 ├── init_data.py              # 建目标表（模拟远端数据库）
-├── init_fhir_data.py         # 加载 FHIR 示例资源（10 Patient + 30 Observation）
+├── tools/seed_fhir_demo.py   # （可选）手动灌 FHIR 演示样本；不在 backend 启动链
+├── tools/check_component_fidelity.py # 组件保真审计（存储定义 ⊆ Production，防重建丢件）
 ├── docs/PROJECT_PLAN.md      # 项目专用知识文档（目标/决策/数据模型/坑）
 ├── backend/                  # Flask 后端
 │   ├── app.py                # 应用入口（注册全部路由蓝图）
@@ -249,12 +297,16 @@ LLM_MODEL=deepseek-chat                        # 模型名
 
 > 系统启动后处于**空白演示态**：无预置数据源/目标/资产/映射；页面（资产/目标/可查看表）只出现你已登记的内容。
 > 重置环境：`bash tools/datakit/run.sh reset_ui_env.py`
-> （一键回到零起点，**脚本自带 25 项自检**：末尾 ✅/❌ 清单 + 退出码 0=干净；只查不改加 `--check-only`。
+> （一键回到零起点，**脚本自带 26 项自检**：末尾 ✅/❌ 清单 + 退出码 0=干净；只查不改加 `--check-only`。
 > 旧脚本 `python cleanup_demo.py` 已过时：它不清 Ens 内部残留/生成类/动态发现的新表。）
+> **术语映射不用管**：事实源在**术语服务器**（独立容器 + 独立数据目录，重置不影响），运行期由管道经
+> **共享 BO**（`demo.TerminologyOperation`）实时查询——**没有本地缓存要预热**，重置后术语映射天然就位；
+> 若某个源编码服务器尚无映射，平台**默认降级**（保留源编码 + `meta.tag=unmapped`，不静默、不阻断），
+> 补录：`bash tools/datakit/run.sh term_map_build.py`（判定 Agent 产出候选并写回服务器，补录后**无需重新生成**）。
 
 ### A. FHIR → DB（数据源 = FHIR 资源）
-1. **添加 FHIR 数据源**：「数据源管理」→ 端点 `http://iris:52773/csp/healthshare/fhirserver/fhir/r4/`、认证 `superuser/SYS` → 注册 → **Profile 分析**（自动产出运行契约：版本/增量能力/健康）。
-2. **添加 DB 目标**：「转换目标」→ JDBC `jdbc:IRIS://iris:1972/USER`、认证 superuser/SYS → 添加 → 联通测试 → 选 schema `SQLUser` → 勾选目标表（`Patient`/`Observation`）→ 分析列结构 → 保存。
+1. **添加 FHIR 数据源**：「数据源管理」→ 端点**默认已填** `http://iris:52773/csp/healthshare/demofhir/fhir/r4/`（DemoFHIR = 默认 FHIR 源仓库）、认证 `superuser/SYS` → 注册 → **Profile 分析**（自动产出运行契约：版本/增量能力/健康）。
+2. **添加 DB 目标**：「转换目标」→ JDBC（表单**默认已填** `jdbc:IRIS://iris:1972/CLINIC` = SQL 目标默认库；本教程要写**平台内置目标表** `Patient`/`Observation`（在 `USER` 命名空间），故把 URL 改为 `jdbc:IRIS://iris:1972/USER`）、认证 superuser/SYS → 添加 → 联通测试 → 选 schema `SQLUser` → 勾选目标表（`Patient`/`Observation`）→ 分析列结构 → 保存。
 3. **AI 智能匹配**：选 `Patient` 资产 → AI 推荐字段映射 → 确认保存。
 4. **生成管道**：「管道监控」→ 生成 → FHIR 增量同步自动抓取 FHIR Server 数据 → 转换 → `Patient` 表落库（Pipelines 目标数据下拉动态可选 `Patient` 查看）。
 5. **看效果**：往 FHIR 写新资源（或用「生成模拟数据」按钮）→ 增量抓取 → 消息 Completed → 落库。
@@ -271,12 +323,40 @@ LLM_MODEL=deepseek-chat                        # 模型名
   `TransformProcess` 按来源（`SQLService`/`FHIRService`）路由到各自目标，消息互不干扰。
 - 注意：SQL 源表与 FHIR 目标表**不要用同一张**（否则 FHIR 写入会被 SQL 源再轮询产生回环，demo 已内置独立 `PatientSource` 表避免）。
 
+### D. 管道增量生成（建议接在 C 之后演示）
+
+1. **不改任何东西再点一次「生成」**：界面提示「所有数据管道均已存在且未变更（未重新生成）」，
+   `/api/pipelines/items` 组件清单与实例"生成次数"**不变**（不重跑 AI、不重启生产）。
+2. **只勾选其中一组**提交：其余管道组件**原样保留**（后端把未提交的既有管道按存储定义自动并入）；
+   若提交里含**同身份重复组**，会被合并并在响应 `dup_merged` 中回报（不产生第二套实例）。
+3. **需要复位某条管道**：打开页面 **「强制重新生成」** 开关后点生成（`force=true`），该组会重新设计组件（AI 重新决策）。
+4. **确认没有丢件**（可选）：`python3 tools/check_component_fidelity.py`
+   —— 逐项比对"每个管道的存储定义 ⊆ Production 组件"，做三次审计（基线 / 复用提交 / 强制重建）并输出缺失清单。
+
 ## 说明与限制
 
 - 本项目为技术演示用途，示例数据均为程序生成，不涉及真实患者信息。
 - IRIS 登录统一 `superuser` / `SYS`；FHIR 资源读写需 Basic Auth（仅 `/metadata` 匿名公开）。
+- **FHIR 源/目标默认分工**（2026-09-16 起）：**源 = `DEMOFHIR`**（第二个独立仓库，UI「数据源管理」表单与
+  `FHIRConfig.BASE_URL` 的默认值）、**目标 = `FHIRSERVER`**（实例自带，UI「转换目标」表单与
+  `FHIRConfig.TARGET_BASE_URL` 的默认值）；两个仓库数据互不可见，重置脚本会同时清空两者。
 - SOAP 目标演示默认指向 **Python mock**（`backend/services/mock_soap.py`，`Config.MOCK_SOAP_URL`）；
   真实接入时在目标连接信息里填真实 endpoint 即可（Adapter `WebServiceURL` 覆盖 WSDL 地址）。
+- **术语判定三态语义**（运行期由共享 BO `demo.TerminologyOperation` 实时查询术语服务器）：
+  `active` → 追加目标体系 coding（双 coding，如 `E11.900` + SNOMED `44054006`）；
+  **`negative`（已判定无匹配，如"依折麦布/阿托伐他汀"复方制剂）→ 只保留源编码、不追加目标编码、也不打 `unmapped` 标记**；
+  `missing` / 调用失败 → 保留源编码并在资源打 `meta.tag=urn:cn-nhsa:term-map|unmapped`（不阻断，可补录；
+  补录后**无需重新生成**，运行期即时生效）。
+- **许可与管道切换**：社区版 IRIS 许可为 **8 个业务主机单元** → 多条管道不能同时运行，超出的分组生成后为 `suspended`；
+  在「数据管道」卡片点**启用/停用**做**一键切换**（许可不足时自动让路其它活动管道，响应 `disabled_others` 列出被让路组件）。
+- **组件保真自查**：`python3 tools/check_component_fidelity.py`（重建/复用后逐项确认没有丢组件）；
+  工具箱清单：`bash tools/datakit/run.sh list`（含 `test_incremental_pipeline.py` 等离线回归与造数脚本）。
 - 目标表写入为 UPSERT（存在则更新），管道定时拉取重复执行不冲突。
-- `init_data.py` / `init_fhir_data.py` 每次后端启动会重建目标表并重新提交 FHIR 示例数据，适合演示；生产环境不应自动清表。
+- `init_data.py` 每次后端启动会**重建目标表**（DROP+CREATE，适合演示；生产环境不应自动清表）。
+- FHIR 演示数据**不在启动时灌**（2026-09-16 起）：用时现造（`tools/gen_test_patient.py`、`generate_mock_data.py --fhir N`）；
+  需要"库里本就有历史存量"时手动 `bash tools/datakit/run.sh seed_fhir_demo.py`。
+- **演 FHIR 源不必先造数**（2026-09-18 起）：数据源的字段发现为「真实数据（优先）→ 服务器 StructureDefinition →
+  **平台 FHIR 规范快照**（US Core 已建模 11 类）→ **AI 按 R4 规范补全**（其余类型）」，来源在运行契约
+  `note.fields.provenance` 与 UI「运行契约」列可见；有了真实数据后下次分析会自动改用真实数据形态。
+  造数仍可选（真实数据形态最准）：`bash tools/datakit/run.sh seed_fhir_demo.py`。
 - **注意：不要修改 IRIS 的 Web Application / Security 权限**（管理门户与 Ensemble 门户依赖，属外部环境）。

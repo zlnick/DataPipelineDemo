@@ -1,29 +1,28 @@
-"""术语映射判定 API（C3 Mapping Agent）：中文药品名 → RxNorm。"""
+"""术语映射 API：术语服务器目录/盘点（术语服务器 = 术语转换映射的唯一事实源）+ C3 判定直连。
+
+- `GET  /api/mapping/term-catalog`：只读目录 + **盘点摘要**（covered/negative/**待办 todo**/命名空间）
+- `POST /api/mapping/cn2rx|cn2snomed`：单条判定直连（补录工具/调试用）
+
+架构（2026-09-18 最终口径）：**运行期**由管道经**共享 BO** `demo.TerminologyOperation` 实时查术语
+服务器（零本地码表副本）；生成期只做**只读盘点**，缺映射**默认放行**（进"待办清单"、运行期降级为
+"保留源编码 + meta.tag=unmapped"），需要"先齐备才允许生成"时用 `strict_terms=true`。
+
+术语服务器的生命周期与演示程序主体**独立**（独立容器 + 数据目录 `./data/iris-terminology`，
+`tools/reset_ui_env.py` 不触及）⇒ 环境重置不影响术语映射。
+"""
+
+import logging
 
 from flask import Blueprint, request
 
-from backend.services import pipeline_instances
 from backend.services.cn2rx_mapping import run_cn2rx_mapping
 from backend.services.cn2snomed_mapping import run_cn2snomed
 from backend.services.llm_client import AgentError
-from backend.services.term_cache import build_term_cache_safe
 from backend.utils import error, success
 
+logger = logging.getLogger(__name__)
+
 mapping_bp = Blueprint("mapping", __name__, url_prefix="/api/mapping")
-
-
-def _pause_candidates() -> list[str]:
-    """可按需暂停的源 BS（本平台已登记管道的源 BS；每暂停 1 个腾出 1 个许可单元）。"""
-    names: list[str] = []
-    for rec in pipeline_instances.list_instances():
-        routes = rec.get("routes") or {}
-        cand = list(routes.get("source_bs_names") or [])
-        if routes.get("source_bs"):
-            cand.append(routes["source_bs"])
-        for n in cand:
-            if n and n not in names:
-                names.append(n)
-    return names
 
 
 @mapping_bp.post("/cn2rx")
@@ -64,34 +63,47 @@ def cn2snomed():
     return success(result)
 
 
-@mapping_bp.post("/term-cache")
-def refresh_term_cache():
-    """按 ^demo.Mapping 中 term_map 指令，调用判码 Skill 预判定并写缓存（运行期双 coding 用）。
+@mapping_bp.get("/term-catalog")
+def term_catalog_view():
+    """术语映射目录与**盘点摘要**（**只读**：不写缓存、不改环境、不调 LLM，供 UI 展示）。
 
-    许可不足（社区版 8 个单元被 Ens 业务主机占满）时，自动**临时暂停源 BS** 腾出单元后再
-    刷新，刷完恢复；仍失败则显式返回 `ok=false` 与原因——`term_map` 是 AI 决策，不得静默失效。
+    返回::
+
+        {"catalog": {"ok","pairs":[{sourceSystem,targetSystem,entries,active,negative}], "url"},
+         "gate": {"jobs","namespaces","covered","negative","missing","todo","pending",
+                  "unresolved","pairs","ok","error","skipped"},
+         "hint": "缺映射时的补录方式（AI 判定写回服务器）",
+         "runtime": "运行期口径说明（共享 BO 实时查询；缺映射默认降级）"}
+
+    说明：术语服务器是术语转换映射的唯一事实源；盘点**只读**（读源表编码值 → 查服务器 availability）。
+    运行期由共享 BO `demo.TerminologyOperation` 实时查询；缺映射**默认降级**（保留源编码 +
+    `meta.tag=unmapped`），补录见 `python3 tools/term_map_build.py`（补录后无需重新生成）。
     """
-    body = request.get_json(silent=True) or {}
+    from backend.services import term_catalog, term_precheck
+
+    catalog = term_catalog.systems(use_cache=False)
     try:
-        report = build_term_cache_safe(body.get("mappings"),
-                                       pause_items=_pause_candidates(),
-                                       force=bool(body.get("force")))
-    except AgentError as exc:
-        return error(f"[判码缓存] {exc}")
-    if not report.get("ok"):
-        return error(f"[判码缓存] 刷新失败（term_map 决策将无法在运行期落地）: {report.get('error')}",
-                     data=report)
-    payload = dict(report.get("cache") or {})
-    payload["paused_items"] = report.get("paused_items") or []
-    payload["restored_items"] = report.get("restored_items") or []
-    # 口径写清（曾因两套口径混用出现"缓存明明有值却显示 cached=0"）：
-    #   cached / negative   = 缓存**累计**（与 required / missing 同口径）
-    #   new_cached / new_negative = **本次**新判定条目（全已判定时为 0，属正常）
-    payload["cached"] = report.get("cached_total")
-    payload["negative"] = report.get("negative_total")
-    payload["new_cached"] = report.get("cached")
-    payload["new_negative"] = report.get("negative")
-    payload["missing"] = report.get("missing") or []
-    payload["note"] = ("cached/negative=缓存累计；new_cached/new_negative=本次新判定；"
-                       "missing=尚未判定（运行期会缺目标系统 coding）")
-    return success(payload, "判码缓存已刷新（判定结果来自 cn2rx/cn2snomed Skill）")
+        gate = term_precheck.precheck()
+    except Exception as exc:  # noqa: BLE001 - 读取失败也要给出可读原因（不假装"无任务"）
+        logger.warning("术语盘点读取失败: %s", exc)
+        gate = {"ok": False, "error": f"术语盘点读取失败: {exc}", "jobs": [], "skipped": ""}
+    return success({
+        "catalog": {"ok": bool(catalog.get("ok")), "url": catalog.get("url") or "",
+                    "pairs": catalog.get("pairs") or [], "error": catalog.get("error") or ""},
+        "gate": {"ok": bool(gate.get("ok")), "skipped": gate.get("skipped") or "",
+                 "jobs": gate.get("jobs") or [], "namespaces": gate.get("namespaces") or {},
+                 "covered": int(gate.get("covered") or 0),
+                 "negative": int(gate.get("negative") or 0),
+                 "missing": gate.get("missing") or [],
+                 "todo": gate.get("todo") or [],
+                 "pending": gate.get("pending") or [],
+                 "unresolved": gate.get("unresolved") or [],
+                 "pairs": gate.get("pairs") or [], "notes": gate.get("notes") or [],
+                 "error": gate.get("error") or ""},
+        "hint": term_precheck.hint(),
+        "runtime": ("运行期由**共享 BO** demo.TerminologyOperation 实时查术语服务器："
+                    "active→追加目标体系 coding（双 coding）；negative→不追加（服务器判定无匹配）；"
+                    "missing/error→**默认降级**（保留源编码 + meta.tag=unmapped，不静默）"),
+    })
+
+

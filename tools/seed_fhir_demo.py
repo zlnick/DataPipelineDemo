@@ -1,14 +1,26 @@
-"""FHIR 示例数据加载脚本。
+"""FHIR 演示样本加载脚本（**手动工具**，已不在 backend 启动链里）。
 
-向 IRIS 自带 FHIR Server 提交示例资源（Patient / Observation），
-以 Bundle（type=transaction）方式写入 FHIR endpoint。
+向 FHIR **源**仓库提交演示资源（Patient / Observation）——地址取 `FHIRConfig.BASE_URL`，
+演示默认 = 第二个独立仓库 **DemoFHIR**（`/csp/healthshare/demofhir/fhir/r4`，可用
+`FHIR_BASE_URL` / `FHIR_SOURCE_BASE_URL` 覆盖）；以 Bundle（type=transaction）方式写入 FHIR endpoint。
+
+⚠ 角色变更（2026-09-16）：本脚本原名 `init_fhir_data.py`，原先由 backend 容器启动时自动执行；
+现改为**显式手动工具**——演示数据一律"用时现造"（`tools/gen_test_patient.py` /
+`generate_mock_data.py --fhir N`），启动时不再隐式往 FHIR 写数据、也不再推进增量同步游标。
+需要"库里本就有历史存量"的场合（例如演示"存量 vs 增量"）再手动执行：
+
+    bash tools/datakit/run.sh seed_fhir_demo.py
+
+副作用（手动执行时）：
+- 写入 Patient `P001`..`P010` + 每人 3 条 Observation，`lastUpdated` 固定为
+  `2026-08-29T00:00:00.000Z`（视为历史存量）；
+- 随后把 `^demo.Config("sync","cursor")` 推进到**当前时间**，增量同步（`demo.FHIRSyncService`）
+  不会重抓这批数据（这正是"历史存量"的语义）。
 
 注意（方案 A，见 docs/PROJECT_PLAN.md）：
 - IRIS FHIR Server 对资源读写默认要求 Basic Auth（superuser/SYS），
   本脚本访问 endpoint 时携带认证头。
 - 使用 PUT（幂等），脚本可重复执行。
-
-本脚本在 backend 容器启动时执行（init_data.py 之后）。
 """
 
 import base64
@@ -221,11 +233,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import os
-
-    # 演示种子开关：SEED_FHIR=0 时跳过（避免重启 backend 时把 P001..P010 等种子重新写回 FHIR，
-    # 干扰"只验证管道写入"的场景）；默认 1 保持原行为。
-    if os.getenv("SEED_FHIR", "1") == "0":
-        logger.info("SEED_FHIR=0：跳过 FHIR 演示种子加载")
-    else:
-        main()
+    # 手动工具：显式执行即视为"要灌这份演示样本"（不再受 SEED_FHIR 开关约束——
+    # 那个开关是"启动链自动执行"时代的产物，已随启动链一并移除）。
+    main()

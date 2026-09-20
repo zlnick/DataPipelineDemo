@@ -69,10 +69,15 @@ def list_json(global_name: str) -> list[dict]:
 
 
 def list_keys(global_name: str) -> list[str]:
-    """返回 global 的全部一级 key（按 IRIS 排序）。"""
+    """返回 global 的全部一级 key（按 IRIS 排序）。
+
+    2026-09-19 修（休眠缺陷，实测）：原实现过滤 `raw is not None` —— 对"一级下标全是**节点**、
+    没有值"的 global（如 `^demo.Config` 的 bp/pipe/…，值是孙节点）会返回 **[]**，与事实不符
+    （诊断脚本据此误报"配置为空"）。现不再按值过滤；需要值的调用方请用 `list_json`（自身会跳过空值）。
+    """
     native, conn = _get_native()
     try:
-        return [str(k) for k, raw in native.iterator(global_name) if raw is not None]
+        return [str(k) for k, _raw in native.iterator(global_name)]
     finally:
         iris_connector.reset_connections()
 
@@ -127,6 +132,18 @@ def datasource_runtime(ds: dict) -> dict:
     # SQL 源的 connection 是「向导可变配置」（query/key_field/dsn 可能被更新），
     # 始终以 config 现算，不复用 runtime 缓存的旧值（曾缓存 key_field=ID 导致 SQLService 报错）
     if rt.get("connection") and kind != "SQL":
+        if kind == "FHIR":
+            # FHIR 资产的**权威来源是资产记录**（analyze 每次都按 CapabilityStatement 重建），
+            # runtime.assets 只是历史快照：曾致"采样计划只跳过快照里已有字段的类型" →
+            # 把数据源改指另一个 FHIR 仓库（fhirserver → DemoFHIR）后，Patient/Observation 等
+            # 11 类**永不重采** → 字段发现静默失效（实测 note.fields.found=0、资产 fields 全空）。
+            # 这里按记录现算（与下方惰性构造分支同口径），保证下游读到的资产始终最新。
+            rt = dict(rt)
+            rt["assets"] = [
+                {"name": a.get("name"), "type": a.get("type") or "FHIR",
+                 "fields": a.get("fields") or []}
+                for a in list_assets(ds.get("id") or "") if a.get("name")
+            ]
         return rt
 
     cfg = ds.get("config") or {}
@@ -247,9 +264,16 @@ def target_runtime(tg: dict) -> dict:
                                             for c in (tb.get("columns") or [])]}
             for tb in (tg.get("tables") or [])]
     else:  # DB
+        # DSN 归一（与源侧同口径）：`jdbc:IRIS://host:1972/<命名空间>` → 命名空间即 DSN 名
+        # （演示默认目标库 = **CLINIC** → 生成 SQLOp 引用 DSN=CLINIC，而不是历史兜底 localTarget/USER）。
+        # 缺这段会让「目标登记 CLINIC、数据却写进 USER」这种静默错位再出现。
+        from backend.services import jdbc_dsn  # 延迟导入避免循环依赖
         conn = {
             "jdbc_url": conn0.get("jdbc_url") or "",
-            "dsn": conn0.get("dsn") or "localTarget",
+            "dsn": conn0.get("dsn") or (tg.get("config") or {}).get("dsn")
+                   or jdbc_dsn.namespace_of(conn0.get("jdbc_url")
+                                            or (tg.get("config") or {}).get("jdbc_url"))
+                   or "localTarget",
             "driver_class": conn0.get("driver_class") or "",
             "username": conn0.get("username") or "",
             "password": conn0.get("password") or "",
@@ -445,18 +469,38 @@ def _identity_part(text) -> str:
     return s.rsplit(".", 1)[-1]
 
 
-def _mapping_identity(m: dict) -> tuple:
-    """映射身份 = (源, 目标实体, 目标类型)：同一身份视为同一条转换关系。
+def _mapping_source_key(m: dict) -> str:
+    """映射的**数据源维度**（2026-09-17 修缺陷 A）：小写数据源 id，未声明返回 ""。
 
-    `source`/`target_table` 都按 `_identity_part` 归一（剥 schema/数据源前缀），
-    使 `Patient` 与 `DS71120_TSQLUser.Patient` 归为同一身份（N10）。
+    背景：演示要同时装 3 个源（FHIR `DS08385` / SQL USER / SQL CLINIC），它们都有名为 `Patient`
+    的资产 —— 身份只含 (源末段, 目标, 类型) 时会被判成**同一条转换关系**，保存时互相覆盖
+    （3 源 × 3 目标 = 9 条只剩 3 条），且已生成管道的 `mapping_ids` 会被改指到别的源的映射内容。
+    故身份加入数据源维度；`source_id` 由 `/ai/recommend` 归一（routes/ai.py::_canonicalize_recs）
+    与 `/mappings` 保存入口（routes/mappings.py::_backfill_source_ids）回填。
+    """
+    for k in ("source_id", "datasource_id", "source_datasource", "source_ds", "ds_id"):
+        v = str(m.get(k) or "").strip().lower()
+        if v:
+            return v
+    return ""
+
+
+def _mapping_identity(m: dict) -> tuple:
+    """映射身份 = (数据源, 源, 目标实体, 目标类型)：同一身份视为同一条转换关系。
+
+    - `source`/`target_table` 按 `_identity_part` 归一（剥 schema/数据源前缀，N10）；
+    - 首位是**数据源 id**（缺陷 A，2026-09-17）：不同数据源的同名资产（`Patient`）是两条
+      不同的转换关系，必须共存。未声明数据源时该位为 ""（历史口径），保存时只与
+      "同样未声明数据源"的行同身份（见 save_mappings._cands_for）。
     """
     if not isinstance(m, dict):
         return ()
     src = _identity_part(m.get("source") or m.get("asset") or m.get("source_table") or "")
     tgt = _identity_part(m.get("target_table") or m.get("target") or m.get("target_entity") or "")
     tt = str(m.get("target_type") or "").strip().lower()
-    return (src, tgt, tt) if (src or tgt) else ()
+    if not (src or tgt):
+        return ()
+    return (_mapping_source_key(m), src, tgt, tt)
 
 
 def _unique_mapping_id(base: str, used: set) -> str:
@@ -477,7 +521,12 @@ def save_mappings(mappings: list[dict], overwrite: bool = False, report: dict | 
     并让已生成管道的 mapping_ids 指向被改写的 id）：
       1) 同一身份（源→目标实体/类型）已存在 → 复用其 id（重复保存 = 幂等更新，不新增）；
       2) 身份不同但 id 已被占用（跨批次撞号）→ 派生新 id（R1 → R1_2 → …），**绝不覆盖**；
-      3) 同批次内重复 id 同样派生（原有行为保留）。
+      3) 同批次内重复 id 同样派生（原有行为保留）；
+      4) 身份含**数据源维度**（2026-09-17 修缺陷 A）：3 个源有同名资产（`Patient`）时，
+         `(数据源, 源, 目标, 类型)` 才唯一确定一条转换关系 —— 否则不同源的映射互相覆盖
+         （9 条只剩 3 条）。未声明 `source_id` 的提交只与"同样未声明数据源"的行同身份，
+         绝不跨源覆盖；提交声明了数据源而库里那条未声明时视为同一条并**认领**
+         （保存即补写数据源维度）。
 
     2026-09-15 修 N6（重复身份的历史副本不被收敛）：原先 `by_identity` 用字典推导式构建，
     同一身份存在多条时**后写覆盖前写**，导致保存永远落在"孪生兄弟"中的任意一条上，另一条
@@ -498,23 +547,36 @@ def save_mappings(mappings: list[dict], overwrite: bool = False, report: dict | 
     """
     existing = [m for m in list_mappings() if isinstance(m, dict)]
     used: set[str] = {str(m.get("id")) for m in existing if m.get("id")}
-    by_identity: dict[tuple, list[dict]] = {}
-    for m in existing:
-        key = _mapping_identity(m)
-        if key:
-            by_identity.setdefault(key, []).append(m)
+    # 现行映射表（id → 记录）：身份候选与归并都基于它（不再用静态字典推导，避免"孪生副本"
+    # 与"数据源维度兼容匹配"互相打架）
+    store: dict[str, dict] = {str(m.get("id")): m for m in existing if m.get("id")}
+
+    def _cands_for(key: tuple) -> list[dict]:
+        """按身份取候选行（含**数据源维度**的兼容匹配，见缺陷 A）：
+
+        ① 精确身份（数据源 + 源 + 目标 + 类型）优先；
+        ② 否则只认"**未声明数据源**"的同名行 —— 既兼容历史数据（当时身份无数据源维度），
+           也让"提交声明了数据源、库里那条还没声明"的同一转换关系被**认领**（保存即补写维度），
+           而**绝不跨源覆盖**：A 源提交时不会命中 B 源那条（它有数据源维度、且不相等）。
+        """
+        exact = [c for c in store.values() if _mapping_identity(c) == key]
+        if exact:
+            return exact
+        rest = key[1:]
+        return [c for c in store.values()
+                if _mapping_identity(c)[1:] == rest and not _mapping_source_key(c)]
 
     collapsed: list[str] = []
     for m in mappings:
         mid = str(m.get("id") or "").strip() or _gen_id("M")
         key = _mapping_identity(m)
+        cands = _cands_for(key) if key else []
         same = None
         if key and not overwrite:
-            cands = by_identity.get(key) or []
             # 规范化选择：优先复用与提交 id 同名那条，否则用列表序最早的一条（稳定、可预测）
             same = next((c for c in cands if str(c.get("id")) == mid), None) or (cands[0] if cands else None)
         if same is not None and same.get("id"):
-            # 同一条转换关系（源→目标相同）：更新内容、沿用原 id，不新增、不改名
+            # 同一条转换关系（数据源+源→目标相同）：更新内容、沿用原 id，不新增、不改名
             mid = str(same["id"])
         elif mid in used and not overwrite:
             # id 撞号但身份不同 → 派生新 id（否则会覆盖别的映射）
@@ -525,13 +587,15 @@ def save_mappings(mappings: list[dict], overwrite: bool = False, report: dict | 
         m["id"] = mid
         m.setdefault("status", "confirmed")
         set_json("^demo.Mapping", mid, m)
+        store[mid] = m
         if key:
             # 归并同身份的陈旧重复行（保留本次落库这条）
-            for dup in by_identity.get(key) or []:
+            for dup in cands:
                 dup_id = str(dup.get("id") or "")
                 if dup_id and dup_id != mid and dup_id in used:
                     if delete_json("^demo.Mapping", dup_id):
                         used.discard(dup_id)
+                        store.pop(dup_id, None)
                         collapsed.append(dup_id)
                         logger.warning("映射 %s 与 %s 身份相同（%s），已归并删除陈旧副本",
                                        dup_id, mid, key)
@@ -544,7 +608,6 @@ def save_mappings(mappings: list[dict], overwrite: bool = False, report: dict | 
                             _pi.rewrite_mapping_id(dup_id, mid)
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("映射引用改写失败（%s → %s）：%s", dup_id, mid, exc)
-            by_identity[key] = [m]
     if report is not None:
         report["collapsed"] = collapsed
     return len(mappings)
@@ -608,26 +671,30 @@ def update_target(target_id: str, patch: dict) -> None:
 
 
 def add_target_table(target_id: str, schema: str, table: str,
-                     columns: list[dict]) -> None:
-    """将用户选定的表保存为目标表（含列结构，去重更新）。
+                     columns: list[dict], key_columns: list[str] | None = None) -> None:
+    """将用户选定的表保存为目标表（含列结构 + 主键事实，去重更新）。
 
     参数:
         target_id: 数据目标 ID。
         schema: 表所在 schema。
         table: 表名。
         columns: 列结构 [{"name": "...", "type": "...", "size": n}]。
+        key_columns: 主键列名列表（JDBC 元数据事实；缺省 None 表示未知）。
     """
     tg = get_target(target_id)
     if not tg:
         return
     tables = [t for t in tg.get("tables", [])
               if not (t.get("schema") == schema and t.get("table") == table)]
-    tables.append({
+    record = {
         "schema": schema,
         "table": table,
         "columns": columns,
         "status": "selected",
-    })
+    }
+    if key_columns:
+        record["key_columns"] = list(key_columns)
+    tables.append(record)
     tg["tables"] = tables
     set_json("^demo.Target", target_id, tg)
 

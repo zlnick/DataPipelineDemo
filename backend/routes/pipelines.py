@@ -3,6 +3,7 @@
 import json
 import logging
 import random
+import re
 import time
 from datetime import datetime, timezone
 
@@ -25,21 +26,80 @@ AVAILABLE_COMPONENTS = type_registry.get_available_components()
 
 
 
+def _registered_table_columns(tg: dict) -> tuple[dict, str]:
+    """目标登记里的 ({表名: 列清单}, schema)（注册时按**目标 JDBC 元数据**取得 → 权威事实）。
+
+    供 DB 目标 SQLOp 生成 UPSERT 列清单使用：列清单必须反映**目标库**的结构，
+    不能拿当前命名空间同名表的列（演示默认目标 = CLINIC，跨库；2026-09-17 实测踩坑）。
+    """
+    cols_by_table: dict[str, list[str]] = {}
+    schema = ""
+    for tb in (tg or {}).get("tables") or []:
+        name = str(tb.get("table") or tb.get("entity_name") or "").strip()
+        cols = []
+        for c in (tb.get("columns") or []):
+            nm = c.get("name") if isinstance(c, dict) else str(c or "")
+            if nm:
+                cols.append(str(nm))
+        if name and cols:
+            cols_by_table[name] = cols
+            schema = schema or str(tb.get("schema") or "")
+    return cols_by_table, schema
+
+
+def _target_dsn(target_config: dict | None) -> str:
+    """DB 目标 DSN：目标归一契约里的 dsn 优先，其次按 jdbc_url 的**命名空间**推导，
+    最后才回落历史兜底 `localTarget`（= USER）。
+
+    演示默认口径（2026-09-16）：SQL 源 = `USER`、SQL 目标 = `CLINIC` —— 目标登记的
+    `jdbc:IRIS://…/CLINIC` 必须真正决定写入库；DB 目标 SQLOp 曾硬编码 `localTarget`，
+    导致转换结果被静默写进 USER（而非目标声明的 CLINIC）。
+    """
+    cfg = target_config or {}
+    dsn = str(cfg.get("dsn") or "").strip()
+    if dsn and not dsn.startswith("jdbc:"):
+        return dsn
+    from backend.services import jdbc_dsn
+    # dsn 被误填成 jdbc url 时也按它推导（不再直接退 localTarget）
+    url = cfg.get("jdbc_url") or (dsn if dsn.lower().startswith("jdbc:iris:") else "")
+    return jdbc_dsn.namespace_of(url) or "localTarget"
+
+
 def _save_pipeline_topology(pipeline):
-    """保存 Agent B 输出的管道拓扑到 ^demo.Config。"""
+    """保存 Agent B 输出的管道拓扑到 ^demo.Config（并写共享术语 BO 的服务器地址，见下）。"""
     import iris
     conn = iris_connector.get_connection()
     try:
         native = iris.createIRIS(conn)
         native.set(json.dumps(pipeline, ensure_ascii=False), "^demo.Config", "pipeline", "topology")
+        # 共享术语 BO（demo.TerminologyOperation）的服务器地址：本次拓扑里有它才写
+        # （与 backend 的 TERMSRV_BASE 同源 → 演示/运维改术语服务器不用改类；写完的缺省值
+        #   与 BO 内置缺省一致，故不写也能跑）。
+        if any("TerminologyOperation" in str((c or {}).get("className") or "")
+               for c in (pipeline or {}).get("components") or []):
+            from backend.services import term_catalog
+            from urllib.parse import urlsplit
+            parsed = urlsplit(term_catalog.base_url() if "://" in term_catalog.base_url()
+                              else "http://" + term_catalog.base_url())
+            if parsed.hostname:
+                native.set(json.dumps({"host": parsed.hostname,
+                                       "port": int(parsed.port or 52773)},
+                                      ensure_ascii=False),
+                           "^demo.Config", "termsrv")
     finally:
         iris_connector.reset_connections()
 
 
-def _save_fhir_runtime_config(topology: dict | None, target_config: dict | None = None) -> None:
+def _save_fhir_runtime_config(topology: dict | None, target_config: dict | None = None,
+                              mappings: list[dict] | None = None,
+                              source_id: str | None = None) -> None:
     """把 FHIR 目标 HTTP Operation 的投递名 / 基础路径 / 凭据写入 ^demo.Config。
 
     TransformProcess 的 FHIR 分支据此构造 REST PUT（GenericOperation 消息契约）。非决策，仅参数化。
+
+    2026-09-19：额外把**本管道的组装事实**合并进各资源的 schema（`fhir_schema_facts`）：
+    每列的「是否编码列 / 源体系 / 体系来自源行哪列」——引擎据此写 coding，**不再自行猜测**
+    （原先硬编码取源行 `CodeSystem` → 把整行共享的药品体系误挂到 route/type，且国标码 reasonCode 无体系）。
     """
     if not topology:
         return
@@ -69,31 +129,73 @@ def _save_fhir_runtime_config(topology: dict | None, target_config: dict | None 
         native.set((target_config or {}).get("password") or "SYS",
                    "^demo.Config", "fhir", "password")
         # 已建模资源组装 schema（path/system/type），供 TransformProcess 通用打包器读取
+        # 2026-09-19：合并**本管道的事实**（源编码体系 / 是否编码列 / 体系来源列）。
+        # ⚠ 按**每条映射自己的 source_id** 建事实索引：一次生成常含多个数据源的组，
+        #   只用一个 source_id 会让别组映射拿错源的事实（实测缺陷）。
+        from backend.services import fhir_schema_facts as _fsf
+        _sids = {str(m.get("source_id") or source_id or "").strip() for m in (mappings or [])
+                 if isinstance(m, dict)}
+        _sids.discard("")
+        _terms_by_src = {sid: _fsf.source_field_terms(sid) for sid in _sids}
         for _rt in _ftm.DEFAULT_RESOURCE_TYPES:
             _schema = _ftm.model_schema(_rt)
-            if _schema:
-                native.set(json.dumps(_schema, ensure_ascii=False),
-                           "^demo.Config", "fhir", "schema", _rt)
+            if not _schema:
+                continue
+            if _terms_by_src:
+                _facts = _fsf.column_facts(_rt, mappings, _terms_by_src,
+                                           default_source_id=source_id)
+                _schema = _fsf.apply_facts(_schema, _facts)
+            native.set(json.dumps(_schema, ensure_ascii=False),
+                       "^demo.Config", "fhir", "schema", _rt)
     finally:
         iris_connector.reset_connections()
 
 
-def _get_table_columns(table: str) -> list[str]:
-    """查询目标表列名（information_schema，按 ordinal_position 排序）。"""
-    rows = iris_connector.query(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema='SQLUser' AND table_name=? ORDER BY ordinal_position",
-        [table])
-    return [r[0] for r in rows]
+def _get_table_columns(table: str, target_config: dict | None = None) -> list[str]:
+    """DB 目标表列名（**按目标自身的库/命名空间取**：登记事实 → 目标命名空间 → 当前命名空间兜底）。
+
+    ⚠ 原实现固定查当前命名空间（USER）的 information_schema：演示默认目标是 CLINIC（跨库），
+    USER 里的同名表列不同 → 目标多出的列（如 CLINIC.Patient.MRN）被**静默丢弃**（映射了也写不进去）、
+    目标独有列被漏掉（2026-09-17 Round 2 实测）。解析逻辑见 services/db_target_columns。
+    """
+    from backend.services import db_target_columns
+    return db_target_columns.columns_of(table, target_config)
+
+
+def _merge_fhir_target_config(cfg: dict, tg: dict) -> dict:
+    """把 FHIR 目标的连接契约（base_url / 凭据）并入 target_config（参数归一，非决策）。
+
+    FHIR 目标组件 = `EnsLib.HTTP.GenericOperation`：Adapter 需要 HTTPServer/HTTPPort
+    （由 base_url 解析），请求的 method/URL 头由发送方（BP）按 `^demo.Config("fhir",*)` 构造。
+    单/多管道路径都必须走这一步 —— 缺了它 HTTPServer 为空，运行期报
+    `Unable to open TCP/IP socket to server :52773`（2026-09-16 实测：FHIR 组消息全 Error、
+    目标 0 落地；该症状此前被「FHIR 目标资源组装失败」掩盖，修好组装后才暴露）。
+    """
+    tconn = tg.get("connection") or {}
+    trt = (tg.get("runtime") or {}).get("connection") or {}
+    base = (cfg.get("base_url") or trt.get("base_url") or tconn.get("base_url")
+            or trt.get("endpoint") or tconn.get("endpoint") or "")
+    if base:
+        cfg["base_url"] = base
+        cfg.setdefault("endpoint", base)
+    for k in ("username", "password"):
+        v = cfg.get(k) or trt.get(k) or tconn.get(k)
+        if v:
+            cfg[k] = v
+    return cfg
 
 
 def _fhir_http_host_port(base_url: str | None) -> tuple[str, str]:
     """从 FHIR 目标 base_url（如 http://iris:52773/csp/.../r4）解析 HTTPServer/HTTPPort。
 
     只做参数归一（非决策）；URL 路径前缀与 method/body 由发送方在消息里携带。
+    base_url 缺失 → 主机名返回空并**显式告警**（生成前的 check_connection 门禁会先拦下来；
+    若绕过门禁，运行期会以此空主机报 socket 错误，不会静默写到别的服务器）。
     """
     base = (base_url or "").strip().rstrip("/")
     if not base:
+        logger.warning("FHIR/HTTP 目标的 base_url 为空：HTTPServer 无法确定"
+                       "（应由 _merge_fhir_target_config 从目标登记并入）")
         return "", "52773"
     head = base.split("://", 1)[1] if "://" in base else base
     host_port = head.split("/", 1)[0]
@@ -174,15 +276,131 @@ def _sql_source_meta(mappings: list[dict], source_id: str | None) -> dict:
     return _resolve_sql_source_tables(mappings, source_id)[1]
 
 
-def _save_sql2fhir_layout(layout: dict) -> None:
-    """把 sql2fhir 布局 JSON 写入 ^demo.Config("sql2fhir","layout")（Agent 生成的 BP 运行时读取）。"""
+def _save_sql2fhir_layout(layout: dict, bp_name: str | None = None) -> None:
+    """把 sql2fhir 布局 JSON 写到 IRIS（Agent 生成的 BP 运行时读取）。
+
+    - `bp_name` 给出时写**实例级**键 `^demo.Config("sql2fhir","layout",<BP名>)`（多管道隔离：每个
+      sql2fhir 组各有一个聚合 BP 实例，布局必须跟着实例走，否则两条管道互相串线）；
+    - 同时写全局键 `^demo.Config("sql2fhir","layout")` 作为**历史兼容兜底**（单管道口径、
+      以及未升级的既有 BP 类仍读它）。
+    """
     import iris
     conn = iris_connector.get_connection()
     try:
         native = iris.createIRIS(conn)
-        native.set(json.dumps(layout, ensure_ascii=False), "^demo.Config", "sql2fhir", "layout")
+        payload = json.dumps(layout, ensure_ascii=False)
+        native.set(payload, "^demo.Config", "sql2fhir", "layout")
+        if bp_name:
+            native.set(payload, "^demo.Config", "sql2fhir", "layout", str(bp_name))
+            logger.info("sql2fhir 布局已按实例写入: ^demo.Config(\"sql2fhir\",\"layout\",%s)", bp_name)
     finally:
         iris_connector.reset_connections()
+
+
+
+def _bp_plan_mode_on() -> bool:
+    """BP 是否走"非整类"路径（engine / plan）——此时 Agent B 只出拓扑。"""
+    import os
+    return os.getenv("BP_GEN_MODE", "engine").strip().lower() in ("engine", "plan")
+
+
+def _bp_plan_mode_for(source_type: str, target_type: str) -> bool:
+    """SQL→FHIR（= sql2fhir-patient-tx，唯一需要聚合 BP 的组合）**只让 Agent B 出拓扑**。
+
+    BP 由平台渲染（engine 模式，调父类通用引擎）或计划链逐方法生成；其余组合的 BP 都由平台类
+    （`demo.TransformProcess`）承担，不涉及整类生成，无需切换。
+    """
+    return (_bp_plan_mode_on()
+            and str(source_type).upper() == "SQL" and str(target_type).upper() == "FHIR")
+
+
+def _ensure_sql2fhir_bp_by_plan(*, layout: dict, mappings: list[dict], components: list[dict],
+                                design_skill: str = "sql2fhir-patient-tx",
+                                facts: dict | None = None) -> tuple[bool, str, dict]:
+    """**Plan → Execute** 链：计划（小输出）→ 逐方法生成（每步编译/单测，可断点续跑）。
+
+    返回 (ok, message, meta)；meta 含 bp_mode/plan_methods/unit 汇总，供响应回显（可审计）。
+    失败**显式**返回 False（是否允许回退整类由调用方按开关决定，见 `_ensure_sql2fhir_bp_dispatch`）。
+    """
+    from backend.services import bp_planner as _planner
+    from backend.services import generated_bp as _gbp
+    from backend.services import bp_method_tests as _bt
+    bp_class = _gbp.BP_CLASS_NAME
+    try:
+        plan = _planner.build_plan(
+            bp_class=bp_class, parent_api=set(_gbp.PARENT_API), layout=layout,
+            mappings=mappings, components=components, design_skill=design_skill,
+            facts=facts or {})
+    except llm_client.AgentError as exc:
+        return False, f"BP 计划阶段 AI 失败: {exc}", {"bp_mode": "plan", "stage": "plan"}
+    _planner.ensure_progress_scope(bp_class, plan)   # 计划未变 → 保留进度（**断点续跑**）；变了才清空
+    res = _gbp.generate_from_plan(plan=plan, layout=layout, mappings=mappings,
+                                  components=components, parent_api=set(_gbp.PARENT_API),
+                                  facts=facts or {}, bp_class=bp_class)
+    meta = {"bp_mode": "plan", "plan_methods": [m.get("name") for m in (plan.get("methods") or [])],
+            "plan_summary": str(plan.get("summary") or "")[:200],
+            "bp_methods": res.get("methods") or {}, "resumed": res.get("resumed") or []}
+    meta.update({k: v for k, v in _bt.units_summary(res.get("methods") or {}).items()})
+    if res.get("ok"):
+        logger.info("Plan 链 BP 生成成功：%s（方法 %s；单测 通过 %s / 跳过 %s）",
+                    res.get("message"), meta["plan_methods"],
+                    meta.get("unit_passed"), meta.get("unit_skipped"))
+        return True, str(res.get("message") or ""), meta
+    logger.warning("Plan 链 BP 生成失败：%s", str(res.get("message"))[:300])
+    return False, str(res.get("message") or ""), meta
+
+
+def _ensure_sql2fhir_bp_dispatch(p_result, mappings, source_type: str, target_type: str,
+                                 available, source_runtime, target_runtime,
+                                 *, layout: dict | None = None,
+                                 components: list[dict] | None = None,
+                                 design_skill: str = "sql2fhir-patient-tx",
+                                 facts: dict | None = None) -> tuple[bool, str, dict]:
+    """BP 生成入口（单/多管道共用）：默认走 **Plan 链**；整类生成为**显式**回退开关。
+
+    开关（环境变量）：
+      · `BP_GEN_MODE` = engine（默认，平台渲染薄 BP 调父类引擎）| plan（AI 计划+逐方法生成）| full（旧：整类生成）
+      · `BP_ALLOW_FULL_FALLBACK` = 1 时允许显式回退链 engine → plan → full（每级都标注 bp_mode）
+    """
+    import os
+    mode = os.getenv("BP_GEN_MODE", "engine").strip().lower()
+    fallback_ok = os.getenv("BP_ALLOW_FULL_FALLBACK", "0") == "1"
+    if mode == "full" or not layout:
+        ok, msg = _ensure_sql2fhir_bp(p_result, mappings, source_type, target_type,
+                                      available, source_runtime, target_runtime)
+        return ok, msg, {"bp_mode": "full"}
+    if mode == "engine":
+        from backend.services import generated_bp as _gbp
+        issues = _gbp.engine_supported(layout)
+        if not issues:
+            src = _gbp.render_engine_bp(_gbp.BP_CLASS_NAME)
+            comp = _gbp._write_and_compile(_gbp.BP_CLASS_NAME, src)
+            if comp.get("ok"):
+                _gbp.save_last_good(src)
+                logger.info("薄适配 BP 渲染+编译通过（engine 模式：聚合机制在父类 ProcessFHIRBundle）")
+                return True, "engine: 平台渲染薄 BP（聚合机制在父类）", {
+                    "bp_mode": "engine", "bp_engine": "demo.TransformProcess.ProcessFHIRBundle",
+                    "bp_source_len": len(src)}
+            logger.warning("薄适配 BP 编译失败（engine 模式）→ %s", str(comp.get("message"))[:200])
+            if not fallback_ok:
+                return False, f"engine 模式薄 BP 编译失败（未开启回退）: {comp.get('message')}", \
+                    {"bp_mode": "engine"}
+        else:
+            logger.info("布局超出引擎能力（%s）→ 转 Plan 链", "；".join(issues[:3]))
+            if not fallback_ok and mode == "engine":
+                mode = "plan"          # 能力边界：直接走 Plan 链（AI 生成定制 BP），不算"回退"
+    ok, msg, meta = _ensure_sql2fhir_bp_by_plan(
+        layout=layout, mappings=mappings, components=components or [],
+        design_skill=design_skill, facts=facts)
+    if ok or not fallback_ok:
+        return ok, msg, meta
+    logger.warning("Plan 链失败 → 按 BP_ALLOW_FULL_FALLBACK=1 回退整类生成（显式标注）: %s",
+                   str(msg)[:200])
+    ok2, msg2 = _ensure_sql2fhir_bp(p_result, mappings, source_type, target_type,
+                                    available, source_runtime, target_runtime)
+    meta2 = dict(meta)
+    meta2.update({"bp_mode": "full_fallback", "bp_mode_reason": str(msg)[:200]})
+    return ok2, msg2, meta2
 
 
 def _ensure_sql2fhir_bp(p_result, mappings, source_type: str, target_type: str,
@@ -274,7 +492,11 @@ def _scope_source_context(runtime: dict | None, models: list[dict] | None,
 
 
 def _c1_assets(source_id: str | None) -> list[dict]:
-    """C1 转换验证的源资产输入（name + fields），供 LLM 补齐必填映射时选 source 列。"""
+    """C1 转换验证的源资产输入（name + fields + **field_terms 事实**）。
+
+    field_terms 来自接口分析 AI 的产出（`coded_value` / `display_name` / `term_uri` / `plain`）：
+    C1 的「明文落 coding」检查（`_coded_text_issues`）与术语体系事实链都依赖它 —— 缺了就 fail-open。
+    """
     assets: list[dict] = []
     try:
         assets = repository.list_source_assets(source_id) if source_id else []
@@ -288,16 +510,40 @@ def _c1_assets(source_id: str | None) -> list[dict]:
     out = []
     for a in assets:
         cols = a.get("fields") or (a.get("structure") or {}).get("columns") or []
-        out.append({"name": a.get("name") or a.get("id") or "",
-                    "fields": [c.get("name") if isinstance(c, dict) else str(c) for c in cols]})
+        item = {"name": a.get("name") or a.get("id") or "",
+                "fields": [c.get("name") if isinstance(c, dict) else str(c) for c in cols]}
+        if isinstance(a.get("field_terms"), dict) and a.get("field_terms"):
+            item["field_terms"] = a["field_terms"]
+        if a.get("source_id") or source_id:
+            item["source_id"] = a.get("source_id") or source_id
+        out.append(item)
+    # 常量指令/体系事实需要知道"列是否编码列" → 登记缺失 field_terms 时用 DataAsset 兜底补一次
+    if out and not any(isinstance(x.get("field_terms"), dict) for x in out):
+        try:
+            by_name = {str((b.get("name") or "")).lower(): b
+                       for b in (repository.list_assets(source_id) or []) if isinstance(b, dict)}
+            for x in out:
+                hit = by_name.get(str(x.get("name") or "").lower())
+                if hit and isinstance(hit.get("field_terms"), dict) and hit["field_terms"]:
+                    x["field_terms"] = hit["field_terms"]
+        except Exception:  # noqa: BLE001 - 事实补齐失败即 fail-open
+            pass
     return out
 
 
 def _c1_target_models(mappings: list[dict]) -> list[dict]:
-    """C1 的 FHIR 目标模型输入（列结构），避免 L1 把它当 SQL 表列误剔除映射。"""
+    """C1 的 FHIR 目标模型输入（列结构），避免 L1 把它当 SQL 表列误剔除映射。
+
+    ⚠ **只对声明为 FHIR（或未声明类型）的映射注入**：`Patient` 既是 DB 表名又是 FHIR 资源名，
+    对 DB/SOAP 映射也注入 FHIR 模型会让 `_get_table_columns("Patient")` 命中 FHIR 列清单
+    （DB 映射的 9 个真实列被判"不存在"→ L1 静默剔除 → LLM 按 FHIR 列改写，实测毁掉 DB 映射）。
+    """
     from backend.services import fhir_target_model as _ftm
     res: list[str] = []
     for m in mappings or []:
+        tt = str(m.get("target_type") or "").strip().upper()
+        if tt and tt != "FHIR":
+            continue
         rt = str(m.get("target_table") or "").strip().lower()
         for k in _ftm.US_CORE_RESOURCE_MODELS:
             if k.lower() == rt and k not in res:
@@ -394,7 +640,7 @@ def build_pipeline_topology(mappings: list[dict], source_type: str = "FHIR",
                 table = m.get("target_table", "")
                 if not table:
                     continue
-                cols = _get_table_columns(table)
+                cols = _get_table_columns(table, target_config)
                 if not cols:
                     logger.warning("目标表 %s 列结构为空，跳过 SQLOp", table)
                     continue
@@ -406,7 +652,7 @@ def build_pipeline_topology(mappings: list[dict], source_type: str = "FHIR",
                     "type": "SQLOperation", "name": f"SQLOp_{table}",
                     "className": c["className"], "comment": f"写入目标表 {table}",
                     "settings": [
-                        _s("Adapter", "DSN", "localTarget"),
+                        _s("Adapter", "DSN", _target_dsn(target_config)),
                         _s("Adapter", "JGService", "EnsLib.JavaGateway.Service"),
                         _s("Host", "Query", query),
                         _s("Host", "InputParameters", params),
@@ -462,6 +708,14 @@ def build_pipeline_topology(mappings: list[dict], source_type: str = "FHIR",
     for c in type_registry.get_common_components():
         if c["type"] == "JavaGateway":
             components.append(_from_template(c, c["className"]))
+
+    # 4b. 共享术语 BO（仅当本次映射含 term_map 决策）：术语转换能力的唯一出口，
+    #     与 JavaGateway 同级（category=shared、不参与许可调度、不被按类别让路停用）。
+    if _needs_terminology(mappings):
+        _term_comp = _terminology_component()
+        if _term_comp:
+            components.append(_term_comp)
+            logger.info("本次映射含 term_map 决策 → 追加共享术语 BO %s", _term_comp.get("name"))
 
     # 5. 按 Agent B 建议的 type 顺序排序（未出现的排在后；sort 稳定保持原序）
     if suggested_types:
@@ -550,7 +804,7 @@ def _build_from_ai_components(mappings: list[dict], *, source_type: str, target_
                     if _m.get("target_table"):
                         tbl = _m["target_table"]
                         break
-            cols = _get_table_columns(tbl) if tbl else []
+            cols = _get_table_columns(tbl, cfg_tgt) if tbl else []
             if not cols:
                 logger.warning("目标表 %s 列结构为空，跳过 SQLOp（Agent B 表选择不可用）", tbl)
                 return None
@@ -560,7 +814,7 @@ def _build_from_ai_components(mappings: list[dict], *, source_type: str, target_
                 "type": "SQLOperation", "name": name or f"SQLOp_{tbl}",
                 "className": tpl["className"], "comment": f"写入目标表 {tbl}",
                 "settings": [
-                    _s("Adapter", "DSN", "localTarget"),
+                    _s("Adapter", "DSN", _target_dsn(cfg_tgt)),
                     _s("Adapter", "JGService", "EnsLib.JavaGateway.Service"),
                     _s("Host", "Query",
                        f"INSERT OR UPDATE INTO {tbl} ({col_sql}) VALUES ({q_marks})"),
@@ -646,6 +900,15 @@ def _build_from_ai_components(mappings: list[dict], *, source_type: str, target_
         for tpl in type_registry.get_target_components(target_type):
             add_if_missing(tpl["type"])
     add_if_missing("JavaGateway")
+    # 共享术语 BO：本次映射含 term_map 决策时挂上（术语转换能力的唯一出口；
+    # 平台按需追加、不进 AI 可选枚举 —— 与 JavaGateway 同级的基础设施）
+    if _needs_terminology(mappings) and not any(
+            c["type"] == "TerminologyOperation" for c in components):
+        _term_comp = _terminology_component()
+        if _term_comp:
+            components.append(_term_comp)
+            supplemented.append("TerminologyOperation")
+            logger.info("本次映射含 term_map 决策 → 追加共享术语 BO %s", _term_comp.get("name"))
 
     topology = {"production": "demo.DataflowProduction", "components": components}
     if supplemented:
@@ -688,6 +951,440 @@ def _common_component(template: dict) -> dict:
     }
 
 
+def _setting_value(comp: dict, name: str) -> str:
+    """取组件某个 setting 的值（任意 Target：Adapter/Host）。"""
+    for st in (comp.get("settings") or []):
+        if str(st.get("name")) == name:
+            return str(st.get("value") or "")
+    return ""
+
+
+_INTO_RE = re.compile(r"\bINTO\s+([^\s(]+)", re.IGNORECASE)
+
+
+def _dispatch_targets(comps: list[dict], rename: dict[str, str] | None = None,
+                      target_config: dict | None = None) -> tuple[dict, str]:
+    """本组「转换 BP → 目标 BO」的**显式主机名**（必须按实例名，不能靠按约定拼名）。
+
+    背景（2026-09-17 实测缺陷 A6）：多管道并存时目标 BO 会按管道实例改名
+    （`SQLOp_PatientSource` → `SQLOp_PatientSource__sql2db`），而 `demo.TransformProcess` 原按约定
+    拼名（`SQLOp_{表}` / `SOAPOp_{服务}`）→ 指向不存在的主机 → `ErrBusinessDispatchNameNotRegistered`、
+    目标零落地而消息状态看似正常（静默失败）。故生成端把实际主机名写进 BP 自己的配置：
+    `bp[<BP名>] = {..., items:{<表|服务>: <主机名>}, item:<单一主机名>}`。
+
+    返回 `(items, single)`：
+    - `items`：键与 BP 查表口径一致（DB=目标表名、SOAP=服务名，取自**改名前**名 `SQLOp_{表}` /
+      `SOAPOp_{服务}`；DB 名不合约定时从 Query 文本 `INTO <表>` 解析）→ 值 = 最终主机名；
+    - `single`：本组 Operation 主机名（FHIR 目标用；多目标组取首个作为兜底）。
+    查询 BO（`SELECT ...`，如 sql2fhir 的子表查询 BO）不是路由 BP 的派发目标，不进 items。
+    """
+    rename = rename or {}
+    items: dict[str, str] = {}
+    single = ""
+    for c in comps or []:
+        ctype = str(c.get("type") or "")
+        old = str(c.get("name") or ctype)
+        final = rename.get(old, old)
+        if ctype == "SQLOperation":
+            key = old[len("SQLOp_"):] if old.startswith("SQLOp_") else ""
+            if not key:
+                m = _INTO_RE.search(_setting_value(c, "Query"))
+                key = m.group(1).strip().strip('"') if m else ""
+            if not key:
+                continue                      # 查询 BO（SELECT）不是路由 BP 的派发目标
+            items[key] = final
+            single = single or final
+        elif ctype == "SOAPOperation":
+            key = old[len("SOAPOp_"):] if old.startswith("SOAPOp_") else ""
+            if not key:
+                key = str((target_config or {}).get("service") or "")
+            if key:
+                items[key] = final
+            single = single or final
+        elif ctype == "HTTPOperation":
+            single = single or final
+    return items, single
+
+
+def _assert_dispatch_targets(groups: list[dict], components: list[dict]) -> None:
+    """生成前自检：转换 BP 的**显式派发目标**必须真实存在于本拓扑（防"改名后引用悬空"）。
+
+    2026-09-17 实测：组件按管道实例改名后 BP 仍按约定拼名 → 派发到不存在的主机，
+    消息看似正常（BS→BP 那跳 Completed）、目标零落地、错误只在 Ens_Util.Log 里
+    （`ErrBusinessDispatchNameNotRegistered`）。此处把"引用悬空"提前到生成期显式失败。
+    """
+    names = {str(c.get("name")) for c in (components or []) if c.get("name")}
+    missing: list[str] = []
+    for g in groups or []:
+        cands = list((g.get("_bp_items") or {}).values())
+        if g.get("_bp_item"):
+            cands.append(g["_bp_item"])
+        for item in cands:
+            if item and item not in names:
+                missing.append("%s→%s" % (g.get("_category") or "?", item))
+    if missing:
+        raise ValueError("转换 BP 派发目标不存在（组件改名后引用悬空）: " + "; ".join(missing))
+
+
+def _config_subs(native, *path: str) -> list[str]:
+    """枚举 `^demo.Config(<path...>)` 的下一级下标（Native SDK nextSubscript，顺序确定）。
+
+    `path` 为空时枚举一级下标；多级（如 `"sql2fhir","layout"`）用于实例级布局键。
+    """
+    prefix = '^demo.Config(%s)' % ",".join('"%s"' % p for p in path)
+    subs, s = [], native.nextSubscript(False, prefix, "")
+    while s:
+        subs.append(str(s))
+        s = native.nextSubscript(False, prefix, s)
+    return subs
+
+
+# `^demo.Config("bp")` 里**非管道参数**的键（Agent BP 源码存档，由 generated_bp.save_last_good
+# 写入，用于回滚/审计）→ 收敛清理必须保护，不可当"死配置"删掉。
+_BP_CONFIG_PROTECTED = ("last_good", "last_good_at")
+
+
+def prune_stale_bp_config(keep_bps: set[str], keep_srcs: set[str],
+                          dry_run: bool = False) -> dict:
+    """生成成功后收敛清理 `^demo.Config` 里**陈旧键**（无对应组件 = 死配置）。
+
+    覆盖三类：
+      - `bp[<BP名>]`                      → 键必须是当前 Production 里的组件名（否则没有读者）；
+      - `bp_target[<源BS>]`               → 键必须是组件名，值必须指向存在的组件（否则悬空派发）；
+      - `sql2fhir.layout[<聚合BP名>]`     → 键必须是组件名（该 BP 自己就是读者）。
+
+    背景：单次生成会**整份替换** Production（`PipelineGenerator.GenerateProduction`）→ 本次生成
+    之后的正确登记集合就是本次渲染出的 BP / 源 BS，其余键指向的组件已不存在、没有任何读者。
+    原实现"只写不清"：Skill 自带聚合 BP 的组（sql2fhir）没有 TransformProcess 主机，却仍登记
+    `bp[TransformProcess__sql2fhir_*]` 与 `bp_target[源BS]`（实测 4 条残留）—— 诊断工具据此误读
+    「登记数 ≠ 组件数 = 生成不完整」，且悬空 `bp_target` 一旦被读到就是 A6 式静默派发失败。
+
+    保护（fail-open，宁可少删）：
+      - `last_good` / `last_good_at`（源码存档，非管道参数）；
+      - `keep_bps` / `keep_srcs`（本次生成渲染出的 BP / 源 BS）；
+      - **当前组件清单里仍存在**的同名主机（生成失败/部分渲染时绝不误删）。
+
+    参数:
+        keep_bps: 本次生成的转换 BP 主机名集合。
+        keep_srcs: 本次生成的源 BS 主机名集合。
+        dry_run: True 时**只报告不删除**（供手动清理工具 `--check`/体检使用）。
+
+    返回:
+        {"removed": {"bp": [...], "bp_target": [{"key","value"}...], "layout": [...]},
+         "skipped": <原因，可选>}
+    """
+    removed: dict = {"bp": [], "bp_target": [], "layout": []}
+    protected = set(_BP_CONFIG_PROTECTED)
+    try:
+        raw = iris_connector.class_method_value("demo.PipelineQuery", "GetItems") or "[]"
+        comps = {str((i or {}).get("name") or "") for i in (json.loads(raw) or [])}
+    except Exception as exc:  # noqa: BLE001 - 读不到事实就不动配置（fail-open）
+        logger.warning("配置收敛：组件清单不可读，跳过清理（%s）", exc)
+        return {"removed": removed, "skipped": "组件清单不可读: %s" % exc}
+
+    import iris
+    conn = iris_connector.get_connection()
+    try:
+        native = iris.createIRIS(conn)
+        for key in _config_subs(native, "bp"):
+            if key in protected or key in keep_bps or key in comps:
+                continue
+            if not dry_run:
+                native.kill("^demo.Config", "bp", key)
+            removed["bp"].append(key)
+        for key in _config_subs(native, "bp_target"):
+            val = str(native.get("^demo.Config", "bp_target", key) or "")
+            if key in keep_srcs or (key in comps and val in comps):
+                continue
+            if not dry_run:
+                native.kill("^demo.Config", "bp_target", key)
+            removed["bp_target"].append({"key": key, "value": val})
+        # 实例级布局 `^demo.Config("sql2fhir","layout",<聚合BP名>)`：读者是**该 BP 自己**
+        # （运行期 `..%ConfigName` 查自己那份）→ 组件不在位 = 无读者，与 bp 同属死配置。
+        # ⚠ 只清**带下标的实例键**，不动全局兜底键 `^demo.Config("sql2fhir","layout")`（历史兼容路径仍在读）。
+        for key in _config_subs(native, "sql2fhir", "layout"):
+            if key in keep_bps or key in comps:
+                continue
+            if not dry_run:
+                native.kill("^demo.Config", "sql2fhir", "layout", key)
+            removed["layout"].append(key)
+    except Exception as exc:  # noqa: BLE001 - 收敛失败不阻断生成（已生成事实不变）
+        logger.warning("配置收敛失败（不影响本次生成）: %s", exc)
+        return {"removed": removed, "error": str(exc)}
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - 关闭失败可忽略
+            pass
+    if removed["bp"] or removed["bp_target"] or removed["layout"]:
+        logger.warning("配置收敛：%s陈旧登记 %s（对应组件已不存在 → 无读者）",
+                       "检出（未删除，dry_run）" if dry_run else "清理",
+                       json.dumps(removed, ensure_ascii=False))
+    return {"removed": removed, "dry_run": bool(dry_run)}
+
+
+def _unkeyed_operations(comps: list[dict]) -> list[str]:
+    """本组中「解析不出派发键」的 DB/SOAP Operation 组件名（生成期必须为空）。
+
+    路由 BP 对 DB/SOAP 目标按**键**（目标表名 / 服务名）查派发表；键取不到就只能按约定拼名，
+    而多管道改名后该拼名并不存在 → 运行期红消息 + 目标零落地（缺陷 A6 的静默面）。
+    故生成期显式拦下：要么组件名 `SQLOp_{表}` / `SOAPOp_{服务}`，要么 Query 文本含 `INTO {表}`。
+    """
+    bad: list[str] = []
+    for c in comps or []:
+        ctype = str(c.get("type") or "")
+        old = str(c.get("name") or ctype)
+        if ctype == "SQLOperation":
+            if old.startswith("SQLOp_"):
+                continue
+            if _INTO_RE.search(_setting_value(c, "Query")):
+                continue
+            if "SELECT" in _setting_value(c, "Query").upper():
+                continue                       # 查询 BO（SELECT）：不是路由 BP 的派发目标
+            bad.append(old)
+        elif ctype == "SOAPOperation" and not old.startswith("SOAPOp_"):
+            bad.append(old)
+        elif ctype not in ("SQLOperation", "SOAPOperation", "HTTPOperation", "TransformProcess",
+                           "SQLService", "FHIRService", "PatientTxProcess", "JavaGateway"):
+            if ctype.endswith("Operation"):
+                bad.append(old)
+    return bad
+
+
+def _configs_for_identity(source_id: str | None, target_id: str | None) -> tuple[dict, dict]:
+    """按业务身份从**登记事实**重建源/目标配置（供"未提交的既有管道自动并入"使用）。
+
+    与新鲜路径同口径：源侧取 runtime connection；目标侧 DB 取 dsn/jdbc_url/列清单、
+    FHIR 取 base_url/凭据、SOAP 取 service/endpoint。缺登记 → 返回空 dict（调用方容错）。
+    """
+    src_cfg: dict = {}
+    tgt_cfg: dict = {}
+    try:
+        ds = repository.get_datasource(source_id) if source_id else None
+    except Exception:  # noqa: BLE001 - 登记缺失不阻断（复用组通常不需要源配置）
+        ds = None
+    try:
+        tg = repository.get_target(target_id) if target_id else None
+    except Exception:  # noqa: BLE001
+        tg = None
+    if ds:
+        rt = (repository.datasource_runtime(ds) or {}).get("connection") or {}
+        src_cfg = {k: (rt.get(k) or ds.get(k) or "") for k in
+                   ("endpoint", "host", "port", "jdbc_url", "dsn", "username", "password")}
+    if tg:
+        tt = (tg.get("type") or "").upper()
+        rt = (repository.target_runtime(tg) or {}).get("connection") or {}
+        if tt == "DB":
+            from backend.services import jdbc_dsn as _jdsn
+            _tc, _sch = _registered_table_columns(tg)
+            tgt_cfg = {"jdbc_url": rt.get("jdbc_url") or "", "dsn": rt.get("dsn") or _jdsn.dsn_name_for_target(tg),
+                       "driver_class": rt.get("driver_class") or "", "table_columns": _tc,
+                       "schema": _sch or "SQLUser"}
+        elif tt == "FHIR":
+            tgt_cfg = _merge_fhir_target_config({}, tg)
+        elif tt == "SOAP":
+            tgt_cfg = {"service": (tg.get("config") or {}).get("service") or "default",
+                       "endpoint": rt.get("endpoint") or Config.MOCK_SOAP_URL}
+    return src_cfg, tgt_cfg
+
+
+def _auto_join_existing_pipelines(submitted: list[dict],
+                                  submitted_ids: set[str]) -> list[dict]:
+    """**把未提交的既有管道按存储定义并入本次生成**（增量生成的关键保障）。
+
+    单一 Production 架构下，一次生成会**整份替换**渲染源（`^demo.Config("pipeline","topology")`
+    → 重写整个 `demo.DataflowProduction`）；若只提交"新增/变更组"，未提交的既有管道会从
+    Production 里**消失**（历史行为：单管道生成 = 替换整份）。故这里把它们的**已存组件定义**
+    自动并入：
+
+    · 输入签名与存储一致 → 标 `_unchanged`（复用组件、跳过 Agent B/C1，运行态按 P2 保留）；
+    · 签名不一致（映射被改过）→ 作为"变更组"参与本次生成（自愈，不静默用旧组件）；
+    · `superseded`（组件已被取代/映射已不存在）→ **不并入**（避免复活幽灵管道）。
+    """
+    out: list[dict] = []
+    try:
+        recs = pipeline_instances.list_instances()
+        all_maps = repository.list_mappings()
+    except Exception as exc:  # noqa: BLE001 - 读不到既有管道 → 退化为"本次提交即全集"
+        logger.warning("增量生成：读取既有管道失败（跳过自动并入）: %s", exc)
+        return out
+    for rec in recs:
+        pid = str(rec.get("id") or "")
+        if pid in submitted_ids or rec.get("status") == "superseded":
+            continue
+        comps = rec.get("ai_components") or []
+        if not comps:
+            continue
+        ids = {str(x) for x in (rec.get("mapping_ids") or [])}
+        maps = [m for m in all_maps if str(m.get("id")) in ids]
+        if not maps:
+            logger.warning("增量生成：既有管道 %s 的映射已不存在 → 不并入（需重新匹配后生成）", pid)
+            continue
+        src_cfg, tgt_cfg = _configs_for_identity(rec.get("source_id"), rec.get("target_id"))
+        g = {"source_type": rec.get("source_type") or "", "target_type": rec.get("target_type") or "",
+             "source_id": rec.get("source_id"), "target_id": rec.get("target_id"),
+             "source_config": src_cfg, "target_config": tgt_cfg, "mappings": maps,
+             "design_skill": rec.get("design_skill"), "ai_components": comps,
+             "_sql2fhir": bool(rec.get("is_sql2fhir")), "_auto_joined": True}
+        if rec.get("layout"):
+            g["_layout"] = rec.get("layout")
+        try:
+            g["_rt_src"] = repository.datasource_runtime(repository.get_datasource(rec.get("source_id")))
+            g["_rt_tgt"] = repository.target_runtime(repository.get_target(rec.get("target_id")))
+        except Exception:  # noqa: BLE001
+            g["_rt_src"], g["_rt_tgt"] = None, None
+        g["_sig_in"] = _inc_input_signature(g)
+        # 冻结定义（复用渲染用：参数完整 + 改名前名字）
+        g["_frozen_components"] = _frozen_defs_from_instance(rec)
+        g["_frozen_infra"] = [dict(c) for c in comps
+                              if isinstance(c, dict) and _is_infra_component(c)]
+        _ok_def, _why = _stored_definition_complete(
+            _frozen_defs_from_instance(rec), rec.get("target_type"))
+        if str(rec.get("signature") or "") == g["_sig_in"] and _ok_def:
+            g["_unchanged"] = True
+        elif not _ok_def:
+            logger.warning("增量生成：管道 %s 的存储定义不完整（%s）→ 本次按**变更组**重新生成"
+                           "（重建完整组件定义 = 自愈）", pid, _why)
+        else:
+            logger.info("增量生成：既有管道 %s 的输入已变 → 本次按**变更组**重新生成", pid)
+        out.append(g)
+    if out:
+        logger.info("增量生成：未提交的既有管道自动并入 %d 条（其中复用 %d 条）：%s",
+                    len(out), sum(1 for x in out if x.get("_unchanged")),
+                    [x.get("source_id") + "→" + str(x.get("target_id")) for x in out])
+    return out
+
+
+# 目标侧业务主机（BO）前缀：存储定义里**必须**有它，否则这条管道的转换结果无处投递
+_BO_PREFIX = {"DB": ("SQLOp_",), "SOAP": ("SOAPOp_",), "FHIR": ("HTTPOp_", "HTTPOperation")}
+
+
+def _frozen_defs_from_instance(rec: dict) -> list[dict]:
+    """从实例记录取**可渲染的冻结定义**（渲染成功参数 + **改名前**名字）。
+
+    优先 `render_components`（新字段，参数与名字都对）；历史实例退 `components`（渲染后名）→
+    把 `__{类别}` 后缀剥掉还原为改名前形态，避免复用渲染时出现二次后缀。
+    """
+    cat = str(rec.get("category") or "")
+    suf = "__" + pipeline_instances.slug(cat) if pipeline_instances.slug(cat) else ""
+    out: list[dict] = []
+    for c in (rec.get("render_components") or rec.get("components") or []):
+        if not isinstance(c, dict):
+            continue
+        nm = str(c.get("name") or "")
+        if suf and nm.endswith(suf):
+            nm = nm[:-len(suf)]
+        out.append({**c, "name": nm})
+    return out
+
+
+def _stored_definition_complete(components: list[dict] | None,
+                                target_type: str | None) -> tuple[bool, str]:
+    """**存储定义完整性**守卫：能不能拿这份定义去复用（不重跑 Agent B）？
+
+    为什么必须查（2026-09-20 实测）：某条历史实例的存储定义只有「源 BS + 转换 BP」，
+    **缺目标 BO**（`SOAPOp_*`）——直接复用会把不完整管道渲染进 Production
+    （源能收到数据、转换结果无处投递，运行期才发现，属静默缺陷）。凡不完整 → 不算"未变更"，
+    交回正常生成链路（重新问 Agent B / Skill 重建完整定义 = 自愈）。
+    """
+    names = [str(c.get("name") or "") for c in (components or []) if isinstance(c, dict)]
+    if not names:
+        return False, "存储定义为空"
+    # 可渲染性（2026-09-20 加）：**缺 className 的组件不可渲染** —— 若曾把"Agent 原始组件"
+    # （无 className/settings）误存进定义，沿用它会渲染出不合规拓扑（拓扑校验会 500）。
+    for c in (components or []):
+        if not isinstance(c, dict):
+            continue
+        if not str(c.get("className") or "").strip():
+            return False, "组件 %s 缺 className（不可渲染）" % (c.get("name") or c.get("type") or "?")
+    prefs = _BO_PREFIX.get(str(target_type or "").upper())
+    if not prefs:
+        return True, ""
+    if not any(n.startswith(prefs) for n in names):
+        return False, "存储定义缺目标业务主机（%s）" % "/".join(prefs)
+    return True, ""
+
+
+def _write_mapping_patch(m: dict) -> None:
+    """把**映射修正结果**写回 `^demo.Mapping` —— 以**库存记录为底合并**（按 id 取库存）。
+
+    为什么必须合并写（2026-09-19 P0）：C1/L2 或 LLM 产出的映射 dict 可能**缺字段**
+    （最典型是 `source_id` 数据源维度）→ 整条覆盖会把已登记信息静默抹掉 → 之后
+    `save_mappings` 判定身份不同 → **每次生成派生重复映射**（实测 `M714233` → `_2` → `_3`…）。
+    合并写保证「修正的是内容，不动身份与其它登记字段」。
+    """
+    if not isinstance(m, dict) or not m.get("id"):
+        return
+    mid = str(m["id"])
+    cur = repository.get_json("^demo.Mapping", mid) or {}
+    merged = {**cur, **m}
+    merged["id"] = mid
+    repository.set_json("^demo.Mapping", mid, merged)
+
+
+def _group_identity(g: dict) -> tuple[str, str]:
+    """组的**业务身份** = (源数据源 id, 目标 id)（P0a：与 LLM 选择的 skill 无关）。"""
+    return (str(g.get("source_id") or "").strip(), str(g.get("target_id") or "").strip())
+
+
+def _dedup_groups_by_identity(groups: list[dict]) -> tuple[list[dict], list[dict]]:
+    """按业务身份 `(source_id, target_id)` 合并重复组（P0a：同管道两次提交 → 只生成一次）。
+
+    合并规则：映射按 id 并集去重；其余取先到者的配置（同身份的正常情况下配置一致）。
+    返回 (去重后的组, 被合并掉的组摘要)。
+    """
+    out: list[dict] = []
+    index: dict[tuple[str, str], dict] = {}
+    merged: list[dict] = []
+    for g in groups or []:
+        key = _group_identity(g)
+        prev = index.get(key)
+        if prev is None:
+            index[key] = g
+            out.append(g)
+            continue
+        seen = {str((m or {}).get("id")) for m in (prev.get("mappings") or []) if isinstance(m, dict)}
+        added = []
+        for m in (g.get("mappings") or []):
+            if isinstance(m, dict) and str(m.get("id")) not in seen:
+                prev.setdefault("mappings", []).append(m)
+                added.append(str(m.get("id")))
+        merged.append({"identity": list(key), "merged_mapping_ids": added,
+                       "kept_mapping_ids": [str((m or {}).get("id")) for m in (prev.get("mappings") or [])]})
+        logger.warning("增量生成：检测到同身份重复组（源=%s 目标=%s）→ 合并为一条管道（并入映射 %s）",
+                       key[0], key[1], added or "无新增")
+    return out, merged
+
+
+def _inc_input_signature(g: dict) -> str:
+    """组的入参签名（生成前可算）：身份 + 类型 + 映射内容 + 源/目标运行契约关键位。"""
+    _rt_src = g.get("_rt_src") or {}
+    _rt_tgt = g.get("_rt_tgt") or {}
+    _conn_s = (_rt_src.get("connection") or {}) if isinstance(_rt_src, dict) else {}
+    _conn_t = (_rt_tgt.get("connection") or {}) if isinstance(_rt_tgt, dict) else {}
+    return pipeline_instances.input_signature(
+        g.get("source_id"), g.get("target_id"), g.get("mappings"),
+        g.get("source_type") or "", g.get("target_type") or "",
+        extra={
+            "src": {k: str(_conn_s.get(k) or "") for k in ("dsn", "jdbc_url", "endpoint", "type")},
+            "tgt": {k: str(_conn_t.get(k) or "") for k in ("dsn", "jdbc_url", "base_url", "endpoint")},
+        })
+
+
+def _running_items() -> dict[str, dict]:
+    """当前 Production 组件（名字 → 记录，含 enabled/category）——供增量复用与运行态保留。"""
+    try:
+        return {str(i.get("name")): i for i in (pipeline_validator.production_items() or [])}
+    except Exception as exc:  # noqa: BLE001 - 读取失败按"拿不到"处理（不阻断生成）
+        logger.warning("读取 Production 组件失败（增量判定退化为全量生成）: %s", exc)
+        return {}
+
+
+def _group_components(g: dict) -> list[dict]:
+    """组的**预改名**组件定义（AI/executor 产出，含基础设施）——增量注入与存量校验共用。"""
+    return [dict(c) for c in (g.get("ai_components") or []) if isinstance(c, dict)]
+
+
 def build_multi_pipeline_topology(pipelines: list[dict]) -> dict:
     """按「多管道组」构建合并拓扑（单 Production 内每管道一套 BS/BP/BO + 共享基础设施）。
 
@@ -721,23 +1418,54 @@ def build_multi_pipeline_topology(pipelines: list[dict]) -> dict:
         不再当共享件剔除。supplemented = 本组 Agent B 遗漏后**注册表保底补齐**的组件类型
         （红线审计：必须按组可区分，不能与 AI 决策混在一起）。
         """
-        topo = build_pipeline_topology(
-            g.get("mappings") or [],
-            source_type=g.get("source_type") or "FHIR",
-            target_type=g.get("target_type") or "DB",
-            suggested_types=g.get("suggested_types"),
-            source_config=g.get("source_config") or {},
-            target_config=g.get("target_config") or {},
-            ai_components=g.get("ai_components"),
-            bp_name=bp_name)
         if g.get("_sql2fhir"):
             # sql2fhir 组：拓扑由 Skill executor 按布局生成（含 Agent 编译的 BP），直接采用
             topo = {"production": "demo.DataflowProduction",
                     "components": g.get("ai_components") or []}
+        elif g.get("_unchanged") and (g.get("_frozen_components") or []):
+            # —— 增量复用（P1）：渲染**冻结定义**（上一轮渲染成功的参数 + 改名前名字）——
+            # 直通 Agent 原始 `ai_components`（无 className/settings）会被拓扑校验拒（500）；
+            # 走注册表参数化链路又会丢目标 BO（实测 2026-09-20）。冻结定义两头都对。
+            # ⚠ **必须把源 BS 的投递目标改写成"本次"的 BP 名**：同类别多管道并存时本组的 BP 会被
+            #   重命名为 `…__{类别}_{k}`，而冻结定义里记的是上一轮的名字（可能属于**另一条**管道）
+            #   → 消息投给别的（可能停用的）BP → 永久 `Queued`（实测 2026-09-20：S2 的源 BS 指向
+            #   `TransformProcess__sql2soap`（S3 组的、已停用），而自己那台叫 `..._2`）。
+            _frozen = [dict(c) for c in g["_frozen_components"]]
+            for _c in _frozen:
+                _sts = _c.get("settings")
+                if not isinstance(_sts, list):
+                    continue
+                for _s in _sts:
+                    if str(_s.get("name")) == "TargetConfigNames" and bp_name:
+                        _s["value"] = bp_name
+            topo = {"production": "demo.DataflowProduction",
+                    "components": _frozen + [dict(c) for c in (g.get("_frozen_infra") or [])]}
+        else:
+            topo = build_pipeline_topology(
+                g.get("mappings") or [],
+                source_type=g.get("source_type") or "FHIR",
+                target_type=g.get("target_type") or "DB",
+                suggested_types=g.get("suggested_types"),
+                source_config=g.get("source_config") or {},
+                target_config=g.get("target_config") or {},
+                ai_components=g.get("ai_components"),
+                bp_name=bp_name)
         raw = topo.get("components") or []
         needs_router = any(str(c.get("type") or "") == "TransformProcess" for c in raw)
         supplemented = [str(x) for x in (topo.get("ai_supplemented") or [])]
+        # 组内拓扑携带的基础设施（JavaGateway / FHIRSyncService 等）**不属于任何一条管道**：
+        # 从本组组件里剔除，但必须收集起来由外层**全局追加一次**——否则会整个从 Production 消失
+        # （2026-09-16 实测缺陷：修 J 把 FHIRSyncService 归为 infra 后忘了追加，
+        #   结果源侧「拉取+入队」生产者不存在 → 所有 FHIR 管道零消息、校验全 FAIL）。
+        for c in raw:
+            if not _is_infra_component(c):
+                continue
+            if not any(str(c.get("name")) == str(x.get("name")) for x in infra_seen):
+                infra_seen.append(c)
         return [c for c in raw if not _is_infra_component(c)], needs_router, supplemented
+
+    # 基础设施收集桶（见 _group_components 内注释）：跨管道共享、全局仅 1 个实例
+    infra_seen: list[dict] = []
 
     categories = [str(g.get("_category") or pipeline_instances.category_of(
         g.get("design_skill"), g.get("source_type"), g.get("target_type")))
@@ -754,40 +1482,108 @@ def build_multi_pipeline_topology(pipelines: list[dict]) -> dict:
     for g, part in zip(pipelines, group_parts):
         if part[2]:
             g["_ai_supplemented"] = part[2]
-    # 统计源 BS 重名（同名源 BS 出现在多组 = 冲突：按管道类别改名，消除"名字漂移"与互相顶掉）
+    # 组件名**跨组冲突 → 按管道实例改名**（`{原名}__{类别}`，同类别多组再 `_k`）：
+    # ⚠ 不止源 BS —— Skill 自带的聚合 BP 及其 BO（`SqlFhirPatientTxProcess` / `HTTPOperation` /
+    #   `SQLQueryOp_*`）同样必须"一管道一实例"：3 源并存时两个 sql2fhir 组会共用同一个 BP 实例，
+    #   而该 BP 的布局取自**实例级**配置（`^demo.Config("sql2fhir","layout",<BP名>)`）→ 两条管道串线
+    #   （2026-09-17 实测：S2 的 USER 源行被按 S3 的 CLINIC 布局组装）。
+    #   改名同时改写组内引用（源 BS 的 TargetConfigNames 指向本组 BP）。
     name_counts: dict[str, int] = {}
     for comps in group_comps:
         for c in comps:
-            if str(c.get("type") or "") in ("SQLService", "FHIRService"):
-                _n = str(c.get("name") or "")
-                name_counts[_n] = name_counts.get(_n, 0) + 1
+            _n = str(c.get("name") or c.get("type") or "")
+            name_counts[_n] = name_counts.get(_n, 0) + 1
 
     components: list[dict] = []
     used_names: set[str] = set()
     for gi, (comps, cat) in enumerate(zip(group_comps, categories)):
         src_names: list[str] = []
+        own_names: list[str] = []
+        agg_bp = ""
+        slug = pipeline_instances.slug(cat) or "pipeline"
+        # 先算本组的改名映射（一次性决定，避免组内引用与宿主名不一致）
+        rename: dict[str, str] = {}
+        for c in comps:
+            nm = str(c.get("name") or c.get("type") or "")
+            if name_counts.get(nm, 0) <= 1 or nm in rename:
+                continue
+            base = f"{nm}__{slug}"
+            new_nm, k = base, 2
+            while new_nm in used_names or new_nm in rename.values():
+                new_nm = f"{base}_{k}"
+                k += 1
+            rename[nm] = new_nm
+        # 派发目标（**改名前的名**参与推导，值取最终名）：转换 BP 不再靠按约定拼名，
+        # 保证"组件改名后引用不悬空"（缺陷 A6）。
+        _bp_items, _bp_item = _dispatch_targets(
+            comps, rename, pipelines[gi].get("target_config"))
+        # 本组走通用路由时，DB/SOAP 目标的**派发键必须可解析**（否则 BP 会按不存在的拼名派发）
+        if group_parts[gi][1]:
+            _bad = _unkeyed_operations(comps)
+            if _bad:
+                raise ValueError(
+                    "管道 %s 的 DB/SOAP 目标无法确定派发键（组件名既非 SQLOp_{表}/SOAPOp_{服务}，"
+                    "Query 也没有 INTO {表}）: %s —— 路由 BP 会按不存在的拼名派发（目标零落地）"
+                    % (cat, "、".join(_bad)))
         for c in comps:
             ctype = str(c.get("type") or "")
             nm = str(c.get("name") or ctype)
-            if ctype in ("SQLService", "FHIRService") and name_counts.get(nm, 0) > 1:
-                base = f"{nm}__{pipeline_instances.slug(cat)}"
-                new_nm, k = base, 2
-                while new_nm in used_names:
-                    new_nm = f"{base}_{k}"
-                    k += 1
-                logger.info("源组件同名跨管道 → 按管道类别命名: %s -> %s", nm, new_nm)
+            if nm in rename:
+                new_nm = rename[nm]
+                logger.info("组件名跨管道冲突 → 按管道实例命名: %s -> %s", nm, new_nm)
                 c["name"] = new_nm
                 nm = new_nm
+                for st in (c.get("settings") or []):
+                    if str(st.get("name")) == "TargetConfigNames" and st.get("value"):
+                        st["value"] = ",".join(
+                            rename.get(str(p).strip(), str(p).strip())
+                            for p in str(st["value"]).split(","))
             c["category"] = cat
             used_names.add(nm)
+            own_names.append(nm)
             if ctype in ("SQLService", "FHIRService"):
                 src_names.append(nm)
+            elif ctype == "PatientTxProcess":
+                agg_bp = nm
             components.append(c)
+        # 本组**专属组件名**（供管道实体精确归属：同类别多组时不能按 category 取，否则
+        # 两条同类别管道会共用一份组件清单 → 一键切换会连带启停另一条，2026-09-17 实测）
+        pipelines[gi]["_own_names"] = own_names
         # 该组实际源 BS 名（供路由表 ^demo.Config("pipe", <BS名>) 使用，必须与拓扑一致）
         if src_names:
             pipelines[gi]["_src_bn"] = src_names[0]
-        # 本组专属转换 BP 名（供 ^demo.Config("bp", <BP名>) 写转换参数）
-        pipelines[gi]["_bp_name"] = bp_names[gi]
+        # 本组专属转换 BP 名：**仅当本组真的有 TransformProcess 主机时**才登记
+        # （group_parts[gi][1] = needs_router）。Skill 自带聚合 BP 的组（sql2fhir-patient-tx）
+        # 拓扑里没有该主机 → 原实现无条件登记 `bp[TransformProcess__sql2fhir_*]` +
+        # `bp_target[源BS]` 却没有任何读者（死配置，2026-09-17 实测残留 4 条）。
+        # ⚠ 这里必须 gate：`_bp_name` 同时是生成端「写 bp[<名>]」与生成后「收敛清理」的
+        #   **keep 名单** —— 登记了不存在的名字，清理器会把死键当有效键保留下来。
+        pipelines[gi]["_has_router"] = bool(group_parts[gi][1])
+        if pipelines[gi]["_has_router"]:
+            pipelines[gi]["_bp_name"] = bp_names[gi]
+        # 派发目标（items / item）：**始终登记**（与"写不写 global"是两件事）——它是
+        # 「生成期悬空自检 `_assert_dispatch_targets`」与「布局 http_bo 兜底」的输入；
+        # sql2fhir 组没有路由 BP，但其 FHIR 派发名仍必须落进实例级布局 `layout.http_bo`。
+        pipelines[gi]["_bp_items"] = _bp_items
+        if _bp_item:
+            pipelines[gi]["_bp_item"] = _bp_item
+        # sql2fhir 组：布局里的**派发名**同步改成最终（改名后）组件名——聚合 BP 运行时按
+        # `layout.query_bos[].bo_name` / `layout.http_bo` 派发，布局与组件名必须一致
+        # （否则同样是"引用悬空"，且只在运行期以红消息暴露）。
+        _lay = pipelines[gi].get("_layout")
+        if isinstance(_lay, dict):
+            for _b in (_lay.get("query_bos") or []):
+                _old_bo = str((_b or {}).get("bo_name") or "")
+                if _old_bo in rename:
+                    _b["bo_name"] = rename[_old_bo]
+            _hb = str(_lay.get("http_bo") or "")
+            if _hb in rename:
+                _lay["http_bo"] = rename[_hb]
+            elif not _hb and _bp_item:
+                _lay["http_bo"] = _bp_item
+        # 本组聚合 BP 名（sql2fhir Skill 组；供按实例写布局 ^demo.Config("sql2fhir","layout",<BP名>)）
+        if agg_bp:
+            pipelines[gi]["_agg_bp_name"] = agg_bp
     components = _dedupe_components(components)
     # 基础设施（真正跨管道共享，各 1 个）：JavaGateway（JDBC 网关）；
     # 转换 BP 不再共享——每组在自己的拓扑里各有一个专属实例（见 _bp_name_for）。
@@ -796,19 +1592,34 @@ def build_multi_pipeline_topology(pipelines: list[dict]) -> dict:
             comp = _common_component(t)
             comp["category"] = "shared"
             components.append(comp)
+    # 共享术语 BO（术语转换能力的唯一出口）：本次任何一组含 term_map 决策就全局挂 1 个实例
+    # （category=shared → 不参与许可调度、不被按类别让路停用；各管道的 BP 共用它取判码）。
+    _all_mappings = [m for g in pipelines for m in (g.get("mappings") or [])]
+    if _needs_terminology(_all_mappings):
+        _term_comp = _terminology_component()
+        if _term_comp:
+            components.append(_term_comp)
+            logger.info("本次含 term_map 决策 → 追加共享术语 BO %s", _term_comp.get("name"))
+    # 组内拓扑自带的基础设施（如 FHIR 源的 FHIRSyncService 生产者）：**全局追加一次**，
+    # 归 shared（不参与许可调度、不被按类别让路停用，修 J 语义）。
+    for comp in infra_seen:
+        comp["category"] = "shared"
+        components.append(comp)
+    components = _dedupe_components(components)
     if not need_router:
         logger.info("本次拓扑无组走通用路由 → 不生成转换 BP（无需该组件，省 1 个许可单元）")
+    # 生成期自检：派发目标必须真实存在（改名后引用悬空 → 运行期红消息 + 目标零落地，静默）
+    _assert_dispatch_targets(pipelines, components)
     return {"production": "demo.DataflowProduction",
             "categories": categories, "components": components}
 
 
 
 def _active_items_from_topology(topology: dict) -> list[str]:
-    """本次管道要启用的业务主机名（许可预算用；JavaGateway 等基础设施由 IRIS 侧保留）。"""
+    """本次管道要启用的业务主机名（许可预算用；基础设施组件由 IRIS 侧保留）。"""
     names: list[str] = []
     for c in (topology or {}).get("components", []) or []:
-        cls = str((c or {}).get("className") or "")
-        if "JavaGateway" in cls:
+        if _is_infra_component(c):
             continue
         n = str((c or {}).get("name") or "").strip()
         if n and n not in names:
@@ -816,16 +1627,55 @@ def _active_items_from_topology(topology: dict) -> list[str]:
     return names
 
 
+def _needs_terminology(mappings: list[dict] | None) -> bool:
+    """本次映射里是否存在术语转换决策（`transform=term_map:<skill>`）→ 是否要挂共享术语 BO。
+
+    判据与 C1/运行期同源（都读 field_mappings[].transform），避免"AI 决策了术语转换、
+    但运行期没有可用的术语能力"这种静默缺口。
+    """
+    for m in mappings or []:
+        for fm in (m or {}).get("field_mappings") or []:
+            if str((fm or {}).get("transform") or "").startswith("term_map:"):
+                return True
+    return False
+
+
+def _terminology_component() -> dict | None:
+    """共享术语 BO 组件（`demo.TerminologyOperation`，全局 1 实例，category 由 _stamp/追加处置 shared）。"""
+    tpl = next((c for c in type_registry.get_common_components()
+                if c.get("type") == "TerminologyOperation"), None)
+    if not tpl:
+        return None
+    comp = _common_component(tpl)
+    comp["category"] = "shared"
+    return comp
+
+
 def _is_infra_component(comp: dict) -> bool:
-    """基础设施组件判定（真正跨管道共享、全局仅 1 个实例）：仅 JavaGateway（JDBC 网关）。
+    """基础设施组件判定（真正跨管道共享、全局仅 1 个实例）：JavaGateway（JDBC 网关）
+    + **FHIRSyncService（FHIR 源增量拉取/入队生产者）**
+    + **TerminologyOperation（术语转换共享 BO，2026-09-18 起）**。
 
     注意：转换 BP（TransformProcess）**不是**共享组件——Ens 的业务主机身份 = Item 名
     （className 可复用），每条数据管道各有一个专属 BP 实例（如 TransformProcess__sql2soap），
     随其管道一起启停/让路，不再靠 `shared` 豁免（否则停管道时许可不放）。
+
+    FHIRSyncService 归属（2026-09-16 修 J，实测缺陷）：它把 FHIR **源**的新资源按
+    「全部 mapping」写入全局 FHIRQueue（每个组各自的源 BS 再按 `^demo.Config("bs_mappings")`
+    只消费自己那份），因此**一条 Production 里只需要一个实例**。原先它被算进"第一个用到它的组"
+    （实测 category=fhir2db）→ 用「一键切换」启用另一条 FHIR 管道（fhir2fhir）时，
+    fhir2db 整类让路把**生产者一起停用** → 新启用的组拿不到任何输入（消息一条都不来，静默失败）。
+    故与 JavaGateway 同级：category=shared、不参与许可调度、不被按类别让路停用。
+
+    TerminologyOperation 归属（2026-09-18）：术语转换能力做成**共享 BO**（任何管道的 BP 都
+    经它取判码，运行期不再有本地码表副本）→ 同样全局 1 实例、category=shared、
+    不参与许可调度、不被按类别让路停用（否则切换管道会把术语能力一起停掉 → 运行期静默缺第二 coding）。
     """
     ttype = str((comp or {}).get("type") or "")
     cls = str((comp or {}).get("className") or "")
-    return ttype == "JavaGateway" or "JavaGateway" in cls
+    return (ttype == "JavaGateway" or "JavaGateway" in cls
+            or ttype == "FHIRSyncService" or "FHIRSyncService" in cls
+            or ttype == "TerminologyOperation" or "TerminologyOperation" in cls)
 
 
 def _is_shared_component(comp: dict) -> bool:
@@ -891,6 +1741,38 @@ def _mark_suspended_components(topology: dict, plan: dict) -> list[str]:
     return marked
 
 
+def _converge_component_enabled(topology: dict, plan: dict, unchanged_cats: set,
+                                suspended_cats: set) -> list:
+    """按**许可调度结论**收敛每个组件的 `enabled`（**保证组内一致**）。
+
+    规则（2026-09-20 两次实测缺陷后固化）：
+      ① 被调度停用的组（`plan["suspended"]`）→ **该组所有组件一律停用**：不允许残留半启用的
+         BO/BP 白占许可（曾出现 `SQLService_*`=0 而 `TransformProcess`/`SOAPOp_*`=1）；
+      ② 未变更（复用）且**其实例本就是 suspended**（= 用户此前的选择）→ 保持停用（不因本次调度复活）；
+      ③ 其余 → **遵循调度结论**（调度说启用就启用）。
+    ⚠ 不再"按逐组件历史快照回填"：历史快照可能是上一轮失败/半渲染的残留（实测把调度判定应启用的
+      组又按快照停掉 → 两组全停）。
+    返回被改动的项（供日志审计）。
+    """
+    susp = {str(c) for c in (plan.get("suspended") or [])}
+    changed: list = []
+    for c in (topology.get("components") or []):
+        if not isinstance(c, dict):
+            continue
+        cat = str(c.get("category") or "")
+        if cat in susp:
+            if bool(c.get("enabled", True)):
+                changed.append("%s→停用(调度)" % c.get("name"))
+            c["enabled"] = False
+            continue
+        if cat in unchanged_cats and cat in suspended_cats:
+            if bool(c.get("enabled", True)):
+                changed.append("%s→停用(用户此前停用)" % c.get("name"))
+            c["enabled"] = False
+    return changed
+
+
+
 def _license_plan(topology: dict) -> dict:
     """本拓扑的许可容量调度计划（超容量的分组停用而非失败，见 schedule_groups）。"""
     return pipeline_validator.schedule_groups(_topology_groups(topology))
@@ -924,49 +1806,113 @@ def _all_pipeline_source_bs_names() -> list[str]:
     return names
 
 
-def _refresh_term_cache(mappings: list[dict] | None, topology: dict | None,
-                        validation: dict | None) -> dict:
-    """刷新判码缓存（`term_map` 运行期执行的前提）并把结果**显式**带回生成响应。
+def _term_catalog_brief(gate: dict) -> dict:
+    """术语门禁/目录摘要（生成响应与前端展示用）。"""
+    gate = gate or {}
+    return {"jobs": gate.get("jobs") or [], "pairs": gate.get("pairs") or [],
+            "covered": int(gate.get("covered") or 0),
+            "negative": int(gate.get("negative") or 0),
+            "missing": gate.get("missing") or [], "pending": gate.get("pending") or [],
+            "unresolved": gate.get("unresolved") or [],
+            "namespaces": gate.get("namespaces") or {}, "notes": gate.get("notes") or [],
+            "catalogOk": bool(gate.get("catalogOk")), "error": gate.get("error") or "",
+            "skipped": gate.get("skipped") or ""}
 
-    背景（实测 2026-09-14）：生成后刷新时许可已被 Ens 业务主机占满（6 业务主机 +
-    JavaGateway + 后端 = 8/8）→ `Unable to allocate a license` → Agent A 的
-    `term_map:cn2snomed` 决策在运行期悄悄失效（FHIR Condition 只剩国标 ICD-10 coding、
-    缺 SNOMED 双 coding）。这里：① 用 `term_cache.build_term_cache_safe`（许可不足自动
-    临时暂停源 BS 腾单元，刷完恢复）；② 把「有 term_map 指令但缓存缺项」作为验证告警并入
-    validation（UI 可见）；③ 返回状态供响应与前端展示（AI 决策未落地 = 显式失败，不静默）。
 
-    返回 {"ok", "attempts", "paused_items", "restored_items", "error", "required", "missing", "note"}。
+def _term_precheck(mappings: list[dict] | None, *, pause_items: list[str] | None = None,
+                   strict: bool = False) -> dict:
+    """**术语映射生成期盘点**（术语服务器 = 唯一事实源；**只读，不写缓存**）。
+
+    行为（2026-09-18 口径，用户确认）：
+      ① 盘点：把映射里 `term_map:<skill>` 涉及的源表实际编码值送 `/mapping/availability` →
+         covered / negative / missing（**待办清单**）/ pending / unresolved；
+      ② **默认放行**：缺映射**不中止生成**（真实世界形态：数据先落地，术语缺口走"待办 + AI 补录"治理），
+         运行期由**共享 BO** 命中 `missing` 时默认降级（保留源编码 + `meta.tag=unmapped`，不静默）；
+      ③ **严格模式**（`strict=True`，请求体 `strict_terms=true`）：缺映射 → `ok=False`，调用方 400。
+
+    参数 ``pause_items`` 保留仅为调用方兼容（本函数已不再暂停组件：不写缓存就没有许可压力）。
+
+    返回 ``{"ok", "skipped", "strict", "gate", "todo", "message"}``：``skipped=True`` 表示本次没有任何
+    term_map 决策（完全不触发术语服务器，避免影响无关管道）。
     """
-    from backend.services import term_cache
+    from backend.services import term_precheck
 
-    pause_items = _source_bs_names(topology or {}) + _all_pipeline_source_bs_names()
-    report = term_cache.build_term_cache_safe(mappings or [], pause_items=pause_items)
-    missing = list(report.get("missing") or [])
-    required = int(report.get("required") or 0)
-    ok = bool(report.get("ok")) and not missing
-    if not ok:
-        msg = ("term_map 判码缓存未就绪：AI 的术语映射决策无法在运行期落地"
-               "（目标 FHIR 资源会缺目标系统 coding，如 Condition 缺 SNOMED 双 coding）")
-        if report.get("error"):
-            msg += f"；错误：{str(report['error'])[:200]}"
-        if missing:
-            msg += f"；缺 {len(missing)} 项（{', '.join(missing[:6])}）"
-        logger.error("判码缓存未就绪: %s", msg)
+    try:
+        gate = term_precheck.precheck(mappings or [])
+    except Exception as exc:  # noqa: BLE001 - 盘点异常也不阻断（默认口径）：显式告警 + 记账
+        logger.error("术语盘点异常（默认放行，运行期将降级）: %s", exc, exc_info=True)
+        return {"ok": not strict, "skipped": False, "strict": strict, "gate": {}, "todo": [],
+                "message": (f"术语盘点失败（术语服务器/IRIS 不可用？）: {exc}"
+                            if strict else
+                            f"术语盘点失败（默认放行，运行期按降级处理）: {exc}")}
+    if not (gate.get("jobs") or []):
+        return {"ok": True, "skipped": True, "strict": strict, "gate": gate, "todo": [],
+                "message": ""}
+    todo = list(gate.get("todo") or [])
+    if strict and not gate.get("ok"):
+        msg = term_precheck.gate_message(gate) or "术语预检未通过（严格模式）"
+        logger.error("术语严格预检未通过: %s", msg)
+        return {"ok": False, "skipped": False, "strict": True, "gate": gate, "todo": todo,
+                "message": msg}
+    msg = term_precheck.degrade_message(gate)
+    if msg:
+        logger.warning("术语盘点：%s", msg)
+    return {"ok": True, "skipped": False, "strict": strict, "gate": gate, "todo": todo,
+            "message": msg}
+
+
+def _term_summary(mappings: list[dict] | None, topology: dict | None,
+                  validation: dict | None) -> dict:
+    """生成后**复核术语覆盖**（只读盘点；不写缓存、不调 LLM、不阻断）。
+
+    运行期由**共享 BO** `demo.TerminologyOperation` 实时查术语服务器：
+    `active` → 追加目标体系 coding（双 coding）；`negative` → 不追加；**`missing`/`error` → 默认降级**
+    （保留源编码 + `meta.tag=unmapped`，不静默）。故这里只做**事实复核 + 待办清单 + 告警**：
+
+    - 缺映射（待办）→ 验证 warning（不判失败：真实世界形态就是"先落地、后补录"）；
+    - 源表此刻无编码值但确有 term_map 决策 → warning（提示"造数后即可自动生效"，无需重生成）。
+
+    返回 ``{"ok","jobs","todo","missing","covered","negative","gate","note"}``。
+    """
+    from backend.services import term_precheck
+
+    try:
+        gate = term_precheck.precheck(mappings or [])
+    except Exception as exc:  # noqa: BLE001 - 复核异常不阻断（生成已完成），显式告警
+        logger.warning("术语复核异常（不影响生成）: %s", exc)
+        return {"ok": False, "jobs": [], "todo": [], "missing": [], "covered": 0, "negative": 0,
+                "gate": {}, "error": str(exc)[:300],
+                "note": "术语复核异常；运行期由共享 BO 实时查询（缺映射会降级并打 meta.tag）"}
+
+    jobs = list(gate.get("jobs") or [])
+    if not jobs:
+        return {"ok": True, "jobs": [], "todo": [], "missing": [], "covered": 0, "negative": 0,
+                "gate": _term_catalog_brief(gate), "skipped": gate.get("skipped") or "",
+                "note": "本次无 term_map 决策（不触发术语能力）"}
+
+    todo = list(gate.get("todo") or [])
+    covered = int(gate.get("covered") or 0)
+    negative = int(gate.get("negative") or 0)
+    if todo:
+        msg = term_precheck.degrade_message(gate)
+        logger.warning("术语待办（不影响生成，运行期降级）: %s", msg or todo[:6])
         if isinstance(validation, dict):
             validation.setdefault("issues", []).append(
-                {"severity": "warning", "check": "term_map_cache", "message": msg})
-    return {"ok": ok, "attempts": report.get("attempts"),
-            "paused_items": report.get("paused_items") or [],
-            "restored_items": report.get("restored_items") or [],
-            "error": str(report.get("error") or ""), "required": required,
-            "cached": int(report.get("cached_total") or 0),
-            "negative": int(report.get("negative_total") or 0),
-            "new_cached": int(report.get("cached") or 0),
-            "new_negative": int(report.get("negative") or 0),
-            "missing": missing,
-            "note": ("term_map 决策的判码 Skill 缓存：cached/negative=缓存累计（cached=判出目标码，"
-                     "运行期追加双 coding；negative=Skill 判定池内无对应，不追加、非失败）；"
-                     "new_cached/new_negative=本次新判定；missing=尚未判定（会缺目标系统 coding）")}
+                {"severity": "warning", "check": "term_map_todo", "message": msg})
+    if covered == 0 and negative == 0:
+        msg = ("存在 term_map 术语映射决策，但源表现在没有编码值可盘点 → 造数后运行期由共享 BO "
+               "实时查询即生效（**无需重新生成**）")
+        logger.warning("术语盘点为空：%s", msg)
+        if isinstance(validation, dict):
+            validation.setdefault("issues", []).append(
+                {"severity": "warning", "check": "term_map_todo", "message": msg})
+    return {"ok": not todo, "jobs": jobs, "todo": todo, "missing": todo,
+            "covered": covered, "negative": negative,
+            "gate": _term_catalog_brief(gate),
+            "note": ("术语转换运行期由**共享 BO** demo.TerminologyOperation 实时查术语服务器："
+                     "active→追加目标体系 coding（双 coding）；negative→不追加（服务器判定无匹配）；"
+                     "missing/error→**默认降级**（保留源编码 + meta.tag=unmapped，不静默）；"
+                     "todo=服务器尚无该转换的源编码（补录：tools/term_map_build.py，补录后无需重生成）")}
 
 
 def _datasource_for_mappings(mappings: list[dict] | None, ds_type: str = "") -> dict | None:
@@ -982,7 +1928,28 @@ def _datasource_for_mappings(mappings: list[dict] | None, ds_type: str = "") -> 
     下游 `_resolve_sql_source_tables` 拿不到资产（columns/key_hint 皆空）→ sql2fhir 布局推导
     直接 500「患者主表未能判定」。现改为：取**末段**做候选（同时保留原始串），并与资产的
     `name` **和** `id` 双向、忽略大小写比对。
+
+    2026-09-17 修缺陷 A 的连带风险（3 源共存）：映射现在带 `source_id`（数据源维度）→
+    **优先采用声明的 source_id**（权威），因为 3 个源都有名为 `Patient` 的资产时，
+    按名字反查必然**歧义**（票数相同会静默选到第一个源 = 静默错源）。名字反查路径也加
+    **歧义守卫**：最高票并列时不再"猜一个"，而是返回 None 让下游显式报错（fail loud）。
     """
+    declared: list[str] = []
+    for m in mappings or []:
+        if isinstance(m, dict):
+            sid = str(m.get("source_id") or m.get("datasource_id") or "").strip()
+            if sid:
+                declared.append(sid)
+    if declared:
+        uniq = set(declared)
+        sid = max(uniq, key=declared.count)
+        if len(uniq) > 1:
+            logger.warning("同组映射声明了多个数据源 %s，按多数取 %s（请检查分组）", sorted(uniq), sid)
+        ds = repository.get_datasource(sid)
+        if ds and (not ds_type or (ds.get("type") or "") == ds_type):
+            return ds
+        logger.warning("映射声明的数据源 %s 不存在或类型不符（期望 %s），退回按源表名反查",
+                       sid, ds_type or "任意")
     cands: set[str] = set()
     for m in mappings or []:
         if not isinstance(m, dict):
@@ -997,7 +1964,7 @@ def _datasource_for_mappings(mappings: list[dict] | None, ds_type: str = "") -> 
                 cands.add(part.lower())
     if not cands:
         return None
-    best, hit_best = None, 0
+    hits: list[tuple[int, dict]] = []
     for ds in repository.list_datasources():
         if ds_type and (ds.get("type") or "") != ds_type:
             continue
@@ -1007,26 +1974,112 @@ def _datasource_for_mappings(mappings: list[dict] | None, ds_type: str = "") -> 
             keys.discard("")
             if keys & cands:
                 hit += 1
-        if hit > hit_best:
-            best, hit_best = ds, hit
-    return best
+        if hit > 0:
+            hits.append((hit, ds))
+    if not hits:
+        return None
+    best_hit = max(h for h, _ in hits)
+    winners = [d for h, d in hits if h == best_hit]
+    if len(winners) > 1:
+        # 多个数据源命中同名资产 → 无法判定归属；**不猜**（返回 None 由下游显式报错）
+        logger.warning("源表名 %s 在多个数据源都有同名资产（%s），无法判定归属；"
+                       "请在映射上带 source_id（数据源维度）", sorted(cands),
+                       [d.get("id") for d in winners])
+        return None
+    return winners[0]
+
+
+def _missing_patient_root_hint(mappings: list[dict] | None, group_source_id: str | None,
+                               target_type: str = "FHIR",
+                               entity: str = "Patient") -> str:
+    """「本组缺患者主表」时给出**可照做的提示**（只报登记事实，不做任何决策）。
+
+    背景（2026-09-19 实测）：两个数据源都有 `SQLUser.Patient`（USER 与 Clinic）时，一条
+    `Patient → Patient(FHIR)` 映射可能**属于另一个源**；平台按 `(源数据源, 目标)` 分组，
+    本组因此缺主表 → 报错只说"没有目标为 Patient 的源表"，用户不知道 Patient 其实在别处。
+    此处把"已存在的同类映射归属哪个源 / 本组源是谁"一并报出，并给出两条可照做的修法。
+    """
+    try:
+        gid = str(group_source_id or "").strip()
+        want = str(entity or "").strip().lower()
+        outs: list[str] = []
+        has_same = False          # 本组源下**已有**该实体映射 → 失败另有原因（如 key_hint），不出提示
+        for m in repository.list_mappings() or []:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("target_type") or "").upper() != str(target_type or "").upper():
+                continue
+            tgt = str(m.get("target_table") or "").split(".")[-1].strip().lower()
+            if tgt != want:
+                continue
+            sid = str(m.get("source_id") or "").strip()
+            if not sid:
+                # 2026-09-19：`source_id` 为空 = 同名资产跨源时平台**不猜**（留空 + 已回报 source_ambiguous）
+                # → 该映射按 (源,目标) 分组会掉进"无源"组，本组因此缺主表。必须显式告知。
+                outs.append("%s（映射 %s）**未声明数据源**（同名资产在多个源下存在时平台不猜）"
+                            % (m.get("source"), m.get("id")))
+            elif sid != gid:
+                outs.append("%s（映射 %s）归属数据源 %s" % (m.get("source"), m.get("id"), sid))
+            else:
+                has_same = True
+        if not outs:
+            if has_same:
+                return ""      # 本组源下已有该实体映射 → 报错原因不是"缺主表"，不产生噪声提示
+            # 完全没有任何该实体的映射（最常见：用户只匹配了子表）→ 直接给出可照做的做法
+            hint0 = ("。提示：本组（源 %s → %s %s）没有任何 `%s → %s(%s)` 映射 —— "
+                     "sql2fhir 以**患者为起始**，缺主表就无法推导布局。"
+                     "请在「AI 智能匹配」页同时勾选**本组源的该表**与目标的该资源，做一次匹配并确认"
+                     "（同名跨源时只勾本组源的资产）。" % (
+                         gid or "(未声明)", target_type, entity, entity, entity, target_type))
+            logger.info("sql2fhir 缺主表提示（无同类映射）：%s", hint0)
+            return hint0
+        hint = ("提示：登记里已有 `%s → %s(%s)` 映射 —— %s；而本组源是 %s。"
+                "请在本组源下对该表重新做一次 AI 智能匹配并确认（推荐；同名跨源时**只勾选本组源的资产**），"
+                "或把该映射的 source_id 修正为本组源。" % (
+                    entity, entity, target_type, "；".join(sorted(set(outs))[:4]),
+                    gid or "(未声明)"))
+        logger.info("sql2fhir 缺主表提示：%s", hint)
+        return "。" + hint
+    except Exception as exc:  # noqa: BLE001 - 提示构造失败不影响原始报错
+        logger.debug("缺主表提示构造失败: %s", exc)
+        return ""
 
 
 def _target_for_mappings(mappings: list[dict] | None, target_type: str = "") -> dict | None:
-    """按映射的目标表/实体名反查已登记目标（target_id 缺失/失效时的参数化兜底）。"""
+    """按映射的目标表/实体名反查已登记目标（target_id 缺失/失效时的参数化兜底）。
+
+    2026-09-17（缺陷 A 连带，3 目标共存）：`Patient` 同时是 DB 目标表与 FHIR 资源名 →
+    同实体名跨类型重名时"第一个命中"就会**静默选错目标**。现：调用方没给 `target_type` 时，
+    改用**映射自身声明的 target_type 多数票**（AI/登记产物，权威）做过滤；若仍匹配到多个
+    不同目标 → 记日志并放弃（返回 None，由下游显式报"目标无法判定"），不再猜。
+    """
     names = {str(m.get("target_table") or "").strip() for m in (mappings or [])
              if isinstance(m, dict)}
     names.discard("")
     if not names:
         return None
+    if not target_type:
+        declared = [str(m.get("target_type") or "").strip() for m in (mappings or [])
+                    if isinstance(m, dict) and str(m.get("target_type") or "").strip()]
+        if declared:
+            target_type = max(set(declared), key=declared.count)
+    matched: list[dict] = []
     for tg in repository.list_targets():
         if target_type and (tg.get("type") or "") != target_type:
             continue
         for tb in (tg.get("tables") or []):
             tb_name = str((tb or {}).get("table") or (tb or {}).get("entity_name") or "")
             if tb_name and tb_name in names:
-                return tg
-    return None
+                matched.append(tg)
+                break
+    if not matched:
+        return None
+    if len(matched) > 1:
+        logger.warning("目标实体名 %s 命中多个已登记目标（%s），无法判定归属；"
+                       "请在提交里带 target_id", sorted(names),
+                       [t.get("id") for t in matched])
+        return None
+    return matched[0]
 
 
 def _reset_ens_messages_for_generate() -> None:
@@ -1058,6 +2111,26 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
     返回 success data（result/validation）。
     """
     import iris
+
+    # —— 术语映射**盘点**（术语服务器 = 术语转换的唯一事实源；**默认放行**）——
+    # 位置：停 Production / 清消息历史**之前**（盘点只读，不改环境）。
+    # 2026-09-18 口径：缺映射**不再中止生成**（真实世界形态：数据先落地，术语缺口走待办 + 补录治理），
+    # 运行期由共享 BO 命中 missing 时默认降级（保留源编码 + meta.tag=unmapped，不静默）；
+    # 仅当显式 `strict_terms=true`（合规场景）才在缺映射时中止（TERM_MAP_INCOMPLETE）。
+    _strict = bool((request.get_json(silent=True) or {}).get("strict_terms"))
+    # 增量生成逃生开关：force=true 时**不**复用存量（强制全量重生成，用于手工改动组件后复位）
+    _force_regen = bool((request.get_json(silent=True) or {}).get("force"))
+    _tgate = _term_precheck([m for g in pipelines for m in (g.get("mappings") or [])],
+                            strict=_strict)
+    _term_todo = list(_tgate.get("todo") or [])
+    if not _tgate.get("ok"):
+        logger.error("多管道生成被术语**严格**预检中止: %s", _tgate.get("message"))
+        _brief = _term_catalog_brief(_tgate.get("gate") or {})
+        return {"result": "TERM_MAP_INCOMPLETE", "reason": "TERM_MAP_INCOMPLETE",
+                "message": _tgate.get("message") or "", "gate": _brief,
+                "validation": {"ok": False, "issues": [
+                    {"severity": "error", "check": "term_map_precheck",
+                     "message": _tgate.get("message") or "术语预检未通过（严格模式）"}]}}
 
     # 生成前先停 Production 并清消息历史（否则历史 Error 消息会让 smoke 校验误判本次失败）
     _reset_ens_messages_for_generate()
@@ -1150,6 +2223,23 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                     tgt_cfg.setdefault("packages", tconn.get("packages") or {})
                     tgt_cfg.setdefault("bo_class", tconn.get("bo_class") or tconn.get("boClass") or tg.get("bo_class") or "")
                     tgt_cfg.setdefault("endpoint", tconn.get("endpoint") or Config.MOCK_SOAP_URL)
+                elif (tg.get("type") or "").upper() == "FHIR":
+                    # FHIR 目标：并入 REST 端点（base_url → HTTPOp 的 HTTPServer/HTTPPort；
+                    # 路径前缀/凭据由 _save_fhir_runtime_config 写 ^demo.Config("fhir",*)）
+                    _merge_fhir_target_config(tgt_cfg, tg)
+                elif (tg.get("type") or "").upper() == "DB":
+                    # DB 目标：并入连接契约（jdbc_url → 命名空间 → DSN），演示默认目标库 = CLINIC
+                    # （SQL 源 = USER）；并确保该 DSN 真实存在（与单管道路径同口径）
+                    from backend.services import jdbc_dsn as _jdbc_dsn_t
+                    trt = (tg.get("runtime") or {}).get("connection") or {}
+                    tgt_cfg.setdefault("jdbc_url", trt.get("jdbc_url") or tconn.get("jdbc_url") or "")
+                    tgt_cfg.setdefault("dsn", trt.get("dsn") or _jdbc_dsn_t.dsn_name_for_target(tg))
+                    tgt_cfg.setdefault("driver_class", trt.get("driver_class") or tconn.get("driver_class") or "")
+                    # 列清单事实（注册时按目标 JDBC 元数据取得）：SQLOp UPSERT 必须按**目标库**列生成
+                    _tc, _sch = _registered_table_columns(tg)
+                    tgt_cfg.setdefault("table_columns", _tc)
+                    tgt_cfg.setdefault("schema", _sch or "SQLUser")
+                    _jdbc_dsn_t.register_for_target(tg)
             # SOAP 目标默认投递地址（未显式指定时指向 Python mock，与单管道路径一致）
             if tgt_type == "SOAP":
                 tgt_cfg.setdefault("service", tgt_cfg.get("service") or "default")
@@ -1160,8 +2250,14 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
             for _m in g.get("mappings") or []:
                 if not isinstance(_m, dict) or not _m.get("id"):
                     continue
+                _prev = str(_m.get("target_type") or "").upper()
+                if _prev and _prev != tgt_type:
+                    # 不再静默改写：映射声明的目标类型与本组目标类型不一致 → 显式告警，
+                    # 便于定位「UI 分组把同名实体归错目标」这类缺陷（如 DB.Patient vs FHIR.Patient）。
+                    logger.warning("映射 %s 声明 target_type=%s 与所属组 %s 不一致，按组类型改写",
+                                   _m.get("id"), _prev, tgt_type)
                 _m["target_type"] = tgt_type
-                repository.set_json("^demo.Mapping", _m["id"], _m)
+                _write_mapping_patch(_m)
                 maps.append(_m)
             if not maps:
                 raise ValueError("管道组缺少 mappings")
@@ -1185,9 +2281,35 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                 "_rt_tgt": repository.target_runtime(tg) if tg else None,
             })
 
+        # —— P0a 身份稳定：① 按 (source_id, target_id) 去重（同管道两次提交只生成一次）
+        #                     ② 身份缺失**拒绝生成**（否则会退化成 PIPE_<skill> 幽灵实例 = "两套 SQL-SOAP"）
+        groups, _dup_merged = _dedup_groups_by_identity(groups)
+        _no_ident = [g for g in groups if not all(_group_identity(g))]
+        if _no_ident:
+            _msg = "；".join(
+                "%s→%s：%s" % (g.get("source_type"), g.get("target_type"),
+                               pipeline_instances.pipeline_id_fallback_note(
+                                   g.get("source_id"), g.get("target_id")))
+                for g in _no_ident[:3])
+            logger.error("多管道生成中止（管道身份不完整，不登记幽灵实例）: %s", _msg)
+            return {"result": "PIPELINE_IDENTITY_MISSING", "reason": "PIPELINE_IDENTITY_MISSING",
+                    "message": _msg, "dup_merged": _dup_merged,
+                    "validation": {"ok": False, "issues": [
+                        {"severity": "error", "check": "pipeline_identity", "message": _msg}]}}
+
+        # —— P1b：未提交的既有管道**按存储定义自动并入**（单一 Production 必须整份渲染；
+        #   否则"只提交变更组"会让别的管道从 Production 消失）——
+        _submitted_ids = {pipeline_instances.pipeline_id(g.get("source_id"), g.get("target_id"))
+                          for g in groups}
+        _joined = _auto_join_existing_pipelines(groups, _submitted_ids)
+        if _joined:
+            groups += _joined
+
         # —— 合并拓扑 + 写路由表 ——
         # C1：逐组转换验证-修复（字段/结构校验，映射修正后写回）
         for _g in groups:
+            if _g.get("_unchanged"):
+                continue        # 增量：未变更组跳过 C1（否则会重写映射 → 签名漂移、破坏"未变更"判定）
             _g_maps = _g.get("mappings") or []
             if not _g_maps:
                 continue
@@ -1200,7 +2322,7 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                         if not isinstance(_m, dict) or not _m.get("id"):
                             continue
                         _m["target_type"] = _g["target_type"]
-                        repository.set_json("^demo.Mapping", _m["id"], _m)
+                        _write_mapping_patch(_m)
                     _g["mappings"] = _fix["mappings"]
                 else:
                     logger.warning("多管道 C1 转换验证未完全通过: %s", _fix.get("message"))
@@ -1211,6 +2333,46 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
         # —— Agent B（LLM）：逐组设计管道拓扑（AI 决定各组件的构成与顺序；sql2fhir 组按 Skill 分发）——
         for _g in groups:
             try:
+                # —— 增量（P1）：同一业务身份 + **输入未变** → 复用已存组件，跳过 Agent B（省 LLM 调用、
+                #    避免重复生成导致组件/命名抖动）；组件名在 build_multi_pipeline_topology 里按同一规则
+                #    重新确定性命名 → 与首次生成结果一致。
+                _sig_in = _inc_input_signature(_g)
+                # ⚠ 必须**在此刻**固定签名（供登记使用）：Agent B 分支会 `pop("_rt_src"/"_rt_tgt")`，
+                # 之后再用 `_inc_input_signature(_g)` 会得到"空契约"签名 → 下轮比较永远不等
+                # （实测：入库签名与比较签名不一致 → 永远判"变更"、反复重生成）。
+                _g["_sig_in"] = _sig_in
+                _unchanged, _irec = (False, None) if _force_regen else pipeline_instances.is_unchanged(
+                    _g.get("source_id"), _g.get("target_id"), _sig_in)
+                if _unchanged and (_irec or {}).get("ai_components"):
+                    _frozen_ok, _why = _stored_definition_complete(
+                        _frozen_defs_from_instance(_irec or {}), _g.get("target_type"))
+                    if not _frozen_ok:
+                        logger.warning("增量生成：管道 %s 的**冻结定义**不完整（%s）→ 不走复用，"
+                                       "交回正常生成链路重建（自愈）", (_irec or {}).get("id"), _why)
+                        _unchanged = False
+                if _unchanged and (_irec or {}).get("ai_components"):
+                    _g["_unchanged"] = True
+                    _g["_sig_in"] = _sig_in
+                    _g["ai_components"] = _irec.get("ai_components") or []
+                    _g["design_skill"] = _irec.get("design_skill") or _g.get("design_skill")
+                    _g["_sql2fhir"] = bool(_irec.get("is_sql2fhir"))
+                    # 冻结定义：复用渲染时用它（参数完整 + 改名前名字 → 保真且不产生二次后缀）
+                    _g["_frozen_components"] = _frozen_defs_from_instance(_irec)
+                    _g["_frozen_infra"] = [dict(c) for c in (_irec.get("ai_components") or [])
+                                           if isinstance(c, dict) and _is_infra_component(c)]
+                    if _g["_sql2fhir"] and _irec.get("layout"):
+                        _g["_layout"] = _irec.get("layout")
+                    logger.info("增量生成：管道 %s（%s→%s）输入未变 → 复用 %d 个已存组件，跳过 Agent B",
+                                _irec.get("id"), _g["source_type"], _g["target_type"],
+                                len(_g["ai_components"]))
+                    continue
+                if _irec:
+                    # 诊断（长期保留）：能一眼看出"为什么没判成未变更"（映射变了？契约变了？）
+                    logger.info("增量生成：管道 %s 入参已变 → 按变更组重新生成"
+                                "（库存签名=%s 现算签名=%s；映射=%s）",
+                                _irec.get("id"), _irec.get("signature"), _sig_in,
+                                [(m.get("id"), len(m.get("field_mappings") or []))
+                                 for m in (_g.get("mappings") or [])])
                 # 上下文精准化：只把本组映射涉及的表交给 Agent（否则会为数据源每张表生成源 BS）
                 _g_tables = _source_tables_from_mappings(_g.get("mappings") or [])
                 _g_rt_src, _g_models = _scope_source_context(
@@ -1224,7 +2386,9 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                     source_runtime=_g_rt_src,
                     target_runtime=_g.pop("_rt_tgt", None),
                     # 已登记管道事实（同一源/目标 → 更新既有管道而非新增；决策仍归 LLM）
-                    existing_pipelines=pipeline_instances.existing_pipelines_brief())
+                    existing_pipelines=pipeline_instances.existing_pipelines_brief(),
+                    # Plan 模式：SQL→FHIR 时只让 Agent B 出拓扑（聚合 BP 由计划+逐方法生成）
+                    bp_plan_mode=_bp_plan_mode_for(_g["source_type"], _g["target_type"]))
                 _comps = ((_p.get("pipeline") or {}).get("components") or [])
                 if not _comps:
                     raise ValueError("Agent B 未返回任何组件")
@@ -1240,12 +2404,21 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                     except Exception as _de:  # noqa: BLE001 - 包装为可定位的错误
                         raise ValueError(
                             "该组映射无法推导 sql2fhir 布局（组内源表: "
-                            f"{[str(m.get('source')) for m in (_g.get('mappings') or [])]}）：{_de}")
+                            f"{[str(m.get('source')) for m in (_g.get('mappings') or [])]}）：{_de}"
+                            f"{_missing_patient_root_hint(_g.get('mappings'), _g.get('source_id'))}")
                     layout = _sfx.enrich_layout_with_mappings(layout, maps_layout)
+                    if layout.get("unmapped_query_bos"):
+                        raise ValueError(
+                            "sql2fhir 布局不完整：子资源查询 BO 缺少映射 id "
+                            f"{layout['unmapped_query_bos']}（子资源会组装成空资源 → FHIR 必填元素缺失"
+                            "→ 整个 Bundle 事务回滚）")
                     _save_sql2fhir_layout(layout)
-                    _bp_ok, _bp_msg = _ensure_sql2fhir_bp(
+                    _bp_ok, _bp_msg, _bp_meta = _ensure_sql2fhir_bp_dispatch(
                         _p, _g.get("mappings") or [], "SQL", "FHIR",
-                        AVAILABLE_COMPONENTS, None, None)
+                        AVAILABLE_COMPONENTS, None, None,
+                        layout=layout, design_skill="sql2fhir-patient-tx",
+                        facts={"source": "SQL", "target": "FHIR"})
+                    _g["_bp_meta"] = _bp_meta
                     if not _bp_ok:
                         raise ValueError(f"Agent 生成 BP 失败（组 sql2fhir）: {_bp_msg}")
                     _g["ai_components"] = _sfx.build_sql2fhir_components(
@@ -1270,17 +2443,111 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
         for _g in groups:
             _g["_category"] = pipeline_instances.category_of(
                 _g.get("design_skill"), _g["source_type"], _g["target_type"])
+
+        # —— P3 免重启（增量）：**全部组都是"输入未变"**且其组件仍在 Production 在位 →
+        # 直接返回"无变更"：不重渲染、不编译、不 Stop/Start（避免无谓重启与运行态被重置）。
+        # 任一组件缺失 → 走完整重渲染自愈（安全兜底）。
+        if groups and all(_g.get("_unchanged") for _g in groups):
+            _prod_now = _running_items()
+            _gone: list[str] = []
+            for _g in groups:
+                _rec_u = pipeline_instances.find_instance(_g.get("source_id"), _g.get("target_id")) or {}
+                # ⚠ 判据必须是**存储定义（ai_components）整体是否在位**，不能只看实例的
+                #   `component_names` —— 后者在历史缺陷里本身就是残缺的（少目标 BO），
+                #   只比它会把"缺件"状态**锁死**（实测 2026-09-20：SOAP 目标 BO 缺席却判"无需重渲染"）。
+                for _c in (_rec_u.get("ai_components") or []):
+                    if not isinstance(_c, dict) or _is_infra_component(_c):
+                        continue
+                    _n = str(_c.get("name") or "")
+                    if not _n:
+                        continue
+                    if _n in _prod_now or any(x.startswith(_n + "__") for x in _prod_now):
+                        continue
+                    _gone.append(_n)
+            # ③ 组内启停一致性（2026-09-20 实测）：同一管道的组件必须**全启用或全停用**——
+            #    出现"源 BS 停、BO 还在跑"这类半启用状态时，必须重渲染收敛（否则状态被锁死、
+            #    BO/BP 白占许可，用户看到"目标 BO 为何没被禁用"）。
+            _by_cat: dict[str, set] = {}
+            for _n, _i in _prod_now.items():
+                _c = str(_i.get("category") or "")
+                if _c:
+                    _by_cat.setdefault(_c, set()).add(int(_i.get("enabled") or 0))
+            _inconsistent = sorted(c for c, vs in _by_cat.items() if len(vs) > 1)
+            if _inconsistent:
+                logger.warning("增量生成：组件启停不一致的管道 %s → 走完整重渲染收敛", _inconsistent)
+                _gone.extend(_inconsistent)
+            if _prod_now and not _gone:
+                logger.info("增量生成：%d 条管道输入均未变且组件在位 → 跳过重渲染/重启（无变更）",
+                            len(groups))
+                _unchanged_recs = [
+                    pipeline_instances.find_instance(_g.get("source_id"), _g.get("target_id")) or {}
+                    for _g in groups]
+                for _g in groups:      # 保留本组输入签名（供下次比对）
+                    _g["_sig_in"] = _g.get("_sig_in") or _inc_input_signature(_g)
+                return {"result": "OK", "unchanged": True,
+                        "production": "demo.DataflowProduction",
+                        "render_skipped": True,
+                        "validation": {"ok": True, "error_count": 0, "warning_count": 0,
+                                       "issues": [], "results": {},
+                                       "note": "增量生成：全部管道输入未变，组件已在位 → 未重渲染/重启"},
+                        "license_budget": {},
+                        "term_summary": {}, "term_todo": [],
+                        "config_cleanup": {},
+                        "pipelines": _unchanged_recs, "pipeline_error": "",
+                        "dup_merged": _dup_merged,
+                        "ai": {"driven": True, "groups": [
+                            {"category": _g.get("_category"), "source_type": _g["source_type"],
+                             "target_type": _g["target_type"], "design_skill": _g.get("design_skill"),
+                             "unchanged": True} for _g in groups]}}
+
         topology = build_multi_pipeline_topology(groups)
+        # sql2fhir 布局**按聚合 BP 实例**写入（一管道一实例；全局键作历史兼容兜底）：
+        # 组件名在拓扑构建阶段才定（同名跨组会加 `__{类别}` 后缀），故必须在此之后写。
+        # ⚠ 未变更（复用）的组：`_agg_bp_name` 不在内存里 → 从**最终拓扑**按
+        #   (type=PatientTxProcess, category) 解析出渲染后的实例名（与首次生成同名）。
+        for _g in groups:
+            if _g.get("_sql2fhir") and _g.get("_layout"):
+                _bp_nm = str(_g.get("_agg_bp_name") or "")
+                if not _bp_nm:
+                    _bp_nm = next((str(c.get("name")) for c in (topology.get("components") or [])
+                                   if str(c.get("type")) == "PatientTxProcess"
+                                   and str(c.get("category")) == str(_g.get("_category"))), "")
+                if _bp_nm:
+                    _save_sql2fhir_layout(_g["_layout"], _bp_nm)
+                else:
+                    logger.warning("增量生成：sql2fhir 组 %s 未能解析聚合 BP 实例名 → 未写布局",
+                                   _g.get("_category"))
+
         # 许可调度（社区版 KeyLicenseUnits=8，业务主机常驻各占 1 个）：按组顺序装箱，
         # 放不下的分组**组件照旧生成、初始停用**（不再直接失败）→ 用户在「数据管道」卡片一键切换
+        # ⚠ 增量（P2）：**未被调度停用**的未变更（复用）管道保留其当前启用位（生成新管道不重置老管道）。
+        #   ⚠ 但**许可调度是硬约束，P2 不得覆盖它**（实测缺陷 2026-09-20：调度判定 sql2soap 超容量→停用，
+        #   P2 回填又把 `TransformProcess`/`SOAPOp_PatientService` 改回启用 → **半启用** + 许可超订
+        #   （enabled=10 > units=8），用户看到"目标 BO 没被禁用"）。
+        _prev_enabled = {n: int(i.get("enabled") or 0) for n, i in _running_items().items()}
+        _unchanged_cats = {str(_g.get("_category")) for _g in groups if _g.get("_unchanged")}
+        # 实例状态为 suspended 的类别 = 用户此前的选择（未变更组保持停用；不再逐组件按历史快照回填）
+        try:
+            _susp_inst_cats = {str(r.get("category")) for r in pipeline_instances.list_instances()
+                               if r.get("status") == "suspended" and r.get("category")}
+        except Exception:  # noqa: BLE001
+            _susp_inst_cats = set()
         _plan = _license_plan(topology)
         _susp = _mark_suspended_components(topology, _plan)
+        _restored = _converge_component_enabled(topology, _plan, _unchanged_cats, _susp_inst_cats)
+        if _restored:
+            logger.info("增量生成：按许可调度/运行态收敛组件启停: %s", _restored)
         if _susp:
             logger.warning("许可调度：以下组件生成后处于停用状态 %s", _susp)
         _save_pipeline_topology(topology)
         _save_fhir_runtime_config(
             topology,
-            next((g.get("target_config") for g in groups if g["target_type"] == "FHIR"), None))
+            next((g.get("target_config") for g in groups if g["target_type"] == "FHIR"), None),
+            # 事实注入：本管道的 FHIR 映射 + 源数据源（决定每列 system/coded，引擎不再猜）
+            mappings=[m for _g in groups if _g["target_type"] == "FHIR"
+                      for m in (_g.get("mappings") or [])],
+            source_id=next((_g.get("source_id") for _g in groups
+                            if _g["target_type"] == "FHIR"), None))
         for _g in groups:
             src_bn = _g.get("_src_bn") or ("SQLService" if _g["source_type"] == "SQL"
                                            else "FHIRService")
@@ -1291,12 +2558,25 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                 pipe["service"] = (_g["target_config"] or {}).get("service") or "default"
             else:
                 pipe["table"] = _m0.get("target_table") or ""
+            # 派发目标（**显式主机名**）：组件按管道实例改名后，BP 按约定拼名会指向不存在的主机
+            # （缺陷 A6）→ 把实际 Operation 主机名写进本 BP 自己的配置，BP 优先用它
+            if _g.get("_bp_items"):
+                pipe["items"] = dict(_g["_bp_items"])
+            if _g.get("_bp_item"):
+                pipe["item"] = _g["_bp_item"]
             # ① 权威：本管道**自己的 BP** 读自己的参数（一管道一 BP，互不干扰）
             #    demo.TransformProcess.OnRequest: $Get(^demo.Config("bp", ..%ConfigName))
-            bp_name = _g.get("_bp_name") or "TransformProcess"
-            native.set(json.dumps(pipe, ensure_ascii=False), "^demo.Config", "bp", bp_name)
-            # ② 源 BS → BP 的投递目标（供代码内显式投递的 BS 读取，如 demo.FHIRService）
-            native.set(bp_name, "^demo.Config", "bp_target", src_bn)
+            #    ⚠ 仅当本组**确有**转换 BP 主机时才登记：Skill 自带聚合 BP 的组（sql2fhir）
+            #      里没有该主机 → 登记了也没有任何读者（死配置，见 prune_stale_bp_config）。
+            if _g.get("_has_router"):
+                bp_name = _g.get("_bp_name") or "TransformProcess"
+                native.set(json.dumps(pipe, ensure_ascii=False), "^demo.Config", "bp", bp_name)
+                # ② 源 BS → BP 的投递目标（供代码内显式投递的 BS 读取，如 demo.FHIRService）
+                native.set(bp_name, "^demo.Config", "bp_target", src_bn)
+            # ③ 本组**映射集**：FHIR 队列是全局表，源 BS 据此只消费本管道的行
+            #    （否则多管道并存时互相抢行并标 processed → 别组拿不到数据、派发到不存在的 SQLOp_*）
+            _bs_ids = [str(x.get("id")) for x in (_g.get("mappings") or []) if x.get("id")]
+            native.set(json.dumps(_bs_ids, ensure_ascii=False), "^demo.Config", "bs_mappings", src_bn)
             # ③ 兼容：旧的「按源 BS 路由」表 + 全局单值键（历史管道 / 兜底路径）
             native.set(json.dumps(pipe, ensure_ascii=False), "^demo.Config", "pipe", src_bn)
             native.set(_m0["id"], "^demo.Config", "pipeline", "active_mapping")
@@ -1335,10 +2615,19 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
             groups=_topology_groups(topology))
 
         # 前置连通门禁（按组构造源/目标 runtime，check_connection 现场探测）
-        _cc_src = [{"kind": g["source_type"], "role": "source",
-                    "connection": dict(g.get("source_config") or {})} for g in groups]
-        _cc_tgt = [{"kind": g["target_type"], "role": "target",
-                    "connection": dict(g.get("target_config") or {})} for g in groups]
+        # ⚠ 必须优先用**归一的运行契约**（_rt_src/_rt_tgt，含 analyze 时探到的 health）：登记的
+        #   FHIR endpoint 常是浏览器视角的 http://localhost:52773/...，backend 在独立容器里连不上，
+        #   直接拿原始 source_config/target_config 现探会必然报 Connection refused 而拦下生成
+        #   （2026-09-16 实测：三组生成被 source.FHIR 不可达拦掉）。契约缺失（数据源未登记/
+        #   反查不到）时才退回原始配置现探。
+        _cc_src = [{**g["_rt_src"], "role": "source"} for g in groups if g.get("_rt_src")]
+        _cc_tgt = [{**g["_rt_tgt"], "role": "target"} for g in groups if g.get("_rt_tgt")]
+        if not _cc_src:
+            _cc_src = [{"kind": g["source_type"], "role": "source",
+                        "connection": dict(g.get("source_config") or {})} for g in groups]
+        if not _cc_tgt:
+            _cc_tgt = [{"kind": g["target_type"], "role": "target",
+                        "connection": dict(g.get("target_config") or {})} for g in groups]
         _conn_check = pipeline_validator.check_connection(sources=_cc_src, targets=_cc_tgt)
         if not _conn_check.get("ok"):
             _msgs = [i.get("message", "") for i in _conn_check.get("issues", [])][:3]
@@ -1373,7 +2662,7 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                         if _f2.get("status") == "ok" and _f2.get("mappings"):
                             for _m in _f2["mappings"]:
                                 if isinstance(_m, dict) and _m.get("id"):
-                                    repository.set_json("^demo.Mapping", _m["id"], _m)
+                                    _write_mapping_patch(_m)
                             _g["mappings"] = _f2["mappings"]
                     all_mappings = [m for _g in groups for m in (_g.get("mappings") or [])]
                     mappings_json = json.dumps(all_mappings, ensure_ascii=False)
@@ -1428,16 +2717,29 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                     resolution=f"多管道生成失败: {result} / {_emsg}", source="multi-generate")
             except Exception as _se:  # noqa: BLE001
                 logger.warning("多管道经验沉淀失败: %s", _se)
-        # 术语判码缓存：mapping 含 term_map 时按源表编码值预判定（Skill 执行；AI 决策能否
-        # 在运行期落地取决于此缓存，故失败/缺项必须显式带回响应与 validation，不静默）
-        term_cache_report: dict = {}
+        # 术语覆盖**复核**（只读盘点）：运行期由共享 BO 实时查术语服务器；缺映射进"待办清单"，
+        # 只作验证告警（默认降级口径，不阻断、不写缓存）
+        term_summary: dict = {}
         if result == "OK":
             try:
-                term_cache_report = _refresh_term_cache(all_mappings, topology, validation)
-            except Exception as _tc:  # noqa: BLE001 - 刷新异常也显式报告
-                logger.error("多管道判码缓存刷新异常: %s", _tc)
-                term_cache_report = {"ok": False, "error": str(_tc),
-                                     "note": "判码缓存刷新异常（term_map 决策将无法落地）"}
+                term_summary = _term_summary(all_mappings, topology, validation)
+            except Exception as _tc:  # noqa: BLE001 - 复核异常也显式报告（不影响生成结果）
+                logger.warning("多管道术语复核异常（不影响生成）: %s", _tc)
+                term_summary = {"ok": False, "error": str(_tc),
+                                "note": "术语复核异常；运行期由共享 BO 实时查询（缺映射会降级）"}
+
+        # 配置收敛：生成成功 = Production 已**整份替换**，本次之外的 `bp` / `bp_target` 登记
+        # 都指向不存在的组件（死配置：诊断噪音 + 悬空引用隐患）。保留本次的 BP / 源 BS、
+        # `last_good` 存档与仍存在的组件（见 prune_stale_bp_config）。
+        config_cleanup: dict = {}
+        if result == "OK":
+            try:
+                config_cleanup = prune_stale_bp_config(
+                    keep_bps={_bg["_bp_name"] for _bg in groups if _bg.get("_bp_name")},
+                    keep_srcs={_bg["_src_bn"] for _bg in groups if _bg.get("_src_bn")})
+            except Exception as _pce:  # noqa: BLE001 - 收敛失败不改变生成结果
+                logger.warning("配置收敛异常（不影响生成）: %s", _pce)
+                config_cleanup = {"error": str(_pce)}
 
         # 管道实体登记（受管理持久对象）：按 (source_id, target_id, design_skill) 逐组登记，
         # 同一身份重复生成 = 更新同一管道（不新增）。生成失败则登记为失败原因（不写成功记录）。
@@ -1448,19 +2750,38 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                 prod_items = pipeline_validator.production_items()
                 for _g in groups:
                     _cat = _g["_category"]
-                    _comps = [c for c in topology.get("components") or []
-                              if c.get("category") == _cat]
+                    _own = set(_g.get("_own_names") or [])
+                    # 组件归属：**优先按本组专属组件名**（同类别多组时按 category 取会拿到两条管道的并集，
+                    # 一键切换会连带启停另一条管道）；无名单（历史路径）才退化为按 category 过滤。
+                    _comps = ([c for c in (topology.get("components") or [])
+                               if str(c.get("name")) in _own] if _own else
+                              [c for c in topology.get("components") or []
+                               if c.get("category") == _cat])
                     instance_records.append(pipeline_instances.upsert_from_generation(
                         source_id=_g.get("source_id"), target_id=_g.get("target_id"),
                         source_type=_g["source_type"], target_type=_g["target_type"],
                         design_skill=_g.get("design_skill"), category_hint=_cat,
                         mapping_ids=[m.get("id") for m in (_g.get("mappings") or []) if m.get("id")],
                         components=_comps or (_g.get("ai_components") or []),
+                        # P0：存**未改名**的原始组件（含 infra）+ 是否 sql2fhir + 布局，
+                        #     供下次增量生成复用（跳过 Agent B，不重渲不重启）
+                        ai_components=_g.get("ai_components") or [],
+                        is_sql2fhir=bool(_g.get("_sql2fhir")),
+                        layout=(_g.get("_layout") if _g.get("_sql2fhir") else None),
+                        source_config=_g.get("source_config") or None,
+                        target_config=_g.get("target_config") or None,
+                        signature=_g.get("_sig_in") or _inc_input_signature(_g),
+                        applied_signature=pipeline_instances.component_signature(
+                            topology.get("components"),
+                            mapping_ids=[m.get("id") for m in (_g.get("mappings") or [])
+                                         if m.get("id")]),
                         routes={"source_bs": _g.get("_src_bn") or ""},
                         ai={"driven": True,
                             "supplemented": (_g.get("_ai_supplemented")
                                              or topology.get("ai_supplemented") or [])},
-                        validation=validation, production_items=prod_items))
+                        validation=validation, production_items=prod_items,
+                        # 未变更（复用存储定义）→ 不计入"生成次数"（本次没重新生成）
+                        reused=bool(_g.get("_unchanged"))))
                 pipeline_instances.reconcile_states(production_items=prod_items)
             except Exception as _pie:  # noqa: BLE001 - 登记失败不改变"生成成功"事实，但必须显式暴露
                 instance_error = str(_pie)
@@ -1468,13 +2789,23 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
 
         return {"result": result, "production": "demo.DataflowProduction",
                 "validation": validation,
+                # BP 生成链（Plan → Execute）审计：bp_mode / 计划方法清单 / 单测汇总
+                "bp_mode": [dict({"category": _g.get("_category")}, **(_g.get("_bp_meta") or {}))
+                            for _g in groups if _g.get("_bp_meta")],
                 # 许可预算：本次生成让旧管道组件让出的许可单元（社区版仅 8 个；避免"启动即超限"）
                 "license_budget": license_budget,
-                # 术语判码缓存（term_map 决策的运行期前提）：ok=false 表示 AI 决策未能落地
-                "term_cache": term_cache_report,
+                # 术语覆盖复核 + **待办清单**（运行期由共享 BO 实时查；缺映射默认降级、不阻断）
+                "term_summary": term_summary,
+                "term_todo": _term_todo,
+                # 术语服务器目录/盘点摘要（唯一事实源：覆盖了多少码、缺什么、源库命名空间）
+                "term_catalog": _term_catalog_brief(_tgate.get("gate") or {}),
+                # 配置收敛：本次生成清理掉的陈旧 `bp` / `bp_target` 登记（无对应组件）
+                "config_cleanup": config_cleanup,
                 # 管道实体（受管理对象）：本次生成新建/更新的管道
                 "pipelines": instance_records,
                 "pipeline_error": instance_error,
+                # 增量（P0a）：同身份重复组被合并的审计（提交里若含重复管道 → 合并而非新增）
+                "dup_merged": _dup_merged,
                 # AI 驱动信息：每组管道均由 Agent B（LLM）设计拓扑
                 "ai": {
                     "driven": True,
@@ -1502,12 +2833,25 @@ def generate():
             logger.error("多管道生成失败: %s", exc)
             return error(f"多管道生成失败: {exc}"), 500
         if multi.get("result") != "OK":
+            # 术语门禁中止：返回 400 + 面向用户的明确说明（缺哪些码、怎么补录），而不是笼统 500
+            if multi.get("gate") is not None:
+                return error(multi.get("message") or "术语预检未通过", data={
+                    "reason": multi.get("reason") or "TERM_MAP_INCOMPLETE",
+                    "term_catalog": multi.get("gate") or {}}), 400
+            # 管道身份不完整（缺源数据源/目标）：同样 400 + 可照做的说明（P0a：不登记幽灵实例）
+            if multi.get("reason") == "PIPELINE_IDENTITY_MISSING":
+                return error(multi.get("message") or "管道身份不完整", data={
+                    "reason": "PIPELINE_IDENTITY_MISSING",
+                    "dup_merged": multi.get("dup_merged") or []}), 400
             return error(f"多管道生成失败: {multi.get('result')}"), 500
         v = multi.get("validation") or {}
         if not v.get("ok"):
             msgs = [i.get("message") for i in v.get("issues", [])
                     if i.get("severity") == "error"][:3]
             return error(f"多管道验证未通过: {'; '.join(msgs) or '未知'}"), 500
+        if multi.get("unchanged"):
+            # 增量：全部提交的管道都已存在且未变更 → 不重渲染/不重启（P3）
+            return success(multi, "所有数据管道均已存在且未变更（未重新生成）")
         return success(multi, "多管道已生成并启动")
     mappings = body.get("mappings") or []
     plan = body.get("transformation_plan") or {}
@@ -1561,14 +2905,37 @@ def generate():
             # 目标运行参数统一取归一化契约 connection（repository.target_runtime）
             rconn = (tg.get("runtime") or {}).get("connection") \
                 or repository.target_runtime(tg)["connection"]
-            target_config = {
-                "wsdl": target_config.get("wsdl") or rconn.get("wsdl", ""),
-                "service": target_config.get("service") or rconn.get("service", "default"),
-                "packages": target_config.get("packages") or rconn.get("packages") or {},
-                "bo_class": target_config.get("bo_class") or rconn.get("bo_class") or tg.get("bo_class", ""),
-                # 远端 SOAP 地址：目标登记时可指定 endpoint；默认指向 Python mock 演示第三方系统
-                "endpoint": target_config.get("endpoint") or rconn.get("endpoint") or Config.MOCK_SOAP_URL,
-            }
+            if (tg.get("type") or "").upper() == "DB":
+                # DB 目标：并入连接契约（jdbc_url → 命名空间 → DSN），供 SQLOp 引用。
+                # 演示默认目标库 = **CLINIC**（SQL 源 = USER）；不并入就会退化成 localTarget/USER：
+                # 目标登记的命名空间被忽略、数据静默写进 USER（见 services/jdbc_dsn.py 说明）。
+                from backend.services import jdbc_dsn as _jdbc_dsn_t
+                _tc, _sch = _registered_table_columns(tg)
+                target_config = {
+                    **target_config,
+                    "jdbc_url": target_config.get("jdbc_url") or rconn.get("jdbc_url", ""),
+                    "dsn": target_config.get("dsn") or rconn.get("dsn") \
+                        or _jdbc_dsn_t.dsn_name_for_target(tg),
+                    "driver_class": target_config.get("driver_class") or rconn.get("driver_class", ""),
+                    # 列清单事实（注册时按目标 JDBC 元数据取得）：SQLOp UPSERT 必须按**目标库**列生成
+                    "table_columns": target_config.get("table_columns") or _tc,
+                    "schema": target_config.get("schema") or _sch or "SQLUser",
+                }
+                _jdbc_dsn_t.ensure_jdbc_dsn(
+                    target_config.get("dsn"), target_config.get("jdbc_url"),
+                    rconn.get("username") or "superuser", rconn.get("password") or "SYS")
+            elif (tg.get("type") or "").upper() == "FHIR":
+                # FHIR 目标：并入 REST 端点（base_url → HTTPOp HTTPServer/HTTPPort）
+                target_config = _merge_fhir_target_config({**target_config}, tg)
+            else:
+                target_config = {
+                    "wsdl": target_config.get("wsdl") or rconn.get("wsdl", ""),
+                    "service": target_config.get("service") or rconn.get("service", "default"),
+                    "packages": target_config.get("packages") or rconn.get("packages") or {},
+                    "bo_class": target_config.get("bo_class") or rconn.get("bo_class") or tg.get("bo_class", ""),
+                    # 远端 SOAP 地址：目标登记时可指定 endpoint；默认指向 Python mock 演示第三方系统
+                    "endpoint": target_config.get("endpoint") or rconn.get("endpoint") or Config.MOCK_SOAP_URL,
+                }
 
     if target_type == "SOAP" and not target_config.get("bo_class"):
         for tg in repository.list_targets():
@@ -1766,6 +3133,22 @@ def generate():
         logger.warning("转换验证-修复未完全解决（已采纳部分修复）: %s", trans_fix["message"])
     repository.save_mappings(mappings_effective)
 
+    # —— 术语映射**盘点**（术语服务器 = 术语转换的唯一事实源；**默认放行**）——
+    # 位置：C1 修完映射之后、Agent B（LLM 管道设计）之前。
+    # 2026-09-18 口径：缺映射不再中止（缺什么进"待办清单"，运行期由共享 BO 降级处理）；
+    # 仅 `strict_terms=true` 时按 TERM_MAP_INCOMPLETE 中止（合规场景）。
+    _strict = bool(body.get("strict_terms"))
+    _tgate = _term_precheck(mappings_effective, strict=_strict)
+    if not _tgate.get("ok"):
+        logger.error("单管道生成被术语**严格**预检中止: %s", _tgate.get("message"))
+        return error(_tgate.get("message") or "术语预检未通过（严格模式）", data={
+            "reason": "TERM_MAP_INCOMPLETE",
+            "term_catalog": _term_catalog_brief(_tgate.get("gate") or {})}), 400
+    _term_catalog = _term_catalog_brief(_tgate.get("gate") or {})
+    _term_todo = list(_tgate.get("todo") or [])
+    if _tgate.get("message"):
+        logger.warning("术语待办（默认放行，运行期降级）: %s", _tgate.get("message"))
+
     mappings_json = json.dumps(mappings_effective, ensure_ascii=False)
     # FHIR 源配置兜底：统一从数据源运行契约读取（datasource_runtime 归一 endpoint/auth），
     # 保证 FHIRSyncService 能抓取（前端可能取不到字段的历史问题由此根治）
@@ -1788,6 +3171,75 @@ def generate():
     # Agent B（LLM）：设计数据管道拓扑——AI 决定组件构成与顺序，注册表只补参数。
     # LLM 不可用时不再静默走规则；如确需规则兜底（如无 LLM key 的演示环境）须显式 allow_rule_fallback。
     allow_rule_fallback = bool(body.get("allow_rule_fallback"))
+
+    # —— 增量（P0a/P1/P3，与多管道同口径）——
+    # ① 身份必须完整：缺源数据源/目标 → **拒绝生成**（否则会登记成 PIPE_<skill> 幽灵实例）
+    if not (str(source_id or "").strip() and str(target_id or "").strip()):
+        _msg0 = pipeline_instances.pipeline_id_fallback_note(source_id, target_id)
+        logger.error("单管道生成中止（管道身份不完整）: %s", _msg0)
+        return error(_msg0, data={"reason": "PIPELINE_IDENTITY_MISSING"}), 400
+    # ⓪ 保护：**存在其它有效管道**时改走多管道路径（P1b 会把它们按存储定义自动并入）。
+    #   否则"单管道 = 整份替换 Production"会把现存的别的管道清掉 —— 实测缺陷（2026-09-20）：
+    #   用户先建了 SQL→SOAP，再生成 SQL→FHIR 时前端只提交 1 组 → 走单管道路径 →
+    #   SQL-SOAP 的 3 个组件整组消失、其实例变 superseded（用户视角："管道消失了"）。
+    try:
+        _others = [r for r in pipeline_instances.list_instances()
+                   if r.get("status") != "superseded"
+                   and str(r.get("id")) != pipeline_instances.pipeline_id(source_id, target_id)
+                   and (r.get("ai_components") or [])]
+    except Exception:  # noqa: BLE001 - 读不到既有管道时按"没有"处理（退化为原单管道语义）
+        _others = []
+    if _others:
+        logger.info("单管道请求：检测到其它 %d 条有效管道 %s → 转多管道路径（自动并入，不整份替换）",
+                    len(_others), [str(r.get("id")) for r in _others])
+        _multi2 = _generate_multi_pipelines([{
+            "source_type": source_type, "source_id": source_id,
+            "target_type": target_type, "target_id": target_id,
+            "mappings": mappings_effective}])
+        if _multi2.get("result") != "OK":
+            if _multi2.get("gate") is not None:
+                return error(_multi2.get("message") or "术语预检未通过", data={
+                    "reason": _multi2.get("reason") or "TERM_MAP_INCOMPLETE",
+                    "term_catalog": _multi2.get("gate") or {}}), 400
+            if _multi2.get("reason") == "PIPELINE_IDENTITY_MISSING":
+                return error(_multi2.get("message") or "管道身份不完整", data={
+                    "reason": "PIPELINE_IDENTITY_MISSING"}), 400
+            return error(f"管道生成失败: {_multi2.get('result')}"), 500
+        if _multi2.get("unchanged"):
+            return success(_multi2, "所有数据管道均已存在且未变更（未重新生成）")
+        return success(_multi2, "多管道已生成并启动")
+
+    # ② 入参未变 且 组件仍在 Production 在位 → 跳过重渲染/重启（无变更；force=true 时不跳过）
+    # ⚠ 签名口径必须与多管道路径**完全一致**（`_inc_input_signature`，含运行契约 extra）——
+    #   否则两条路径算出的签名不同：单管道重放永远判"变更"→ 重渲染 → 把别的管道整份换掉
+    #   （实测缺陷）。
+    _force_regen1 = bool(body.get("force"))
+    _sig_in1 = _inc_input_signature({
+        "source_id": source_id, "target_id": target_id,
+        "source_type": source_type, "target_type": target_type,
+        "mappings": mappings_effective,
+        "_rt_src": repository.datasource_runtime(ds_obj) if ds_obj else None,
+        "_rt_tgt": repository.target_runtime(locals().get("tg")) if locals().get("tg") else None})
+    _unch1, _rec1 = (False, None) if _force_regen1 else pipeline_instances.is_unchanged(
+        source_id, target_id, _sig_in1)
+    if _unch1:
+        _prod1 = _running_items()
+        _miss1 = [str(n) for n in ((_rec1 or {}).get("component_names") or [])
+                  if str(n) not in _prod1]
+        if _prod1 and not _miss1:
+            logger.info("增量生成（单管道）：%s 输入未变且组件在位 → 跳过重渲染/重启（无变更）",
+                        (_rec1 or {}).get("id"))
+            rec1 = dict(_rec1 or {})
+            rec1["signature"] = _sig_in1
+            return success({
+                "result": "OK", "unchanged": True, "render_skipped": True,
+                "production": "demo.DataflowProduction",
+                "validation": {"ok": True, "error_count": 0, "warning_count": 0, "issues": [],
+                               "note": "增量生成：输入未变、组件已在位 → 未重渲染/重启"},
+                "pipelines": [rec1],
+            }, "该数据管道已存在且未变更（跳过重新生成）")
+        logger.warning("增量生成（单管道）：组件缺失 %s → 走完整重渲染自愈", _miss1[:5])
+
     ai_components: list[dict] | None = None
     p_result: dict | None = None
     design_skill = None
@@ -1807,7 +3259,9 @@ def generate():
             source_runtime=_rt_src_scoped,
             target_runtime=(tg.get("runtime") if locals().get("tg") else None),
             # 已登记管道事实（同一 (源,目标) → 更新既有管道而非新增；决策仍归 LLM）
-            existing_pipelines=pipeline_instances.existing_pipelines_brief())
+            existing_pipelines=pipeline_instances.existing_pipelines_brief(),
+            # Plan 模式：SQL→FHIR 时只让 Agent B 出拓扑（聚合 BP 由计划+逐方法生成）
+            bp_plan_mode=_bp_plan_mode_for(source_type, target_type))
         pipeline = p_result.get("pipeline")
         design_skill = p_result.get("design_skill") if isinstance(p_result, dict) else None
         if pipeline and pipeline.get("components"):
@@ -1830,13 +3284,14 @@ def generate():
     for _m in mappings_effective or []:
         if isinstance(_m, dict) and _m.get("id"):
             _m["target_type"] = target_type
-            repository.set_json("^demo.Mapping", _m["id"], _m)
+            _write_mapping_patch(_m)
 
     # —— sql2fhir-patient-tx 分发（Skill 布局 executor + Agent 生成 BP，无平台预置 BP）——
     # 触发条件：目标=FHIR、Agent B 已选 design_skill=sql2fhir-patient-tx（AI 决策），
     # 且源为 SQL 并映射覆盖患者主表。布局与 BP 由 Skill/Agent 链路完成，平台只做参数化与准入。
     # C2 目标落地预期（布局驱动，sql2fhir 分支内按布局声明赋值）：{FHIR 资源: 至少条数}
     _expect_targets: dict[str, int] = {}
+    _bp_mode_meta: dict = {}          # Plan 链 meta（bp_mode/方法/单测汇总），响应回显（可审计）
     sql2fhir_flow = False
     if (target_type == "FHIR" and design_skill == "sql2fhir-patient-tx"
             and ai_components is not None):
@@ -1845,18 +3300,26 @@ def generate():
             maps_layout, meta = _resolve_sql_source_tables(mappings_effective, source_id)
             layout = _sfx.derive_sql2fhir_layout(maps_layout, meta)
             layout = _sfx.enrich_layout_with_mappings(layout, maps_layout)
+            if layout.get("unmapped_query_bos"):
+                return error("sql2fhir 布局不完整：子资源查询 BO 缺少映射 id "
+                             f"{layout['unmapped_query_bos']}（子资源会组装成空资源 → "
+                             "FHIR 必填元素缺失 → 整个 Bundle 事务回滚）"), 500
         except Exception as _lexc:  # noqa: BLE001
             logger.error("sql2fhir 布局推导失败（Skill executor）: %s", _lexc, exc_info=True)
-            return error(f"sql2fhir 布局推导失败（Skill executor）: {_lexc}"), 500
+            return error("sql2fhir 布局推导失败（Skill executor）: %s%s" % (
+                _lexc, _missing_patient_root_hint(mappings_effective, source_id))), 500
         _save_sql2fhir_layout(layout)
         # 目标落地预期 = 布局声明的资源（每条至少 1 个）：子资源全 0 时不能判"通过"
         _expect_targets = {str(r): 1
                            for r in (layout.get("bundle", {}).get("resource_order") or []) if str(r)}
         _tg_rt = (locals().get("tg") or {}).get("runtime") if locals().get("tg") else None
-        _bp_ok, _bp_msg = _ensure_sql2fhir_bp(
+        _bp_ok, _bp_msg, _bp_meta = _ensure_sql2fhir_bp_dispatch(
             p_result, mappings_effective, source_type, target_type,
             AVAILABLE_COMPONENTS,
-            (ds_obj or {}).get("runtime") if ds_obj else None, _tg_rt)
+            (ds_obj or {}).get("runtime") if ds_obj else None, _tg_rt,
+            layout=layout, design_skill="sql2fhir-patient-tx",
+            facts={"source": source_type, "target": target_type})
+        _bp_mode_meta = _bp_meta
         if not _bp_ok:
             logger.error("Agent 生成 BP 失败（sql2fhir-patient-tx）: %s", _bp_msg)
             return error(f"Agent 生成 BP 失败（sql2fhir-patient-tx）: {_bp_msg}"), 500
@@ -1880,6 +3343,18 @@ def generate():
     _category = pipeline_instances.category_of(
         topology.get("design_skill") or design_skill, source_type, target_type)
     _stamp_categories(topology, _category)
+    # 本拓扑是否真的生成转换 BP（TransformProcess 主机）：Skill 自带聚合 BP 的组（sql2fhir）没有
+    # 它 → `bp` / `bp_target` 一律不登记（否则留下无读者的死配置，口径与多管道一致）
+    _has_router = any(str(c.get("type")) == "TransformProcess"
+                      for c in (topology.get("components") or []))
+    # 生成期自检 + 布局派发名对齐（单管道不改名，但口径与多管道一致：BP 读显式派发名）
+    _sp_items, _sp_item = _dispatch_targets(
+        topology.get("components") or [], None, target_config)
+    _assert_dispatch_targets(
+        [{"_category": _category, "_bp_items": _sp_items, "_bp_item": _sp_item}],
+        topology.get("components") or [])
+    if sql2fhir_flow and locals().get("layout") and isinstance(layout, dict):
+        layout["http_bo"] = _sp_item or layout.get("http_bo") or ""
     # 许可调度：放不下的管道分组标 enabled=false（组件照旧生成、初始停用，UI 一键切换）
     _plan = _license_plan(topology)
     _susp = _mark_suspended_components(topology, _plan)
@@ -1895,7 +3370,14 @@ def generate():
         _expect_targets = {}
     _effect_target_types = [] if _self_suspended else [target_type]
     _save_pipeline_topology(topology)
-    _save_fhir_runtime_config(topology, target_config)
+    # sql2fhir 布局**按聚合 BP 实例**写入（多管道隔离；全局键已在上文写过作历史兼容）——
+    # 单管道时 BP 名即 `SqlFhirPatientTxProcess`，与多管道同口径，便于两口径混用。
+    _agg_bp = next((str(_c.get("name")) for _c in (topology.get("components") or [])
+                    if str(_c.get("type")) == "PatientTxProcess" and _c.get("name")), "")
+    if _agg_bp and locals().get("layout"):
+        _save_sql2fhir_layout(layout, _agg_bp)
+    _save_fhir_runtime_config(topology, target_config,
+                              mappings=mappings_effective, source_id=source_id)
     # 以及管道目标类型（TransformProcess 路由权威依据，防止 mapping.target_type 缺省 DB 误路由）
     # 转换 BP 的**自身配置**（单管道只有一条 → BP 名固定 TransformProcess）：
     # demo.TransformProcess.OnRequest 首选 ^demo.Config("bp", ..%ConfigName)，
@@ -1913,11 +3395,28 @@ def generate():
                 _pipe["service"] = (target_config or {}).get("service") or "default"
             else:
                 _pipe["table"] = _m0.get("target_table") or ""
+            # 派发目标（显式主机名，口径与多管道一致）：单管道虽不改名，仍写入以便
+            # 与多管道共用同一 BP 读法（生成期自检也会校验其存在性）
+            _sp_items, _sp_item = _dispatch_targets(
+                topology.get("components") or [], None, target_config)
+            if _sp_items:
+                _pipe["items"] = _sp_items
+            if _sp_item:
+                _pipe["item"] = _sp_item
             _pipe_json = json.dumps(_pipe, ensure_ascii=False)
-            native.set(_pipe_json, "^demo.Config", "bp", "TransformProcess")
+            # ① 权威：本 BP 自己的参数（BP 内用 ..%ConfigName 读）
+            #    ⚠ 仅当本拓扑**确有** TransformProcess 主机时才登记（口径同多管道）
+            if _has_router:
+                native.set(_pipe_json, "^demo.Config", "bp", "TransformProcess")
+            _ids_json = json.dumps([str(x.get("id")) for x in mappings_effective if x.get("id")],
+                                   ensure_ascii=False)
             for _bn in _source_bs_names(topology):
-                native.set("TransformProcess", "^demo.Config", "bp_target", _bn)
+                # ② 源 BS → BP 投递表（仅本拓扑有转换 BP 时才有意义）
+                if _has_router:
+                    native.set("TransformProcess", "^demo.Config", "bp_target", _bn)
                 native.set(_pipe_json, "^demo.Config", "pipe", _bn)
+                # 本管道映射集：源 BS 据此只消费本管道在 FHIR 队列里的行（多管道不互相抢行）
+                native.set(_ids_json, "^demo.Config", "bs_mappings", _bn)
             native.set(_m0.get("id", ""),
                        "^demo.Config", "pipeline", "active_mapping")
             native.set(target_type,
@@ -1970,7 +3469,7 @@ def generate():
                 if _fix2.get("status") == "ok" and _fix2.get("mappings"):
                     for _m in _fix2["mappings"]:
                         if isinstance(_m, dict) and _m.get("id"):
-                            repository.set_json("^demo.Mapping", _m["id"], _m)
+                            _write_mapping_patch(_m)
                     mappings_effective = _fix2["mappings"]
                     result = iris_connector.class_method_value(
                         "demo.PipelineGenerator", "Generate",
@@ -2051,6 +3550,15 @@ def generate():
                 category_hint=_category,
                 mapping_ids=[m.get("id") for m in mappings_effective if m.get("id")],
                 components=topology.get("components"),
+                # P0：存**未改名**原始组件（含 infra）+ 是否 sql2fhir + 布局 + 输入签名，
+                #     供下次增量生成复用（跳过 Agent B、不重渲不重启）
+                ai_components=ai_components or [],
+                is_sql2fhir=bool(locals().get("sql2fhir_flow")),
+                layout=(locals().get("layout") if locals().get("sql2fhir_flow") else None),
+                signature=_sig_in1,
+                applied_signature=pipeline_instances.component_signature(
+                    (topology or {}).get("components"),
+                    mapping_ids=[m.get("id") for m in mappings_effective if m.get("id")]),
                 routes={"source_bs": _src_bs[0] if _src_bs else "",
                         "source_bs_names": _src_bs},
                 ai={"driven": ai_components is not None,
@@ -2062,24 +3570,42 @@ def generate():
             pipeline_error = str(_pie)
             logger.error("管道实体登记失败（生成已成功，实体未登记）: %s", _pie)
 
-    # 术语判码缓存：mapping 含 term_map 时，按当前源表编码值预判定（Skill 执行；结果显式回传）
-    term_cache_report: dict = {}
+    # 术语覆盖**复核**（只读盘点）：运行期由共享 BO 实时查；缺映射进"待办清单"（只告警不阻断）
+    term_summary: dict = {}
     if result == "OK":
         try:
-            term_cache_report = _refresh_term_cache(mappings_effective, topology, validation)
-        except Exception as _tc:  # noqa: BLE001 - 刷新异常也显式报告
-            logger.error("生成后判码缓存刷新异常: %s", _tc)
-            term_cache_report = {"ok": False, "error": str(_tc),
-                                 "note": "判码缓存刷新异常（term_map 决策将无法落地）"}
+            term_summary = _term_summary(mappings_effective, topology, validation)
+        except Exception as _tc:  # noqa: BLE001 - 复核异常也显式报告（不影响生成结果）
+            logger.warning("生成后术语复核异常（不影响生成）: %s", _tc)
+            term_summary = {"ok": False, "error": str(_tc),
+                            "note": "术语复核异常；运行期由共享 BO 实时查询（缺映射会降级）"}
+
+    # 配置收敛（口径同多管道）：清理指向不存在组件的 `bp` / `bp_target` 陈旧登记
+    config_cleanup: dict = {}
+    if result == "OK":
+        try:
+            config_cleanup = prune_stale_bp_config(
+                keep_bps={"TransformProcess"} if _has_router else set(),
+                keep_srcs=set(_source_bs_names(topology)) if _has_router else set())
+        except Exception as _pce:  # noqa: BLE001 - 收敛失败不改变生成结果
+            logger.warning("配置收敛异常（不影响生成）: %s", _pce)
+            config_cleanup = {"error": str(_pce)}
 
     return success({
         "result": result,
         "production": "demo.DataflowProduction",
         "validation": validation,
+        # BP 生成链（Plan → Execute）审计：bp_mode / 计划方法清单 / 每方法状态 / 单测汇总
+        "bp_mode": _bp_mode_meta,
         # 许可预算：本次生成让旧管道组件让出的许可单元（社区版仅 8 个许可单元）
         "license_budget": license_budget,
-        # 术语判码缓存（term_map 决策的运行期前提）：ok=false 表示 AI 决策未能落地
-        "term_cache": term_cache_report,
+        # 术语覆盖复核 + **待办清单**（运行期由共享 BO 实时查；缺映射默认降级、不阻断）
+        "term_summary": term_summary,
+        "term_todo": _term_todo,
+        # 术语服务器目录/盘点摘要（唯一事实源：覆盖了多少码、缺什么、源库命名空间）
+        "term_catalog": _term_catalog,
+        # 配置收敛：本次生成清理掉的陈旧 `bp` / `bp_target` 登记（无对应组件）
+        "config_cleanup": config_cleanup,
         # AI 驱动信息：Agent B（LLM）决定组件构成；supplemented 为注册表保底补齐（校验性，非替代）
         "ai": {
             "driven": ai_components is not None,

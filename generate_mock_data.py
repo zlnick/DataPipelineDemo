@@ -5,7 +5,8 @@
     docker compose exec dataflow-backend python /app/generate_mock_data.py --fhir 5 --sql 3
 
 说明：
-- FHIR：向 IRIS FHIR Server 事务写入几条 Patient（触发 FHIR 增量抓取链路）。
+- FHIR：向 FHIR **源**仓库事务写入几条 Patient（触发 FHIR 增量抓取链路）。
+  地址取 `FHIRConfig.BASE_URL`，演示默认 = 第二个独立仓库 **DemoFHIR**（`/csp/healthshare/demofhir/fhir/r4`）。
 - SQL：向 SQLUser.PatientEntity（SQL 源演示表，三字段实体）插入几条行
   （触发 SQL 源轮询 → SOAP 投递链路）。假设 SQL 源向导选择了 PatientEntity 表。
 - 主键带时间戳后缀，重复执行不互相覆盖。

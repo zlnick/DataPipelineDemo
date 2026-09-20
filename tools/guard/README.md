@@ -105,6 +105,13 @@ assert_in_scope(candidate_paths)  # 越界即抛 ScopeViolation，脚本必须�
 
 - `docker_guard.sh` 是 shell 函数包装：`/usr/local/bin/docker rm ...` 这类绝对路径调用可绕过；
   它挡的是"顺手删"，不是"蓄意绕"。
+- **已知误拒（不是越界，换写法即可，不要绕过守卫）**：守卫把「第一个非 `-` 开头的参数」当目标，
+  而 `-w` / `-v` 这类**带值选项**的值会排在容器名前，于是被当成目标 →
+  - `docker exec -w /app dataflow-backend python x.py` → **rc=77**（把 `/app` 当越界目标）。
+    容器 `WORKDIR` 通常已是 `/app`，直接 `docker exec <容器> python …` 即可；
+  - `docker cp <宿主路径> <容器>:<容器路径>` → 同样被首个参数（**源**路径）判归属而误拒。
+    往本项目容器送文件改用**管道**：
+    `docker exec -i <容器> sh -c 'cat > /tmp/x.py' < 本地文件` → 再 `docker exec <容器> python /tmp/x.py`。
 - `scope_guard.py` 只校验**它被调用时传入的路径**；清理脚本必须真的调用它才有意义（协议要求）；
   文件层的兜底是可选沙箱（内核拒绝越界写入）。
 - 沙箱只约束**从 `ai-session.sh` 起的那个 shell**；AI 在别的工作区/普通终端里跑就不受限。

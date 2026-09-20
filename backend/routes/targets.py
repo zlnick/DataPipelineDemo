@@ -416,12 +416,19 @@ def create_target():
         "type": target_type,
         "connection": conn,
     })
+    # DSN 归一（演示默认 DB 目标库 = **CLINIC**）：按 jdbc_url 的命名空间注册 DSN 并写回 runtime，
+    # 生成管道时 DB 目标 SQLOp 直接引用它 —— 不再硬编码 localTarget/USER（否则"目标登记 CLINIC、
+    # 数据却写进 USER"的静默错位，详见 services/jdbc_dsn.py 模块说明）。
+    from backend.services import jdbc_dsn
+    dsn_name = jdbc_dsn.register_for_target(repository.get_target(target_id))
     try:
         rt = connection_profiler.profile_target(repository.get_target(target_id))
         repository.update_target(target_id, {"runtime": rt})
     except Exception as exc:  # noqa: BLE001
         logger.warning("DB 目标探查失败: %s", exc)
-    return success({"id": target_id, "target": repository.get_target(target_id)}, "数据目标添加成功")
+    logger.info("DB 目标 %s 登记完成（DSN=%s）", target_id, dsn_name)
+    return success({"id": target_id, "dsn": dsn_name,
+                    "target": repository.get_target(target_id)}, "数据目标添加成功")
 
 
 @targets_bp.post("/<target_id>/import")
@@ -555,10 +562,15 @@ def test_target(target_id: str):
                         "candidates": rt.get("candidates") or {}},
                        f"{ttype} 目标连通（{health.get('detail') or 'OK'}）")
     result = jdbc_client.test_connection(tg.get("connection") or {})
+    if result["ok"]:
+        # 连通即顺带把 DSN 归一/注册（与数据源侧「连通测试即注册 DSN」同一时机），
+        # 保证生成 SQLOp 时引用的是**目标命名空间**对应的 DSN（如 CLINIC），而不是 localTarget/USER
+        from backend.services import jdbc_dsn
+        result["dsn"] = jdbc_dsn.register_for_target(repository.get_target(target_id))
     repository.update_target(target_id, {"status": "connected" if result["ok"] else "error"})
     if not result["ok"]:
         return error(f"连接失败: {result['message']}"), 500
-    return success(result, "连接成功")
+    return success(result, f"连接成功（DSN={result.get('dsn') or 'localTarget'}）")
 
 
 @targets_bp.get("/<target_id>/schemas")
@@ -621,8 +633,17 @@ def select_tables(target_id: str):
         except Exception as exc:  # noqa: BLE001
             logger.error("分析列失败 %s.%s: %s", schema, table, exc)
             return error(f"分析表 {table} 列失败: {exc}"), 500
-        repository.add_target_table(target_id, schema, table, columns)
-        saved.append({"schema": schema, "table": table, "columns": columns})
+        # 主键列事实（JDBC 元数据）：IRIS 的 INSERT/UPSERT 要求主键非空，
+        # 该事实供 Agent A（生成映射）与 C1（验证修复）使用；探查失败不阻断登记。
+        try:
+            key_columns = jdbc_client.list_primary_keys(conn, schema, table)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("分析主键失败（%s.%s，按未知处理）: %s", schema, table, exc)
+            key_columns = []
+        repository.add_target_table(target_id, schema, table, columns,
+                                    key_columns=key_columns)
+        saved.append({"schema": schema, "table": table, "columns": columns,
+                      "key_columns": key_columns})
 
     repository.update_target(target_id, {"status": "analyzed"})
     # —— 接口分析 Agent（LLM）：DB 目标表语义 + 写读方向判定（失败即显式失败）——

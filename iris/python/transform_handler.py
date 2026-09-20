@@ -98,7 +98,7 @@ def _split_args(expr):
 
 
 def _get_field(resource, source_path):
-    """从源数据按字段路径提取值（兼容 "表.列" 前缀 + list/dict 归一）。
+    """从源数据按字段路径提取值（兼容多段「限定名」前缀 + 扁平行末段兜底）。
 
     参数:
         resource: 源数据（FHIR 资源 dict / SQL 行 dict）。
@@ -107,12 +107,27 @@ def _get_field(resource, source_path):
     返回:
         归一后的值；提取失败返回 None。
     """
-    val = _get_path(resource, source_path)
-    if val is None and "." in source_path and not source_path.startswith("["):
-        # 兼容 "表名.路径" 前缀（SQL 多表映射/资产命名常带表名前缀）：
-        # 去掉首段（表名）保留完整余路径（可含 name[0] 索引），如 Patient.name[0].family → name[0].family
-        rest = source_path.split(".", 1)[1]
-        val = _get_path(resource, rest)
+    path = str(source_path or "").strip()
+    val = _get_path(resource, path)
+    if val is None and "." in path:
+        # 逐级剥前缀：`SQLUser.Patient.ID`（schema.表.列）/ `Patient.name[0].family` / `表.列`
+        # ⚠ 旧实现只剥**一层**（`split(".", 1)[1]`）：三段全限定名（SQL 源映射实测常这么写）
+        #   剥成 `Patient.ID` 仍取不到 → **整行值全为 null** → DB 目标 INSERT 报
+        #   `<Field 'SQLUser.Patient.ID' is required>`（消息 Error、目标零落地，而生成接口一路
+        #   `code:0`；2026-09-17 Round 2 实测）。限定名深度不必假设，逐级尝试即可。
+        parts = path.split(".")
+        for i in range(1, len(parts)):
+            val = _get_path(resource, ".".join(parts[i:]))
+            if val is not None:
+                break
+    if val is None and isinstance(resource, dict) and path:
+        # 扁平源行（SQL 轮询行 = 裸列名）兜底：按**末段**做大小写不敏感匹配——
+        # 覆盖 `Patient.familyname` 这类限定名与实际列名大小写不一致的写法。
+        last = path.split(".")[-1].strip().lower()
+        for k, v in resource.items():
+            if str(k).strip().lower() == last:
+                val = v
+                break
     if isinstance(val, list):
         val = val[0] if val else None
     if isinstance(val, dict):

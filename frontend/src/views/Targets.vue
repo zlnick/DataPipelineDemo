@@ -22,9 +22,9 @@
             </el-option>
           </el-select>
         </el-form-item>
-        <!-- DB 目标：JDBC 连接 -->
+        <!-- DB 目标：JDBC 连接（演示默认目标库 = CLINIC 命名空间；SQL 源默认 = USER 命名空间） -->
         <el-form-item v-if="form.type === 'DB'" :label="t('targets.fldJdbcUrl')">
-          <el-input v-model="form.jdbc_url" placeholder="jdbc:IRIS://iris:1972/USER" style="width: 320px" />
+          <el-input v-model="form.jdbc_url" placeholder="jdbc:IRIS://iris:1972/CLINIC" style="width: 320px" />
         </el-form-item>
         <el-form-item v-if="form.type === 'DB'" :label="t('targets.fldDriver')">
           <el-input v-model="form.driver_class" placeholder="com.intersystems.jdbc.IRISDriver" style="width: 260px" />
@@ -297,14 +297,16 @@ const constraintsRows = ref([])
 const form = reactive({
   name: t('targets.defName'),
   type: 'DB',
-  jdbc_url: 'jdbc:IRIS://iris:1972/USER',
+  // DB 目标默认 JDBC（演示默认：SQL 源 = USER 命名空间 / SQL 目标 = CLINIC 命名空间）
+  // 平台按 URL 命名空间推导 DSN（CLINIC → DSN `CLINIC`），故改这里即改写入库
+  jdbc_url: 'jdbc:IRIS://iris:1972/CLINIC',
   driver_class: 'com.intersystems.jdbc.IRISDriver',
   username: 'superuser',
   password: 'SYS',
   // SOAP 目标配置（WSDL 导入型）
   wsdl: '/tmp/patient.wsdl',
   service: 'PatientService',
-  // FHIR 目标配置（US Core 声明式存储库）
+  // FHIR 目标配置（US Core 声明式存储库）——演示默认 **目标仓库 = FHIRSERVER**（实例自带）
   base_url: 'http://iris:52773/csp/healthshare/fhirserver/fhir/r4',
 })
 

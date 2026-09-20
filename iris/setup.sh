@@ -39,6 +39,41 @@ EOF
 
 /usr/irissys/bin/iris session "$instance" -U %SYS < /tmp/setup_fhir.os
 
+# 2b. 搭建第二个 FHIR 存储库（DemoFHIR namespace + 独立仓库端点）
+# 目的：与上面 FHIRSERVER 完全同构的**第二个 FHIR 仓库**（独立命名空间 + 独立数据库 + 独立端点），
+#       供演示「多 FHIR 仓库并存 / 数据互不干扰」。
+# 官方安装序列（与 FHIRSERVER 一字不差，只是换了命名空间与端点路径）：
+#   Foundation.Install(ns)  → 建库（/dur/irissys/mgr/<ns>，随 ISC_DATA_DIRECTORY 持久化）+ 建命名空间
+#                             （含 Ensemble 映射、Portal CSP 应用、FoundationProduction 模板、FHIR 元数据包）
+#   InstallNamespace()      → 在**当前命名空间**内安装 FHIR Server 支持（编译 HSFHIR.* 存储类、建表）
+#   InstallInstance(...)    → 注册 FHIR 仓库端点（CSP 应用 + DispatchClass=HS.FHIRServer.RestHandler），
+#                             pCreateDatabases=1 会自动建 <ns>X0001R / <ns>X0001V 两个数据仓库库
+# 幂等：命名空间已存在则跳过 Foundation.Install；端点已存在时 InstallInstance 异常被捕获跳过，
+#       随后只对齐该端点自身的认证（AutheEnabled/MatchRoles，与既有 FHIR 端点同口径）——
+#       ⚠ 只作用于本步骤新建的端点应用，绝不触碰任何既有 Web Application（门户/登录等）。
+# 说明：可在运行中的实例上重复执行同一段脚本（不重启 IRIS）：`python3 tools/create_fhir_repo.py`
+echo "=== [setup] 搭建第二个 FHIR 存储库（DemoFHIR namespace + 独立仓库端点） ==="
+cat << 'EOF' > /tmp/setup_demofhir.os
+zn "%SYS"
+set ns = "DEMOFHIR"
+set appKey = "/csp/healthshare/demofhir/fhir/r4"
+set strategyClass = "HS.FHIRServer.Storage.JsonAdvSQL.InteractionsStrategy"
+set metadataPackages = $lb("hl7.fhir.r4.core@4.0.1")
+write "[demofhir] 前置：命名空间=", ##class(%SYS.Namespace).Exists(ns), " 库=", ##class(Config.Databases).Exists(ns), " CSP应用=", ##class(Security.Applications).Exists(appKey), !
+if '##class(%SYS.Namespace).Exists(ns) { zn "HSLIB" do ##class(HS.Util.Installer.Foundation).Install(ns) zn "%SYS" write "[demofhir] Foundation.Install 完成，新建库=", ##class(Config.Databases).Exists(ns), ! }
+zn ns
+do ##class(HS.FHIRServer.Installer).InstallNamespace()
+write "[demofhir] InstallNamespace 完成（当前命名空间=", $namespace, "）", !
+try { do ##class(HS.FHIRServer.Installer).InstallInstance(appKey, strategyClass, metadataPackages) write "[demofhir] InstallInstance 完成", ! } catch ex { write "[demofhir] InstallInstance 跳过/异常: ", ex.DisplayString(), ! }
+zn "%SYS"
+if ##class(Security.Applications).Get(appKey, .props) { set props("AutheEnabled") = 8288 set props("MatchRoles") = ":%All" do ##class(Security.Applications).Modify(appKey, .props) write "[demofhir] CSP 应用认证已设置（AutheEnabled=8288, MatchRoles=:%All）", ! }
+write "[demofhir] 结果：命名空间=", ##class(%SYS.Namespace).Exists(ns), " 库=", ##class(Config.Databases).Exists(ns), " CSP应用=", ##class(Security.Applications).Exists(appKey), !
+write "[demofhir] DEMOFHIR_FHIR_REPO_DONE", !
+halt
+EOF
+
+/usr/irissys/bin/iris session "$instance" -U %SYS < /tmp/setup_demofhir.os
+
 # 3. 编译 Production 组件类（按依赖顺序逐个编译，避免 LoadDir 的编译顺序竞态）
 echo "=== [setup] 编译 Production 组件类 ==="
 /usr/irissys/bin/iris session "$instance" -U USER <<'EOF'
@@ -56,10 +91,13 @@ write "COMPILE_DONE", !
 halt
 EOF
 
-# 4. 配置 JDBC 数据源 localTarget（SQL Operation 通过 JDBC 写入 USER namespace 目标表）
+# 4. 配置 JDBC 数据源 localTarget（通用 DSN：无 jdbc_url 时的历史兜底，指向 USER namespace）
 #    - Name=连接逻辑名（SQL Operation 的 DSN 引用它）
 #    - DSN=JDBC URL（必须含冒号，EnsLib.SQL.OutboundAdapter 依此判断走 JDBC 而非 ODBC）
 #    - isJDBC=1 + driver/URL/Usr/pwd 完整配置
+#    ⚠ 演示默认口径（2026-09-16）：**SQL 源 = USER、SQL 目标 = CLINIC** —— 源/目标的 DSN 都由
+#      登记 jdbc_url 的命名空间推导（`…/<ns>` → DSN `<ns>`，见 backend/services/jdbc_dsn.py），
+#      `localTarget` 只在"没有 jdbc_url"时才被引用。
 echo "=== [setup] 配置 JDBC 数据源 localTarget ==="
 /usr/irissys/bin/iris session "$instance" -U %SYS <<'EOF'
 // 幂等：连接已存在则跳过（注意：iris session stdin 不支持多行 if，且 SQL 字面量需用参数绑定避免单引号被解析）

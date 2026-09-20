@@ -50,6 +50,17 @@
         </el-form-item>
       </el-form>
       <el-alert :title="t('recommend.alert')" type="warning" :closable="false" show-icon />
+      <!-- 重名跨源审计（2026-09-19）：资产名在多个数据源间重名时平台**不猜测**其数据源，
+           此处显式告知（否则映射会被归属到别的源 → 分组后该组缺主表 → 生成失败） -->
+      <el-alert
+        v-if="ambiguousNames.length"
+        class="mt8"
+        type="error"
+        :closable="false"
+        show-icon
+        :title="t('recommend.sourceAmbiguousTitle', { names: ambiguousNames.join('、') })"
+        :description="ambiguousDesc"
+      />
     </el-card>
 
     <!-- 验证报告（AI 推荐后的转换关系验证状态） -->
@@ -143,6 +154,16 @@ const recommending = ref(false)
 const recommendations = ref([])
 const transformationPlan = ref(null)
 const validation = ref(null)
+// 重名跨源审计：{资产名: [候选数据源 id...]} —— 平台在名字有歧义时**不猜测**数据源，
+// 此处显式提示（2026-09-19 实测：Clinic 的 Patient 被静默归属到 USER 源 → 该组缺主表 → 生成失败）
+const sourceAmbiguous = ref({})
+const ambiguousNames = computed(() => Object.keys(sourceAmbiguous.value || {}))
+const ambiguousDesc = computed(() => {
+  const rows = Object.entries(sourceAmbiguous.value || {})
+    .map(([nm, ds]) => `${nm} → ${(ds || []).join(' / ')}`)
+    .join('；')
+  return t('recommend.sourceAmbiguousDesc', { rows })
+})
 
 // 验证检查项名称（后端 check 字段 → 本地化标签）
 const CHECK_NAMES = {
@@ -236,7 +257,7 @@ function buildRecommendPayload() {
     profile: t.profile || '',
     open: !!t.open,
     note: t.open
-      ? '开放 FHIR R4 类型（服务器支持、平台未建模）：映射 target 字段需你依 FHIR R4/US Core 规范自定'
+      ? t('common.openFhirNote')
       : '',
   }))
   const targetModels = selectedTargetObjs.map((t) => ({
@@ -304,9 +325,13 @@ async function handleRecommend() {
     recommendations.value = data?.recommendations || []
     transformationPlan.value = data?.transformation_plan || null
     validation.value = data?.validation || null
+    sourceAmbiguous.value = data?.source_ambiguous || {}
     ElMessage.success(t('recommend.recommendDone', { n: recommendations.value.length }))
     if (validation.value && !validation.value.ok) {
       ElMessage.warning(t('recommend.validationWarnMessage', { n: validation.value.error_count }))
+    }
+    if (ambiguousNames.value.length) {
+      ElMessage.warning(t('recommend.sourceAmbiguousTitle', { names: ambiguousNames.value.join('、') }))
     }
   } finally {
     recommending.value = false
@@ -324,11 +349,27 @@ async function confirmAll() {
   // 多条映射 id 相同（^demo.Mapping 以 id 为键），后保存的覆盖先保存的。
   // 因此用时间戳 + 序号拼接生成唯一 id。
   const stamp = Date.now() % 100000
+  // 源数据源归属：**以用户勾选的资产为准**（显式选择，不是猜）——
+  // 同名资产跨源（如 USER.Patient 与 Clinic.Patient）时，平台按名字反查会判歧义并留空 source_id，
+  // 导致该映射掉进"无源"组 → 按 (源,目标) 分组后本组缺主表 → SQL→FHIR 生成 500。
+  // 这里用 selectedAssets（用户勾选的资产 id）反查其 source_id：**唯一命中才采用**，
+  // 同一名字勾了多个源的资产 → 仍留空（不猜，由平台的红条提示引导用户分源匹配）。
+  const srcIdByName = {}
+  for (const aid of selectedAssets.value) {
+    const a = allAssets.value.find((x) => x.id === aid)
+    if (!a) continue
+    const key = String(a.name || '').toLowerCase()
+    if (!key) continue
+    if (!(key in srcIdByName)) srcIdByName[key] = a.source_id || ''
+    else if (srcIdByName[key] !== (a.source_id || '')) srcIdByName[key] = ''
+  }
   const mappings = recommendations.value.map((rec, idx) => ({
     id: `M${stamp}${idx}`,
     source: rec.asset,
+    // 归属优先取平台归一结果（rec.source_id），其次取用户勾选资产的源（唯一命中时）
+    source_id: rec.source_id || srcIdByName[String(rec.asset || '').toLowerCase()] || undefined,
     target_table: rec.target_table,
-    target_type: typeByTable[rec.target_table] || 'DB',
+    target_type: rec.target_type || typeByTable[rec.target_table] || 'DB',
     field_mappings: (rec.field_mappings || []).map((fm) => ({
       source: fm.source,
       target: fm.target,
@@ -343,7 +384,12 @@ async function confirmAll() {
     status: 'confirmed',
   }
   await modelApi.createPlan(plan)
-  await mappingApi.save(mappings)
+  const saved = await mappingApi.save(mappings)
+  // 保存入口同样会回报重名跨源（未猜测 source_id 的映射）→ 显式提示，避免"静默错归属"
+  const amb = saved?.source_ambiguous || {}
+  if (Object.keys(amb).length) {
+    ElMessage.warning(t('recommend.sourceAmbiguousTitle', { names: Object.keys(amb).join('、') }))
+  }
   ElMessage.success(t('recommend.saved'))
   router.push('/mappings')
 }

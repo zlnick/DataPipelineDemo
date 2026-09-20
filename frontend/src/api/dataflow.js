@@ -52,11 +52,15 @@ export const aiApi = {
 export const mappingApi = {
   list: () => http.get('/mappings'),
   save: (mappings) => http.post('/mappings', { mappings }),
+  // 术语映射（术语服务器 = 唯一事实源）：只读目录+预检摘要；迁移为本地物化缓存（运行期零网络）
+  termCatalog: () => http.get('/mapping/term-catalog'),
 }
 
 // 已封装 AI Agent 目录
 export const agentApi = {
   list: () => http.get('/agents'),
+  // Skill 目录：管道设计 Skill（Agent B 选用）+ 术语判码 Skill（A/C1 受控指令），含实际使用次数
+  skills: () => http.get('/agents/skills'),
 }
 
 // 数据管道

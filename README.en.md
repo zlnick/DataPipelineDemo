@@ -50,6 +50,40 @@ auditable `ai` payload (`driven/components/supplemented/c2_rule_rebuilt`) and to
 - **Knowledge loop**: validation experience is deduplicated and restructured by the **Knowledge Polish Agent (LLM)**
   and exported to an Obsidian vault (`export_validation_issues.py`).
 
+### ✨ Incremental pipeline generation (pipeline-scoped)
+
+Generation is no longer a full recompute every time — it is **incremental at the pipeline level**:
+
+- **Stable identity**: the same `(source datasource, target)` is always **the same pipeline** — no matter how many
+  times you submit, or which design Skill the LLM picks (one `PIPE_<src>_<tgt>` record, updated in place).
+- **Skip when unchanged**: if the inputs (mapping content / source·target contracts) did not change, the platform
+  **reuses the stored component definitions, does not re-run Agent B and does not restart the Production**
+  (`unchanged=true` / `render_skipped=true`; the UI reports "all pipelines already exist and are unchanged").
+- **Only changed groups are generated**: the UI submits just the new/changed groups; **existing pipelines that were
+  not submitted are merged back from their stored definitions** (never wiped by a full re-render) and keep their
+  runtime state (enabled flags / license / scan keys).
+- **Duplicate submissions are safe**: identical `(source, target)` groups inside one payload are merged and reported
+  in `dup_merged` (auditable).
+- **Force rebuild**: turn on the UI switch **"Force regenerate"** (`force=true`) when you really want a redesign.
+
+### ✨ AI capability catalog (Tools / Workflows / Skills / Agents + Skill catalog)
+
+The **AI Agents** page classifies platform capabilities per the industry reference (Anthropic, *Building effective
+agents*) and shows the reasoning for every entry:
+
+| Class | Meaning | Items in this project |
+| --- | --- | --- |
+| **Tool** | Deterministic callable, **no LLM** | Connection profiler / connectivity gate / fact checks (`pipeline_validator.check_*`) / rule checks / BP static admission / terminology gap precheck / target column & key facts / WSDL entity analysis / terminology lookup BO (`demo.TerminologyOperation`) / type & FHIR model registries |
+| **Workflow** | LLM involved, but the **path is predefined in code** | Interface analysis (tool-driven facts + one LLM pass); Pipeline Design Agent B (decides once → the platform renders along a fixed path) |
+| **Skill** | Packaged instructions/knowledge, **single step**, no tool loop | Transformation generation (A), knowledge polish, terminology judgement (C3 / C3-Dx: single-shot judgement + lookup tool) |
+| **Agent** | **Tools + multi-round autonomous loop + goal** | Transformation validation-fix (C1); Pipeline validation-fix (C2) |
+
+The page also shows the **Skill catalog** (the controlled list used for AI decisions, `GET /api/agents/skills`):
+**6 pipeline-design Skills** (`sql2fhir-patient-tx` / `sql2db` / `fhir2db` / `sql2soap` / `fhir2soap` / `fhir2fhir`,
+with applies-to source→target, status and topology roles) and **2 terminology Skills** (`cn2snomed` / `cn2rx`, with
+source/target systems and the judging agent) — each with a **usage counter** for the current environment.
+The catalog is only used for **parameterization**; choosing which Skill to use remains an AI decision.
+
 ### Layered models & AI transformation
 The platform separates conversion into three layers instead of assuming a 1:1 "source → target" mapping:
 1. **Source asset model**: FHIR resources / SQL tables with fields, types, keys and relations.
@@ -118,8 +152,16 @@ design the Production topology and hand it to IRIS to compile and start.
 | AI | OpenAI-compatible endpoint (`base_url` / `api_key` / `model`) |
 | Orchestration | Docker Compose (3 containers) |
 
-**IRIS dual role**: FHIRSERVER namespace = FHIR Server (source); USER namespace = platform (targets / Production /
-Mappings / runtime contracts).
+**IRIS multi-role (single instance)**:
+- `FHIRSERVER` namespace = built-in FHIR Server — **default FHIR *target* repository** (conversion results land here)
+  — endpoint `/csp/healthshare/fhirserver/fhir/r4/`
+- `DEMOFHIR` namespace = **second, independent FHIR repository** (main DB `DEMOFHIR` + repository data DBs
+  `DEMOFHIRX0001R/V`) — endpoint `/csp/healthshare/demofhir/fhir/r4/`; fully isolated from `FHIRSERVER`
+  (the same resource id is invisible across repositories). It is the **default FHIR *source* repository**
+  (data-source form, `FHIRConfig.BASE_URL` and the mock-data scripts all default to it).
+  Created by `iris/setup.sh` step 2b (idempotent); re-runnable on a live instance via
+  `python3 tools/create_fhir_repo.py` (with 15 built-in checks).
+- `USER` namespace = the platform (targets / Production / Mappings / runtime contracts).
 
 **Demo tables (SQLUser)**: `Patient`/`Observation` (FHIR→DB landing) · `PatientSource` (SQL-source demo table) ·
 `PatientEntity` (SOAP mock delivery result) · `FHIRQueue` (incremental fetch queue).
@@ -143,8 +185,13 @@ Stop: `docker compose down` (add `-v` to also wipe the IRIS data directory).
 | Frontend | http://localhost | Vue3 (zh/en) |
 | Backend API | http://localhost:5001 | REST (proxied at /api/*) |
 | IRIS Portal | http://localhost:52773/csp/sys/UtilHome.csp | `superuser` / `SYS` |
-| FHIR endpoint | http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/ | `/metadata` anonymous; data needs Basic Auth |
+| FHIR endpoint (built-in = default **target**) | http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/ | `/metadata` anonymous; data needs Basic Auth; conversion results land here |
+| FHIR endpoint (second repository = default **source**) | http://localhost:52773/csp/healthshare/demofhir/fhir/r4/ | Namespace `DEMOFHIR`; the data-source form / `FHIRConfig.BASE_URL` default to it; data invisible to the repository above; check via `python3 tools/create_fhir_repo.py --check` |
 | Superserver | localhost:1972 | Native SDK / DB-API |
+| **Terminology server: terminology sets page (built-in web page)** | http://localhost:52774/terminology/ | Title “术语服务器 · 术语集”; lists 4 terminology sets (Chinese drugs / RxNorm / national ICD-10 / SNOMED US Core sample) with their endpoints; JSON: `http://localhost:52774/terminology/systems`; `superuser` / `SYS` |
+| Terminology server: native REST (browsable) | http://localhost:52774/terminology/… | e.g. `/terminology/icd10/search?q=糖尿病`, `/terminology/drug/search?q=阿司匹林`, `/terminology/uscore-condition/zh-map?q=糖尿病`, `/terminology/vector/search?q=diabetes`; full route map in `termsrv/iris/src/Terminology/Production/API.cls` |
+| Terminology server: portal / Production config | http://localhost:52774/csp/sys/UtilHome.csp ｜ http://localhost:52774/csp/user/EnsPortal.ProductionConfig.zen?$NAMESPACE=TERMINOLOGY | Production = `Terminology.Production`; ⚠ the Ensemble portal lives under `/csp/user/` (the `/csp/sys/` variant returns 404) |
+| Terminology server: upstream React demo UI (Terminology Explorer) | http://localhost:5173 (**not deployed here**) | Requires Node on the host: `cd termsrv/ui && npm install && VITE_API_BASE_URL=http://localhost:52774 npm run dev`; upstream also ships a `webgateway` container (8080) |
 
 > The frontend is for business configuration & monitoring. Technical management of the generated `Ens.Production`
 > (component config, start/stop, message details) happens in the IRIS Management Portal → Interoperability.
@@ -163,6 +210,8 @@ Unified response: `{"code": 0, "data": ..., "message": "success"}` (`code != 0` 
 | POST | `/api/pipelines/generate` | Generate & start pipelines (single or multi) |
 | GET | `/api/pipelines/status` · `/logs` | Status / message log |
 | GET | `/api/pipelines/target-data` | Target table landing data |
+| GET | `/api/agents` | Wrapped AI capabilities (Skills / Agents) |
+| GET | `/api/agents/skills` | **Skill catalog** (pipeline-design + terminology Skills, with applies-to / status / usage count) |
 | GET · POST | `/api/pipelines/validation-issues` | Read / append validation experience |
 | POST | `/api/pipelines/validation-issues/polish` | LLM dedupe + restructure for knowledge export |
 | GET | `/api/agents` | AI capability catalog (Skills / Agents, `kind` field) |
@@ -185,7 +234,7 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
 .
 ├── docker-compose.yml            # IRIS + backend + frontend
 ├── .env.example                  # env template (IRIS/FHIR/LLM)
-├── init_data.py / init_fhir_data.py    # init target tables / FHIR samples
+├── init_data.py                  # init target tables (DROP+CREATE, idempotent)
 ├── generate_mock_data.py         # demo data (--fhir/--obs/--sql)
 ├── export_validation_issues.py   # validation experience → Obsidian knowledge
 ├── README.en.md                  # this file
@@ -202,15 +251,19 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
 │   ├── setup.sh                  # container init
 │   ├── src/demo/                 # Production components + PipelineGenerator + PipelineQuery
 │   └── python/                   # transform_handler.py (Embedded Python)
+├── tools/                        # datakit toolbox (`run.sh list`) + check_component_fidelity.py
 └── data/                         # IRIS persistence
 ```
 ## Demo Walkthrough (start from a blank state)
 
 ### A. FHIR → DB
-1. **Add FHIR source** (Data Sources): endpoint
-   `http://iris:52773/csp/healthshare/fhirserver/fhir/r4/`, auth `superuser/SYS` → Register → **Analyze**
-   (produces runtime contract + AI asset semantics).
-2. **Add DB target** (Targets): JDBC `jdbc:IRIS://iris:1972/USER`, auth superuser/SYS → Add → Test → schema `SQLUser`
+1. **Add FHIR source** (Data Sources): the endpoint is **pre-filled** with
+   `http://iris:52773/csp/healthshare/demofhir/fhir/r4/` (DemoFHIR = default FHIR source repository),
+   auth `superuser/SYS` → Register → **Analyze** (produces runtime contract + AI asset semantics).
+2. **Add DB target** (Targets): the JDBC field is **pre-filled** with `jdbc:IRIS://iris:1972/CLINIC`
+   (default SQL target namespace); this walkthrough writes the platform's built-in target tables
+   `Patient`/`Observation`, which live in the `USER` namespace, so change the URL to
+   `jdbc:IRIS://iris:1972/USER`, auth superuser/SYS → Add → Test → schema `SQLUser`
    → check `Patient`/`Observation` → Analyze columns → Save.
 3. **AI Matching** (Recommend): select the `Patient` asset → AI recommends field mappings → Confirm & save.
 4. **Generate pipeline** (Pipelines): FHIR incremental sync fetches new resources → converts → lands in `Patient`
@@ -231,6 +284,18 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
   message by its source BS to its own target.
 - Do not use the same table as both a SQL source and a FHIR landing target (loop risk; a dedicated `PatientSource`
   table avoids this in the demo).
+
+### D. Incremental pipeline generation (nice right after C)
+
+1. **Click Generate again without changing anything**: the UI reports "all pipelines already exist and are unchanged";
+   the component list (`/api/pipelines/items`) and each instance's generation count stay the same
+   (no LLM re-run, no Production restart).
+2. **Submit only one group**: the other pipelines keep their components (unsubmitted existing pipelines are merged
+   back from their stored definitions); identical groups inside one payload are merged and reported in `dup_merged`.
+3. **Reset one pipeline**: switch on **"Force regenerate"** and generate again (`force=true`) — that group's
+   components are re-designed by AI.
+4. **Verify nothing was lost** (optional): `python3 tools/check_component_fidelity.py` audits
+   "stored definition ⊆ Production components" three times (baseline / reuse submit / force rebuild).
 
 ## AI Guardrails (limits kept, machinery simplified — 2026-09-14)
 
@@ -264,8 +329,28 @@ See [`tools/guard/README.md`](tools/guard/README.md) for the full design, verifi
 - The SOAP target demo points to the Python mock by default; for a real integration fill in the real endpoint in the
   target connection (Adapter `WebServiceURL` overrides the WSDL address).
 - Target writes are UPSERTs (idempotent across repeated polling).
-- `init_data.py` / `init_fhir_data.py` rebuild target tables and resubmit FHIR samples on each backend start
-  (fine for demos; do not auto-clear in production).
+- `init_data.py` rebuilds the target tables on each backend start (DROP+CREATE; fine for demos, do not auto-clear in
+  production).
+- FHIR demo data is **not** seeded at startup (since 2026-09-16): create it on demand
+  (`tools/gen_test_patient.py`, `generate_mock_data.py --fhir N`), or run
+  `bash tools/datakit/run.sh seed_fhir_demo.py` when you explicitly need pre-existing history.
+- **Analyzing a FHIR source no longer requires data first** (since 2026-09-18): field discovery goes
+  real sample data (preferred) → server StructureDefinition → **platform FHIR spec snapshot** (11 modeled
+  US Core resources) → **AI completion per FHIR R4 spec** (other types). Provenance is visible in
+  `runtime.note.fields.provenance` and in the UI "Runtime Contract" column; once real data exists, the next
+  analyze switches back to the real data shape. Seeding stays optional:
+  `bash tools/datakit/run.sh seed_fhir_demo.py`.
 - The English UI is an interface shell shared with the Chinese UI (`zh.js` / `en.js`); dynamic content produced by
   the backend / AI (asset semantics, error messages, logs, landed data) stays in its source language.
 - **Do not modify IRIS Web Applications / Security permissions** (management & Ensemble portals depend on them).
+- **Terminology judgement has three outcomes** (queried live from the terminology server through the shared BO
+  `demo.TerminologyOperation`): `active` → the target-system coding is appended (dual coding, e.g. `E11.900` +
+  SNOMED `44054006`); **`negative` (judged "no equivalent", e.g. a compound drug) → only the source coding is kept,
+  no target coding and no `unmapped` tag**; `missing` / call failure → source coding kept plus
+  `meta.tag=urn:cn-nhsa:term-map|unmapped` (non-blocking; after curation **no regeneration is needed**).
+- **License & pipeline switching**: the community-edition IRIS license allows **8 business-host units**, so several
+  pipelines cannot run at the same time — extra groups are generated as `suspended`; use the **enable / disable**
+  buttons on the "Pipelines" card for one-click switching (units are freed by disabling other active pipelines,
+  listed in `disabled_others`).
+- **Component fidelity self-check**: `python3 tools/check_component_fidelity.py`; toolbox index:
+  `bash tools/datakit/run.sh list` (includes `test_incremental_pipeline.py` and data-generation scripts).

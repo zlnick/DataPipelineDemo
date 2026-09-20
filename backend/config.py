@@ -78,15 +78,27 @@ class LLMConfig:
 
 
 class FHIRConfig:
-    """FHIR 数据源（IRIS 自带 FHIR Server）配置。
+    """FHIR 仓库访问配置（演示默认：**源 = DemoFHIR，目标 = FHIRSERVER**）。
+
+    实例内有两个互相隔离的 FHIR 存储库（各建/自检见 `iris/setup.sh` 步骤 2b、`tools/create_fhir_repo.py`）：
+    - **源** = `DEMOFHIR` namespace（第二个独立仓库）→ 演示的 FHIR 数据源从这里抓；
+    - **目标** = `FHIRSERVER` namespace（实例自带）→ 转换结果（US Core 资源）落这里。
 
     注意（方案 A）：IRIS FHIR Server 对资源读写默认要求 Basic Auth（superuser/SYS），
     仅 /metadata 匿名公开；本配置提供访问 endpoint 所需的认证信息。
     """
 
-    # FHIR endpoint 基础 URL（含结尾 /）
+    # FHIR **源**仓库 base URL（含结尾 /）——演示默认 = 第二个独立仓库 DemoFHIR
     BASE_URL = os.getenv(
         "FHIR_BASE_URL",
+        "http://127.0.0.1:52773/csp/healthshare/demofhir/fhir/r4/",
+    )
+    # 语义别名：显式表达「这是 FHIR 源的地址」（可用 FHIR_SOURCE_BASE_URL 单独覆盖）
+    SOURCE_BASE_URL = os.getenv("FHIR_SOURCE_BASE_URL", BASE_URL)
+    # FHIR **目标**仓库 base URL ——演示默认 = 实例自带 FHIRSERVER（转换结果落这里；
+    # 目标落地效果校验的兜底地址必须用它，不能跟着「源」的默认值走）
+    TARGET_BASE_URL = os.getenv(
+        "FHIR_TARGET_BASE_URL",
         "http://127.0.0.1:52773/csp/healthshare/fhirserver/fhir/r4/",
     )
     USERNAME = os.getenv("FHIR_USERNAME", "superuser")

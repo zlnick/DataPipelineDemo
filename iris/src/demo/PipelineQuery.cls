@@ -16,6 +16,122 @@ ClassMethod GetBpLastGood() As %String
     Quit $Get(^demo.Config("bp", "last_good"))
 }
 
+/// 方法级单测**调用助手**：按方法**形参声明类型**把 JSON 文本参数转成对应 IRIS 值再调用。
+///
+/// 背景（2026-09-19）：平台在生成期对"纯函数"方法做合成输入单测；若方法形参声明为
+/// `%DynamicObject`/`%DynamicArray`，直接把 JSON **字符串**传进去会取不到值（实测
+/// `ExtractMrn` 断言失败、实际返回 ""）。本方法读 `%Dictionary` 的 FormalSpec，按声明类型
+/// 决定"转对象/传字符串"，从而与运行期真实调用一致。
+/// 支持 0~4 个参数（聚合 BP 的纯函数方法形参不会更多）。
+ClassMethod InvokeMethodJson(pClass As %String, pMethod As %String, pArgsJson As %String) As %String
+{
+    Set tArgs = ##class(%DynamicArray).%FromJSON(pArgsJson)
+    Set tN = tArgs.%Size()
+    Set tSpec = ""
+    Try {
+        Set tMD = ##class(%Dictionary.MethodDefinition).%OpenId(pClass_"||"_pMethod)
+        If $IsObject(tMD) Set tSpec = tMD.FormalSpec
+    } Catch e {
+        Set tSpec = ""
+    }
+    ; 形参类型清单（按逗号切，取每项的 " As <type>"）
+    Set tTypes = ##class(%DynamicArray).%New()
+    For i=1:1:$LENGTH(tSpec,",") {
+        Set tOne = $PIECE(tSpec, ",", i)
+        Set tType = ""
+        If tOne [ " As " Set tType = $ZSTRIP($PIECE(tOne, " As ", 2), "<>W")
+        Do tTypes.%Push(tType)
+    }
+    ; 逐个参数：JSON 看起来像对象/数组 且 形参是动态类型 → 转对象；否则原样字符串
+    Set tV1="", tV2="", tV3="", tV4="", tV5="", tV6="", tV7="", tV8=""
+    For i=0:1:tN-1 {
+        Set tRaw = tArgs.%Get(i)
+        Set tType = tTypes.%Get(i)
+        Set tVal = tRaw
+        If ($IsObject(tRaw)) {
+            Set tVal = tRaw
+        } ElseIf ((tRaw '= "") && ((tType [ "%Dynamic") || (tType [ "%Library.AbstractObject"))) {
+            Set tFirst = $EXTRACT(tRaw, 1)
+            If ((tFirst = "{") || (tFirst = "[")) {
+                Try { Set tVal = ##class(%DynamicAbstractObject).%FromJSON(tRaw) } Catch e { Set tVal = tRaw }
+            }
+        }
+        If i=0 Set tV1 = tVal
+        If i=1 Set tV2 = tVal
+        If i=2 Set tV3 = tVal
+        If i=3 Set tV4 = tVal
+        If i=4 Set tV5 = tVal
+        If i=5 Set tV6 = tVal
+        If i=6 Set tV7 = tVal
+        If i=7 Set tV8 = tVal
+    }
+    Set tOut = ""
+    If tN = 0 Set tOut = $CLASSMETHOD(pClass, pMethod)
+    If tN = 1 Set tOut = $CLASSMETHOD(pClass, pMethod, tV1)
+    If tN = 2 Set tOut = $CLASSMETHOD(pClass, pMethod, tV1, tV2)
+    If tN = 3 Set tOut = $CLASSMETHOD(pClass, pMethod, tV1, tV2, tV3)
+    If tN = 4 Set tOut = $CLASSMETHOD(pClass, pMethod, tV1, tV2, tV3, tV4)
+    If tN = 5 Set tOut = $CLASSMETHOD(pClass, pMethod, tV1, tV2, tV3, tV4, tV5)
+    If tN = 6 Set tOut = $CLASSMETHOD(pClass, pMethod, tV1, tV2, tV3, tV4, tV5, tV6)
+    If tN = 7 Set tOut = $CLASSMETHOD(pClass, pMethod, tV1, tV2, tV3, tV4, tV5, tV6, tV7)
+    If tN >= 8 Set tOut = $CLASSMETHOD(pClass, pMethod, tV1, tV2, tV3, tV4, tV5, tV6, tV7, tV8)
+    ; 返回对象/数组时转 JSON 文本（便于平台单测断言与审计）
+    If $IsObject(tOut) {
+        Set tJson = ""
+        Try {
+            Set tJson = tOut.%ToJSON()
+        } Catch e {
+            Set tJson = ""
+        }
+        Quit tJson
+    }
+    Quit tOut
+}
+ClassMethod SaveBpPlan(pBpClass As %String, pPlanJson As %String) As %String
+{
+    If (pBpClass = "") || (pPlanJson = "") Quit "empty"
+    Set ^demo.Config("bp_plan", pBpClass) = pPlanJson
+    Set ^demo.Config("bp_plan", pBpClass, "_at") = $ZDateTime($Horolog, 3)
+    Quit "saved:"_$Length(pPlanJson)
+}
+
+/// 读取聚合 BP 的计划（空 = 无计划）。
+ClassMethod GetBpPlan(pBpClass As %String) As %String
+{
+    Quit $Get(^demo.Config("bp_plan", pBpClass))
+}
+
+/// 记录方法级生成进度（pStatus = ok | failed | pending；成功项用于**断点续跑**）。
+ClassMethod SaveBpMethodProgress(pBpClass As %String, pMethod As %String, pStatus As %String, pNote As %String = "") As %String
+{
+    If (pBpClass = "") || (pMethod = "") Quit "empty"
+    Set ^demo.Config("bp_progress", pBpClass, pMethod) = pStatus
+    Set ^demo.Config("bp_progress", pBpClass, pMethod, "_at") = $ZDateTime($Horolog, 3)
+    If pNote '= "" Set ^demo.Config("bp_progress", pBpClass, pMethod, "_note") = pNote
+    Quit "saved"
+}
+
+/// 读取方法级进度，返回 JSON {方法: 状态}。
+ClassMethod GetBpMethodProgress(pBpClass As %String) As %String
+{
+    Set tOut = ##class(%DynamicObject).%New()
+    Set tM = ""
+    For {
+        Set tM = $Order(^demo.Config("bp_progress", pBpClass, tM))
+        Quit:tM=""
+        Do tOut.%Set(tM, $Get(^demo.Config("bp_progress", pBpClass, tM)))
+    }
+    Quit tOut.%ToJSON()
+}
+
+/// 清空某聚合 BP 的进度（重新生成前调用）。
+ClassMethod ClearBpMethodProgress(pBpClass As %String) As %String
+{
+    If pBpClass = "" Quit "empty"
+    Kill ^demo.Config("bp_progress", pBpClass)
+    Quit "cleared"
+}
+
 
 ClassMethod FindDSNByUrl(pUrl As %String) As %String
 {
@@ -334,7 +450,7 @@ ClassMethod SetItemsEnabled(pProduction As %String, pNamesCsv As %String, pEnabl
 /// 说明：IRIS 社区版 KeyLicenseUnits=8，每个 Ens 业务主机（BS/BP/BO）常驻 1 个许可单元；
 /// 多管道 Production 整体启动会耗尽许可，导致后端无法连接、管道生成校验全部失败。
 /// 等效于用户手工「生成新管道前先关闭旧管道的业务组件」——这里自动化：
-///   - 保留基础设施组件（JavaGateway 等，ClassName 含 JavaGateway）；
+///   - 保留基础设施组件（JavaGateway / FHIRSyncService / TerminologyOperation，ClassName 含关键字）；
 ///   - 保留 pKeepCsv 中的组件（本次管道要用的）；
 ///   - 其余业务主机 Enabled=0。
 /// 返回被让路的组件名（逗号分隔；空串=无需变更）。
@@ -350,7 +466,7 @@ ClassMethod DisableNonActiveItems(pProduction As %String = "demo.DataflowProduct
     For i = 1:1:tProd.Items.Count() {
         Set tItem = tProd.Items.GetAt(i)
         Continue:'$IsObject(tItem)
-        Continue:tItem.ClassName["JavaGateway"
+        Continue:(tItem.ClassName["JavaGateway")!(tItem.ClassName["FHIRSyncService")!(tItem.ClassName["TerminologyOperation")
         Continue:+tItem.Enabled=0
         Continue:$Find(tKeep, ","_tItem.Name_",")>0
         Set tItem.Enabled = 0
@@ -378,7 +494,7 @@ ClassMethod SetItemsEnabledByCategory(pProduction As %String = "demo.DataflowPro
     For i = 1:1:tProd.Items.Count() {
         Set tItem = tProd.Items.GetAt(i)
         Continue:'$IsObject(tItem)
-        Continue:tItem.ClassName["JavaGateway"
+        Continue:(tItem.ClassName["JavaGateway")!(tItem.ClassName["FHIRSyncService")!(tItem.ClassName["TerminologyOperation")
         Set tCat = tItem.Category
         If (tCat = "") || (tCat = "shared") Continue
         If $Find(tKeep, ","_tCat_",")>0 Continue

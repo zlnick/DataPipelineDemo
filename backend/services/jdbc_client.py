@@ -136,3 +136,34 @@ def list_columns(conn: dict, schema: str, table: str) -> list[dict]:
         finally:
             rs.close()
     return columns
+
+
+def list_primary_keys(conn: dict, schema: str, table: str) -> list[str]:
+    """查询表的主键列（DatabaseMetaData.getPrimaryKeys，按 KEY_SEQ 排序）。
+
+    用途（2026-09-17 实测缺陷）：DB 目标的主键列是**运行期硬约束**——IRIS 的
+    INSERT/UPSERT 语句（`EnsLib.SQL.Operation.GenericOperation` 按目标表列生成）要求
+    主键列有值，转换结果缺主键值会在运行期被判 `<列名> is required`（消息 Error、目标 0 落地），
+    而生成接口在此之前一路 `code:0`。平台把"目标表主键列"作为事实登记到目标表记录
+    （`tables[].key_columns`），并注入 Agent A（生成映射）与 C1（验证修复）上下文，
+    由 AI 决定用哪个源列/常量产出主键值——平台只提供事实，不代写映射。
+
+    参数:
+        conn: JDBC 连接信息 dict。
+        schema: schema 名。
+        table: 表名。
+
+    返回:
+        主键列名列表（按主键序号排序）；非 IRIS 驱动不支持时抛异常，由调用方降级。
+    """
+    with _connect(conn) as c:
+        meta = c.jconn.getMetaData()
+        rs = meta.getPrimaryKeys(None, schema or None, table)
+        keys: list[tuple[int, str]] = []
+        try:
+            while rs.next():
+                seq = int(rs.getShort("KEY_SEQ") or 0)
+                keys.append((seq, rs.getString("COLUMN_NAME") or ""))
+        finally:
+            rs.close()
+    return [name for _, name in sorted(keys) if name]

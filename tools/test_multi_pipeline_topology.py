@@ -113,5 +113,30 @@ print("[同类别两条管道] BP:", _bps5)
 assert len(_bps5) == 2 and len(set(_bps5)) == 2, f"同类别两条管道必须各有一个 BP: {_bps5}"
 assert all(c.get("category") == "sql2soap" for c in topo5["components"]
            if c.get("type") == "TransformProcess"), topo5["components"]
+# ------------- 死配置根治：无转换 BP 的组不得登记 bp / bp_target（2026-09-17） -------------
+# 背景：原实现无条件给每组登记 `_bp_name`（生成时无条件写 `bp[TransformProcess__<类别>]` +
+# `bp_target[<源BS>]`）→ 自带聚合 BP 的 Skill 组（sql2fhir）没有该主机，登记了没有任何读者
+# （实测残留 4 条死配置：诊断误读「登记数 ≠ 组件数」+ 悬空 `bp_target` 一旦被读到就是
+# A6 式静默派发失败）。现按「本组是否真的有 TransformProcess 主机」登记（_has_router）。
+print("\n[死配置根治] 组级登记标志:")
+_, gs_pure = build(pure_skill)
+print("  sql2fhir 组 _has_router=%s 有_bp_name=%s _bp_item=%s（仅内存派发目标，不写 global）" % (
+    gs_pure[0].get("_has_router"), "_bp_name" in gs_pure[0], gs_pure[0].get("_bp_item")))
+assert gs_pure[0].get("_has_router") is False, gs_pure[0].get("_has_router")
+# 关键断言：`_bp_name` 不登记（它同时是生成端「写 bp[<名>]」与「收敛清理 keep 名单」的输入，
+# 登记了不存在的名字 → 既写出死配置，又让清理器把死键保留下来）。
+assert "_bp_name" not in gs_pure[0], "无转换 BP 的组不得登记 _bp_name（会写出死配置 + 污染清理 keep 名单）"
+# 而 `_bp_items` / `_bp_item` 仍要登记（生成期悬空自检 + 布局 http_bo 兜底的输入，不写 global）：
+assert isinstance(gs_pure[0].get("_bp_items"), dict), "派发目标表需保留（自检/布局输入）"
+assert gs_pure[0].get("_bp_item"), "FHIR 派发名需保留（布局 http_bo 兜底）"
+for _n, _g in enumerate(gs5):
+    print("  通用组%d %s _has_router=%s _bp_name=%s" % (
+        _n, _g.get("_category"), _g.get("_has_router"), _g.get("_bp_name")))
+assert all(g.get("_has_router") for g in gs5), "通用组必须登记 _has_router=True"
+assert all(g.get("_bp_name") for g in gs5), "通用组必须登记自己的 BP 名"
+# 通用组：派发目标表仍在（BP 按**显式主机名**派发，缺陷 A6 的修复不能丢）
+assert gs5[0].get("_bp_items"), "通用组必须写派发目标表（items）"
+assert all(v for v in gs5[0]["_bp_items"].values()), gs5[0]["_bp_items"]
+
 print("\n✓ 多管道命名/类别/共享基础设施（BP 每管道一个 + 仅 JavaGateway 共享）全部通过"
-      "（重复生成名字稳定）")
+      "（重复生成名字稳定 + 无转换 BP 的组不产生死配置）")

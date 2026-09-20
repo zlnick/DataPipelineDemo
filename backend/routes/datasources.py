@@ -143,7 +143,11 @@ def analyze_datasource(ds_id: str):
         return error(f"数据源类型 {ds.get('type')} 尚未实现"), 400
 
     try:
-        endpoint = ds["endpoint"]
+        # 回环归一：UI 登记的 endpoint 常是浏览器视角的 localhost/127.0.0.1，
+        # backend 在独立容器里连不上（Connection refused）→ 探测统一走内部地址，
+        # 与 profile_source/profile_target 同口径；对外保存的仍是用户登记值。
+        from backend.config import to_internal_url
+        endpoint = to_internal_url(ds["endpoint"])
         auth = ds.get("auth") or {}
         cap = fhir_client.get_capability_statement(
             endpoint, auth.get("username", "superuser"), auth.get("password", "SYS"))
@@ -160,25 +164,73 @@ def analyze_datasource(ds_id: str):
         logger.error("数据源分析失败: %s", exc)
         return error(f"Profile 分析失败: {exc}"), 500
 
-    # —— 接口分析 Agent（LLM）：资产语义 + 运行契约解读（失败即显式失败，不静默规则）——
+    # —— 接口分析 Agent（LLM）：① 无数据资源类型按 **FHIR R4 规范**补字段 ② 资产语义 ③ 契约解读 ——
+    # 顺序很重要：先探查（事实层，含规范快照兜底）→ AI 规范补字段并**回写资产** → 再让语义 Agent
+    # 看到带字段的资产（原来先做语义、后探查，导致首次 analyze 时 AI 看不到采样到的字段）。
+    # 失败一律显式返回错误（不静默退回规则文案）。
     try:
+        rt = connection_profiler.profile_source(repository.get_datasource(ds_id))
+        _fnote = (rt.get("note") or {}).get("fields") or {}
+        _pending = list(_fnote.get("pending_ai_types") or [])
+        _cap = interface_analyzer.FHIR_AI_FIELDS_MAX_TYPES
+        _attempted = _pending[:_cap] if _cap and _cap > 0 else list(_pending)
+        _not_attempted = _pending[len(_attempted):]
+        _ai_spec: dict = {}
+        if _attempted:
+            _ai_spec = interface_analyzer.complete_fhir_resource_fields(
+                _attempted,
+                {"fhir_version": analysis.get("fhir_version", ""),
+                 "endpoint": ds.get("endpoint", ""),
+                 "note": "这些资源类型目前**没有样例数据**，请按 FHIR R4 规范给出可映射元素路径"})
+            connection_profiler.backfill_fhir_fields(
+                ds_id, {t: v.get("fields") or [] for t, v in _ai_spec.items()})
+            _fnote.setdefault("provenance", {})
+            _fnote["provenance"].update({t: "ai_spec" for t in _ai_spec})
+            _fnote["ai_spec_types"] = sorted(_ai_spec)
+            _fnote["ai_spec_missing"] = sorted(set(_attempted) - set(_ai_spec))
+            _fnote["ai_spec_not_attempted"] = sorted(_not_attempted)
+            repository.update_datasource(ds_id, {"runtime": rt})
+        assets = repository.list_assets(ds_id)          # 重新载入（含刚补写的字段）
         if assets:
             _apply_ai_semantics(assets, "FHIR",
                                 {"fhir_version": analysis.get("fhir_version", ""),
-                                 "capability": analysis})
-        rt = connection_profiler.profile_source(repository.get_datasource(ds_id))
+                                 "capability": analysis,
+                                 "field_sources": {
+                                     "sampled": _fnote.get("sampled_types") or [],
+                                     "spec_model": _fnote.get("spec_model_types") or [],
+                                     "ai_spec": _fnote.get("ai_spec_types") or [],
+                                     "no_fields_yet": _fnote.get("empty_types") or []}})
         _apply_ai_contract("source", rt)
-        repository.update_datasource(ds_id, {"runtime": rt})
+        repository.update_datasource(ds_id, {"runtime": rt, "status": "analyzed"})
     except AgentError as exc:
         logger.error("FHIR 源接口分析 Agent 失败: %s", exc)
         return error(f"接口分析 Agent（AI）语义/契约分析失败: {exc}"), 500
     except Exception as exc:  # noqa: BLE001 - 确定性探查失败可继续（语义已完成）
         logger.warning("FHIR 连接探查失败: %s", exc)
 
+    # 字段来源审计（数据优先 / 规范快照 / AI 按 R4 规范 / 暂无）——前端与后续 Agent 都能看到
+    _fnote = (rt.get("note") or {}).get("fields") or {}
+    _field_sources = {
+        "sampled": _fnote.get("sampled_types") or [],
+        "spec_model": _fnote.get("spec_model_types") or [],
+        "ai_spec": _fnote.get("ai_spec_types") or [],
+        "unresolved": _fnote.get("ai_spec_missing") or [],
+        "not_attempted": _fnote.get("ai_spec_not_attempted") or [],
+        "structure_definition": bool(_fnote.get("structure_definition")),
+    }
+    _warnings = []
+    if _field_sources["unresolved"]:
+        _warnings.append("AI 未能给出以下资源类型的规范字段（保持为空）: "
+                         + ", ".join(_field_sources["unresolved"][:10]))
+    if _field_sources["not_attempted"]:
+        _warnings.append("超出单次补全限量的资源类型（未处理）: "
+                         + ", ".join(_field_sources["not_attempted"][:10]))
     return success({
-        "analysis": analysis, "assets": assets, "asset_count": len(assets),
+        "analysis": analysis, "assets": repository.list_assets(ds_id),
+        "asset_count": len(assets),
         "ai": _ai_semantics_summary(repository.list_assets(ds_id)),
-    }, "Profile 分析完成（AI 语义分析已生成）")
+        "field_sources": _field_sources, "warnings": _warnings,
+    }, "Profile 分析完成（AI 语义分析已生成；字段来源见 field_sources）")
 
 
 @datasources_bp.post("/<ds_id>/test")

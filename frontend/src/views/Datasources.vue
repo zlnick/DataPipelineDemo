@@ -25,7 +25,7 @@
         <el-form-item v-if="form.type === 'FHIR'" :label="t('datasources.endpoint')">
           <el-input
             v-model="form.endpoint"
-            placeholder="http://host:52773/csp/healthshare/fhirserver/fhir/r4/"
+            :placeholder="t('datasources.phFhirEndpoint')"
             style="width: 420px"
           />
         </el-form-item>
@@ -35,11 +35,12 @@
         <el-form-item :label="t('datasources.password')">
           <el-input v-model="form.password" type="password" placeholder="SYS" style="width: 120px" show-password />
         </el-form-item>
-        <!-- SQL 源配置：JDBC 连接（选表后自动生成轮询 Query） -->
+        <!-- SQL 源配置：JDBC 连接（演示默认源库 = USER 命名空间，表 SQLUser.Patient；
+             选表后自动生成轮询 Query） -->
         <el-form-item v-if="form.type === 'SQL'" label="JDBC URL">
           <el-input v-model="form.jdbc_url" placeholder="jdbc:IRIS://iris:1972/USER" style="width: 300px" />
         </el-form-item>
-        <el-form-item v-if="form.type === 'SQL'" label="驱动类">
+        <el-form-item v-if="form.type === 'SQL'" :label="t('common.driverClass')">
           <el-input v-model="form.driver_class" placeholder="com.intersystems.jdbc.IRISDriver" style="width: 240px" />
         </el-form-item>
         <el-form-item>
@@ -216,10 +217,13 @@ const analysis = ref(null)
 const form = reactive({
   name: t('datasources.defName'),
   type: 'FHIR',
-  endpoint: 'http://iris:52773/csp/healthshare/fhirserver/fhir/r4/',
+  // 演示默认 FHIR **源** = DemoFHIR（第二个独立 FHIR 存储库，与 FHIRSERVER 数据隔离）
+  endpoint: 'http://iris:52773/csp/healthshare/demofhir/fhir/r4/',
   username: 'superuser',
   password: 'SYS',
   // SQL 源配置（JDBC 连接，选表后自动生成轮询 Query）
+  // 演示默认 **SQL 源 = USER 命名空间**（`SQLUser.Patient`，SQL→SOAP / SQL→DB 的输入表）；
+  // 平台按 URL 命名空间推导 DSN（USER → 必要时自动创建），SQL 目标默认 = CLINIC 命名空间
   jdbc_url: 'jdbc:IRIS://iris:1972/USER',
   driver_class: 'com.intersystems.jdbc.IRISDriver',
 })
@@ -244,7 +248,19 @@ function runtimeSummary(row) {
     const mode = caps.incremental_search
       ? t('datasources.incSearch', { m: caps.incremental_search })
       : (poll.note ? t('datasources.fullLimited') : t('datasources.full'))
-    return `FHIR ${caps.fhir_version || '-'} · ${mode}`
+    // 字段来源（无数据也能知道字段：真实数据 / FHIR 规范快照 / AI 按 R4 规范推断）
+    const fs = ((rt.note || {}).fields) || {}
+    const srcs = []
+    const nData = (fs.sampled_types || []).length
+    const nSpec = (fs.spec_model_types || []).length
+    const nAi = (fs.ai_spec_types || []).length
+    if (nData) srcs.push(t('datasources.fieldSampled', { n: nData }))
+    if (nSpec) srcs.push(t('datasources.fieldSpecModel', { n: nSpec }))
+    if (nAi) srcs.push(t('datasources.fieldAiSpec', { n: nAi }))
+    const fsrc = srcs.length
+      ? ` · ${t('datasources.fieldSources')}: ${srcs.join(' / ')}`
+      : ''
+    return `FHIR ${caps.fhir_version || '-'} · ${mode}${fsrc}`
   }
   if (kind === 'SQL') {
     const q = (rt.connection || {}).query || ''

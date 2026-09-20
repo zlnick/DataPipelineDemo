@@ -10,6 +10,46 @@
 - `direct/date/code/reference` 等属平台已支持的取值方式或类型提示，登记在册但不产生额外语义。
 """
 
+# ---------------------------------------------------------------------------
+# 术语判定 Skill 注册表（`term_map:<skill_id>` 的单一事实源）
+#
+# 职责划分（与"术语服务器 = 事实源"的架构一致）：
+# - 这里只登记**平台侧知识**：该 Skill 走哪一对编码体系、判定结果取哪个字段、
+#   目标 coding 写进哪个 system URI；
+# - "某对体系下有哪些码可用"是**术语服务器**的事实（/mapping/systems、/mapping/availability），
+#   平台不复制、不硬编码码表；
+# - 判定本身由 LLM 判定 Agent 做（C3-Dx / C3），平台不引入第二套判码规则。
+# ---------------------------------------------------------------------------
+TERM_SKILLS: dict[str, dict] = {
+    "cn2snomed": {
+        "label": "中文诊断（国标 ICD-10）→ SNOMED CT",
+        "source_system": "urn:cn-nhsa:icd10-gbt2016",
+        "target_system": "http://snomed.info/sct",
+        "code_field": "code",
+        "display_field": "display",
+        "agent": "C3-Dx（Diagnosis Mapping Agent）",
+    },
+    "cn2rx": {
+        "label": "中文药品（国家医保目录 NRDL）→ RxNorm",
+        "source_system": "urn:cn-nhsa:drug-nrdl",
+        "target_system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+        "code_field": "rxcui",
+        "display_field": "enName",
+        "agent": "C3（Drug Mapping Agent）",
+    },
+}
+
+
+def term_skill(skill_id: str) -> dict | None:
+    """取术语判定 Skill 登记项（未注册返回 None）。"""
+    return TERM_SKILLS.get(str(skill_id or "").strip())
+
+
+def term_skill_ids() -> list[str]:
+    """已注册的术语判定 Skill 名（供 Agent 提示词 / 校验 / 目录注入共用）。"""
+    return list(TERM_SKILLS)
+
+
 DIRECTIVES: list[dict] = [
     {"id": "direct", "syntax": "direct（或 transform=null）", "implemented": True,
      "note": "按 source 表达式原样取值（字段路径 / 表.列 前缀 / concat(...) 表达式）"},
@@ -18,8 +58,8 @@ DIRECTIVES: list[dict] = [
     {"id": "constant", "syntax": "constant:<值>", "implemented": True,
      "note": "常量值（无源列可映射的必填字段用）；source 必须为 null，常量值写在 transform 内"},
     {"id": "term_map", "syntax": "term_map:<skill_id>", "implemented": True,
-     "skills": ["cn2rx", "cn2snomed"],
-     "note": "术语判定：保留源编码并追加目标标准体系 coding（判码由判定 Skill 在运行期执行）"},
+     "skills": term_skill_ids(),
+     "note": "术语判定：保留源编码并追加目标标准体系 coding（判码结果来自术语服务器映射，生成前预检 + 运行期读本地缓存）"},
     {"id": "concat", "syntax": "source=concat(A,' ',B)", "implemented": True,
      "note": "拼接表达式（写在 source 中，不是 transform 指令）"},
     {"id": "code", "syntax": "code", "implemented": True,
@@ -125,9 +165,16 @@ def value_issues(fm: dict, source_columns: set[str] | None = None) -> list[str]:
         return issues          # 由 syntax_issues 报告
     if "(" in src_s:           # concat(...) 等表达式
         return issues
-    col = src_s.split(".")[-1]
-    if source_columns is not None and col.lower() not in source_columns:
-        issues.append(f"{target}: 源列 {col} 不在源表已知列中（该映射运行期取不到值）")
+    # 源列存在性：既支持 SQL 的「表.列」，也支持 FHIR 的**完整路径**（name[0].family）。
+    # 原实现只取 `split(".")[-1]` 的最后一段与源字段清单比对 —— FHIR 资产清单里存的是完整路径
+    # （`name[0].family`），于是**正确映射被误报**「源列 family 不在源表已知列中」（2026-09-16 实测，
+    # 缺陷 L：噪音告警会误导用户去"修"本来正确的映射，也可能触发无谓的 C1 修复轮）。
+    # 现改为逐级剥前缀的多候选匹配：Patient.name[0].family → name[0].family → family。
+    if source_columns is not None:
+        parts = str(src_s).split(".")
+        cands = {".".join(parts[i:]).lower() for i in range(len(parts))} - {""}
+        if not (cands & source_columns):
+            issues.append(f"{target}: 源列 {src_s} 不在源表已知列中（该映射运行期取不到值）")
     return issues
 
 

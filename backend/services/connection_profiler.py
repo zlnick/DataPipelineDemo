@@ -4,6 +4,10 @@
 docs/ConnectionContract-设计.md），成为前端 / AI 上下文 / 管道生成 / 自动验证的单一参数来源：
 
 - FHIR 源：GET metadata → 版本 / 认证 / 分页 / `_lastUpdated` 增量能力；资产=已发现资源真实字段
+  （字段发现 = 拉 `?_count=10` 样例资源递归合并路径，**覆盖全部已发现资源类型**；
+  采到的字段回写资产记录 `^demo.DataAsset` / `^demo.SourceAsset`，供 AI 映射 / UI / C1 使用。
+  ⚠ 空库 / 某类型无数据 → 该类型字段为空，只能靠 `StructureDefinition` 兜底；
+  本服务器无 core StructureDefinition（`StructureDefinition?url=...` 恒 total=0），故**演 FHIR 源前必须先造数**）
 - SQL 源：JDBC 连通 + 已选表列 → 轮询增量键（key_field）
 - DB 目标：连通 / 表存在（UPSERT 语义）
 - SOAP 目标：WSDL 导入 + BO MessageMap → 操作语义判定（Add/Create→写入型，Get/Query→查询型）
@@ -12,6 +16,8 @@ docs/ConnectionContract-设计.md），成为前端 / AI 上下文 / 管道生�
 
 import json
 import logging
+import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +25,16 @@ import urllib.request
 from backend.services import fhir_client, iris_connector, jdbc_client, repository
 
 logger = logging.getLogger(__name__)
+
+# ---------------- FHIR 源字段采样（样例资源发现字段）----------------
+# 背景：原实现硬编码只对 Patient / Observation 采样（第一代 FHIR→DB demo 的两个核心资源），
+# 其它类型（Encounter / Condition / MedicationRequest…）字段**永远为空** → AI 映射缺源字段、
+# 采到的字段也只留在 runtime，未回写资产。现：范围=全部已发现资源类型 + 回写资产记录。
+_CORE_SAMPLE_TYPES = ("Patient", "Observation")  # 优先级最高（demo 核心资源）
+# 单次分析最多采样多少个资源类型（0=不限）；145 类全采样会让 analyze 变慢，故设上限
+FHIR_SAMPLE_MAX_TYPES = int(os.environ.get("FHIR_SAMPLE_MAX_TYPES", "40"))
+# 采样总耗时预算（秒）：超出即停止（避免个别类型的慢查询拖垮整个分析）
+FHIR_SAMPLE_BUDGET_SECONDS = float(os.environ.get("FHIR_SAMPLE_BUDGET", "30"))
 
 
 def _op_kind(method: str) -> str:
@@ -104,6 +120,11 @@ def _fhir_sample_fields(endpoint: str, username: str, password: str,
             elif isinstance(obj, list):
                 for i, item in enumerate(obj[:1]):  # 数组访问统一取 [0]
                     walk(item, f"{prefix}[{i}]", depth + 1)
+            elif isinstance(obj, (str, int, float, bool)) or obj is None:
+                # 数组里的**标量元素**（如 name[0].given[0] / address[0].line[0]）：
+                # 原实现只处理 dict/list，标量元素被静默丢弃 → Patient 资产看不到 given/line
+                if prefix:
+                    fields.append(prefix)
 
         for entry in entries:
             resource = entry.get("resource") or {}
@@ -169,6 +190,92 @@ def _fhir_resource_fields(endpoint: str, username: str, password: str,
         return []
 
 
+def _fhir_sample_order(fhir_assets: list[dict], max_types: int,
+                       re_sample_types: set[str] | None = None) -> tuple[list[dict], int]:
+    """给出待采样的 FHIR 资产顺序（字段为空，或字段是"暂定"来源需重新采样），返回 (计划, 超上限跳过数)。
+
+    顺序：核心资源（Patient/Observation）→ 平台已建模的 US Core 资源 → 其余按名称；
+    参数:
+        fhir_assets: 数据源 runtime 的资产列表（{name, type, fields}）。
+        max_types: 单次采样的类型上限（<=0 表示不限）。
+        re_sample_types: **需重新采样**的类型集合 —— 上一轮字段来自规范快照 `spec_model` /
+            AI 规范推断 `ai_spec` 的"暂定字段"：一旦库里出现真实数据，应改用真实数据形态
+            （数据优先，长期成立）。为空集 = 只采样字段为空的类型（旧行为）。
+    返回:
+        (plan, skipped_by_cap)
+    """
+    _re = {str(t).lower() for t in (re_sample_types or set())}
+    candidates = [a for a in (fhir_assets or [])
+                  if str(a.get("name") or "").strip()
+                  and (not a.get("fields") or str(a.get("name")).lower() in _re)]
+    if not candidates:
+        return [], 0
+    try:  # 平台已建模资源（US Core 11 类）；惰性导入避免循环依赖
+        from backend.services import fhir_target_model as _ftm
+        modeled = set(_ftm.DEFAULT_RESOURCE_TYPES)
+    except Exception:  # noqa: BLE001 - 模型清单缺失不影响采样（退化为按名称排序）
+        modeled = set()
+
+    def _rank(name: str) -> tuple:
+        if name in _CORE_SAMPLE_TYPES:
+            return (0, _CORE_SAMPLE_TYPES.index(name), "")
+        if name in modeled:
+            return (1, 0, name.lower())
+        return (2, 0, name.lower())
+
+    ordered = sorted(candidates, key=lambda a: _rank(str(a.get("name") or "")))
+    if max_types and max_types > 0 and len(ordered) > max_types:
+        return ordered[:max_types], len(ordered) - max_types
+    return ordered, 0
+
+
+def _fhir_spec_model_fields(resource_type: str) -> list[str]:
+    """**平台规范快照**兜底：已建模资源从 `fhir_target_model` 取标准元素路径。
+
+    FHIR 是标准 —— 库里没有数据也能知道资源有哪些元素。优先级：真实样例（数据形态）>
+    服务器 StructureDefinition（若有）> **平台内置 R4/US Core 模型**（本函数）。
+    未建模类型返回 []（调用方转 AI 按 R4 规范推断）。
+    """
+    try:
+        from backend.services import fhir_target_model as _ftm
+        return _ftm.source_field_paths(resource_type)
+    except Exception as exc:  # noqa: BLE001 - 模型缺失不影响其它兜底路径
+        logger.warning("FHIR 规范快照字段读取失败 %s: %s", resource_type, exc)
+        return []
+
+
+def backfill_fhir_fields(source_id: str, mapping: dict) -> int:
+    """把 FHIR 资产字段回写资产记录（公开包装，供路由在 AI 规范补全后复用）。"""
+    return _fhir_backfill_fields(source_id, mapping)
+
+
+def _fhir_backfill_fields(source_id: str, mapping: dict) -> int:
+    """把采样到的 FHIR 资产真实字段回写资产记录，返回实际回写条数。
+
+    按**资产 id** 精确写入（`repository.update_asset` 会同步 `^demo.DataAsset` 与
+    `^demo.SourceAsset`），且只处理该数据源名下的资产 —— 不触碰其它数据源（尤其 SQL 数据源）：
+    SQL 资产的 fields=列名是 C1 补齐映射与管道生成（`_resolve_sql_source_tables`）的输入，不可被清空。
+    参数:
+        source_id: 数据源 id（为空则不写，防御性）。
+        mapping: {资源类型: 字段路径列表}。
+    返回:
+        实际回写的资产条数。
+    """
+    if not source_id or not mapping:
+        return 0
+    written = 0
+    try:
+        for asset in repository.list_assets(source_id):
+            fields = mapping.get(str(asset.get("name") or ""))
+            if not fields or asset.get("fields") == fields:
+                continue
+            repository.update_asset(asset.get("id") or "", {"fields": list(fields)})
+            written += 1
+    except Exception as exc:  # noqa: BLE001 - 回写失败不影响本次契约探查
+        logger.warning("FHIR 资产字段回写失败（不影响本次分析）: %s", exc)
+    return written
+
+
 def profile_source(ds: dict) -> dict:
     """探查数据源并返回其 runtime 契约（含 health）。调用方负责写回记录。"""
     import datetime
@@ -187,22 +294,86 @@ def profile_source(ds: dict) -> dict:
             health["detail"] = "缺少 endpoint"
         else:
             try:
-                fcaps, fpoll = _fhir_capabilities(ep, conn.get("username"), conn.get("password"))
+                # 回环归一：前端登记的 endpoint 常是浏览器视角的 localhost/127.0.0.1，
+                # backend 在独立容器里连不上（Connection refused）→ 探测统一走内部地址，
+                # 与 profile_target 同口径；对外保存的仍是用户登记值（见 backend/config.to_internal_url）。
+                from backend.config import to_internal_url
+                _probe = to_internal_url(ep)
+                fcaps, fpoll = _fhir_capabilities(_probe, conn.get("username"), conn.get("password"))
                 caps.update(fcaps)
                 poll.update(fpoll)
                 health = {"ok": True,
                           "checked_at": datetime.datetime.now().isoformat(),
                           "detail": f"metadata OK（fhir {caps.get('fhir_version', '')}）"}
-                # FHIR 资产真实字段（demo 核心资源从 StructureDefinition 提取，供 AI/转换使用）
-                _core = {"Patient", "Observation"}
-                for _a in assets:
-                    _rt = _a.get("name") or ""
-                    if _rt in _core and not _a.get("fields"):
-                        _f = _fhir_sample_fields(ep, conn.get("username"), conn.get("password"), _rt)
-                        if not _f:
-                            _f = _fhir_resource_fields(ep, conn.get("username"), conn.get("password"), _rt)
+                # FHIR 资产真实字段：以样例资源（?_count=10）递归合并可访问路径发现字段。
+                # 范围=**全部已发现资源类型**（原实现硬编码仅 Patient/Observation → 其它类型字段永远为空）；
+                # 顺序=核心资源 → 已建模资源 → 其它；受类型上限（FHIR_SAMPLE_MAX_TYPES）与
+                # 总耗时预算（FHIR_SAMPLE_BUDGET）约束（145 类全采样会让分析明显变慢）。
+                # **无数据也能知道字段（FHIR 是标准）**：三层兜底
+                #   ① 真实样例（数据形态，最准）
+                #   ② 服务器 StructureDefinition（本环境实测 total=0 → 探一次即知不可用）
+                #   ③ **平台规范快照** `fhir_target_model`（US Core 11 类，元素路径=转换引擎访问路径）
+                #   ④ 仍未命中（未建模类型）→ 记入 `pending_ai_types`，由接口分析 Agent 按 R4 规范补
+                _prev_prov = ((base.get("note") or {}).get("fields") or {}).get("provenance") or {}
+                _re_sample = {t for t, k in _prev_prov.items() if k in ("spec_model", "ai_spec")}
+                _plan, _skipped_cap = _fhir_sample_order(assets, FHIR_SAMPLE_MAX_TYPES, _re_sample)
+                _deadline = time.monotonic() + FHIR_SAMPLE_BUDGET_SECONDS
+                _found: dict = {}
+                _empty: list = []
+                _provenance: dict = {}
+                _spec_model: list = []
+                _pending_ai: list = []
+                _sd_usable = None
+                _skipped_budget = 0
+                for _idx, _a in enumerate(_plan):
+                    if time.monotonic() > _deadline:
+                        _skipped_budget = len(_plan) - _idx
+                        break
+                    _rt = str(_a.get("name") or "")
+                    _f = _fhir_sample_fields(_probe, conn.get("username"), conn.get("password"), _rt)
+                    _src_kind = "sampled"
+                    if not _f:
+                        if _sd_usable is None:
+                            _f = _fhir_resource_fields(_probe, conn.get("username"), conn.get("password"), _rt)
+                            _sd_usable = bool(_f)
+                        elif _sd_usable:
+                            _f = _fhir_resource_fields(_probe, conn.get("username"), conn.get("password"), _rt)
                         if _f:
-                            _a["fields"] = _f
+                            _src_kind = "structure_definition"
+                    if not _f:
+                        # 规范快照兜底：已建模资源的标准元素路径（无需任何数据）
+                        _f = _fhir_spec_model_fields(_rt)
+                        if _f:
+                            _src_kind = "spec_model"
+                            _spec_model.append(_rt)
+                    if _f:
+                        _a["fields"] = _f
+                        _found[_rt] = _f
+                        _provenance[_rt] = _src_kind
+                    else:
+                        _empty.append(_rt)
+                        _pending_ai.append(_rt)   # 未建模且无数据 → 待 AI 按 R4 规范补
+                # 采到的字段回写资产记录（^demo.DataAsset / ^demo.SourceAsset，按资产 id 精确写入）
+                _backfilled = _fhir_backfill_fields(ds.get("id") or "", _found)
+                base.setdefault("note", {})["fields"] = {
+                    "found": len(_found), "found_types": sorted(_found),
+                    "empty_types": sorted(_empty),
+                    "skipped_cap": _skipped_cap, "skipped_budget": _skipped_budget,
+                    "backfilled": _backfilled, "structure_definition": bool(_sd_usable),
+                    # 字段来源审计（数据优先；规范兜底；AI 补全由路由层写入 ai_spec_types）
+                    "provenance": _provenance,
+                    "sampled_types": sorted(t for t, k in _provenance.items() if k == "sampled"),
+                    "spec_model_types": sorted(_spec_model),
+                    "pending_ai_types": sorted(_pending_ai),
+                    "ai_spec_types": [],
+                }
+                logger.info("FHIR 字段发现[%s]：有字段 %d 类（采样 %d / 规范快照 %d / StructureDefinition %d），"
+                            "仍空 %d 类（待 AI 按 R4 规范补），超类型上限跳过 %d，超耗时预算跳过 %d，回写资产 %d",
+                            ds.get("id") or "", len(_found),
+                            sum(1 for k in _provenance.values() if k == "sampled"),
+                            sum(1 for k in _provenance.values() if k == "spec_model"),
+                            sum(1 for k in _provenance.values() if k == "structure_definition"),
+                            len(_empty), _skipped_cap, _skipped_budget, _backfilled)
             except Exception as exc:  # noqa: BLE001
                 health = {"ok": False,
                           "checked_at": datetime.datetime.now().isoformat(),

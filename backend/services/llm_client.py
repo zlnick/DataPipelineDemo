@@ -34,12 +34,28 @@ SYSTEM_PROMPT_TRANSFORMATION = (
     "给该 field_mapping 设置 transform 为受控指令："
     "  药品→RxNorm 用 term_map:cn2rx；诊断/症状（国标 ICD-10 或中文诊断）→SNOMED 用 term_map:cn2snomed；"
     "不需要术语转换的普通映射 transform 保持 null（或原 date/concat 表达式）。"
+    "⚠ **优先级（硬约束）**：`code` 只是『目标为 code/codeableConcept』的类型提示，**不产生任何目标体系 coding**；"
+    "当目标列 note 已写明『建议双 coding』/『经术语对照』（保留源码 + 补充目标标准体系）时，"
+    "该列 transform **必须是 term_map:<skill_id>**，不得写 `code`/null —— "
+    "若你的 reason 里写了『双 coding / 补充标准体系 / 经术语对照』而 transform 却是 code/null，即为输出不合规。"
+    "（`code` 只用于**没有**术语转换诉求的 codeableConcept/Reference 旁列，如 clinicalStatus、固定状态列。）"
     "6. 给出 term_map 时必须在 reason 中说明『调用哪个判定 Skill、源术语与目标体系』（如："
     "国标ICD-10→SNOMED，调用诊断映射判定Skill(cn2snomed) 双 coding）；不要把标准码写进转换结果。"
     "7. 目标资源为 FHIR 且无字段模型（开放类型）时，target 字段用 FHIRPath 表达并按需套用上述术语规则。"
     "8. transform **只能取受控指令集内写法**（见 user 内容的 transform_directives 目录）：普通映射用 null 或 "
     "\"direct\"；日期用 \"date\"；**无源列可映射的必填字段用 \"constant:<值>\" 且 source=null**；术语用 "
     "\"term_map:<skill_id>\"；不得发明新指令、不得把常量值放进 source。"
+    "9. DB/SQL 目标表的主键列是**硬事实**（见 user 内容 target_models[].key_columns，如 IRIS 表 Patient 的主键 ID）："
+    "目标侧 INSERT 要求主键列有非空值，转换结果缺主键值会在运行期报 \"<列名> is required\" 并使该目标零落地。"
+    "因此为 DB 目标生成映射时，**必须为每个主键列各产出一条 field_mapping**——"
+    "通常直接映射源表主键或语义等价的业务键（如源 SQLUser.Patient.ID → 目标 ID），"
+    "源侧确实没有可用业务键时才用 transform=\"constant:<稳定值>\" 且 source=null。"
+    "注意别只把源主键映射到某个业务列（如 ID→MRN）而**漏掉目标主键列本身**。"
+    "10. field_mapping.source 的**规范写法**：源为 SQL 表时写 \"<源表名>.<列名>\"（如 Patient.FamilyName），"
+    "源为 FHIR 资源时写路径本身（如 name[0].family）或 \"<资产名>.<路径>\"；"
+    "**不要写 schema/库前缀**（禁止 \"SQLUser.Patient.FamilyName\"、\"CLINIC.Patient.ID\" 这类三段全限定名）——"
+    "运行期源数据是扁平列名，三段写法会让取值落到空值（平台虽会自动剥前缀，但请按规范输出）；"
+    "concat 表达式的每个参数同样遵循该写法（如 concat(Patient.FamilyName, ' ', Patient.GivenName)）。"
     "严格输出 JSON（不要输出其他文字），格式："
     '{"recommendations":[{"asset":"PatientTable","target_table":"PatientEntity","confidence":0.90,'
     '"reason":"根据 ID 和姓名字段精准匹配","field_mappings":[{"source":"PatientTable.ID","target":"PatientNo","transform":null},'
@@ -78,14 +94,30 @@ SYSTEM_PROMPT_PIPELINE = (
     "8. 仅当 design_skill=sql2fhir-patient-tx 时，顶层额外输出 \"generated_bp\"：{\"class_name\":\"demo.SqlFhirPatientTxProcess\","
     "\"source\":\"<完整可编译 ObjectScript 类源码>\"}——该 BP 是患者事务聚合控制中心，**类源码由你（Agent）生成**，"
     "平台不提供任何预置 BP。其职责与实现规范："
-    "a) demo.SqlFhirPatientTxProcess Extends Ens.BusinessProcess，实现 Method OnRequest(request As %Library.Persistent,"
+    "a) demo.SqlFhirPatientTxProcess **Extends demo.TransformProcess**"
+    "（必须继承平台基类：`..BuildFHIRResource` / `..TermCoding` 在其中，术语转换由平台**共享 BO** 承载），"
+    "实现 Method OnRequest(request As %Library.Persistent,"
     "Output response As %Library.Persistent) As %Status 与空 OnResponse；"
-    "b) 布局在 ^demo.Config(\"sql2fhir\",\"layout\")：patient_id_col / query_bos[](bo_name/source_table/fk_col/depth/depends_on/"
-    "target_resource) / bundle.entries[](source_table/target_resource/mapping_id) / bundle.refs[](target_resource/parent_resource/"
-    "field)；**query_bos[].depends_on 是父「源表名」**（depth=1 为 \"Patient\"）：取父行主键集合时，"
+    "b) 布局在 IRIS：**优先按 BP 实例名读** ^demo.Config(\"sql2fhir\",\"layout\",..%ConfigName)"
+    "（平台按本管道写入；多管道并存时每个聚合 BP 实例各有一份布局，只读全局键会与别的管道串线），"
+    "取不到再回退全局 ^demo.Config(\"sql2fhir\",\"layout\")；推荐写法（照抄）："
+    "Set tBP=..%ConfigName Set tLayoutStr=$Get(^demo.Config(\"sql2fhir\",\"layout\",tBP)) "
+    "If tLayoutStr=\"\" { Set tLayoutStr=$Get(^demo.Config(\"sql2fhir\",\"layout\")) }；"
+    "布局字段：patient_id_col / query_bos[](bo_name/source_table/fk_col/depth/depends_on/"
+    "target_resource/**mapping_id**) / bundle.entries[](source_table/target_resource/mapping_id) / bundle.refs[](target_resource/parent_resource/"
+    "field)；**每个子资源的字段映射必须按 `query_bos[i].mapping_id` 取**"
+    "（`Set tFms=..GetMappingFms(tQB.%Get(\"mapping_id\"))`；平台已为 query_bos 与 bundle.entries 同时注入同一个 id）。"
+    "取不到就是空映射 → 转换行是 `{}` → 子资源只带 resourceType/id → FHIR 报 "
+    "`MissingRequiredProperty`（如 Encounter 缺 class/status）→ **整个 Bundle 事务回滚（Patient 也不落地）**；"
+    "**query_bos[].depends_on 是父「源表名」**（depth=1 为 \"Patient\"）：取父行主键集合时，"
     "若没有维护该名称对应的 ID 集合（根表 Patient 即如此，患者主键只存在于上一层集合），**必须回退用上一层 ID 集合**"
     "（tLevel(depth-1)）——否则子表查询会被整体跳过，导致只有 Patient、零子资源；"
-    "c) 患者行=##class(demo.TransformProcess).UnpackSource(request)；患者 UUID=SHA1('Patient:'_患者ID) 取32hex分8-4-4-4-12；"
+    "**层级记账必须与 depth 对齐**：患者层 = **level 0**（`Set tLevelCnt(0)=1`、`Set tLevelIds(0,0)=患者ID`、"
+    "父层取 `tLevelCnt(depth-1)`）、depth=1 的子表（如 Encounter）产出记到 **level 1**、depth=2 记到 level 2；"
+    "实测 2026-09-18 缺陷：把患者写成 `tLevelCnt(1)`（整体上移一层）→ depth=1 的 Encounter 取 `tLevelCnt(0)`=0 "
+    "**被整体跳过**，depth=2 的 Diagnosis/MedicationOrder 又把患者 ID 当 EncounterID 查询 → 0 行，"
+    "结果 Bundle 只有 Patient 一条 entry，**消息全 Completed、零错误**（静默失败）；"
+    "c) 患者行=..UnpackSource(request)；患者 UUID=SHA1('Patient:'_患者ID) 取32hex分8-4-4-4-12；"
     "d) 子表查询：向 bo_name 组件（现成 EnsLib.SQL.Operation.GenericOperation）发送 Ens.StreamContainer，"
     "其 Stream 为 JSON {fk_col:父key值}（depth=1 用患者ID、depth=2 先得 Encounter 行 UUID 再用其 ID）；"
     "响应 Stream 为 JSON 行集，实测 body 与官方文档口径一致：**一个序号键对象** "
@@ -93,35 +125,50 @@ SYSTEM_PROMPT_PIPELINE = (
     "NULL 表现为 \"\\u0000\"），按该事实逐行处理（遍历 API 见 h）；"
     "e) 每行资源组装：mapping=^demo.Mapping(mapping_id) 的 field_mappings；转换="
     "##class(demo.FHIRTransformHelper).TransformResource(行JSON, fmsJSON)；组装="
-    "##class(demo.TransformProcess).BuildFHIRResource(target_resource, 转换后JSON, 行JSON, fmsJSON)；"
+    "**..BuildFHIRResource(target_resource, 转换后JSON, 行JSON, fmsJSON)**"
+    "（继承自 demo.TransformProcess 的实例方法，故必须用 `..`；**术语转换无需你实现**——"
+    "`field_mappings[].transform=term_map:<skill>` 的列由平台共享 BO 自动追加目标体系 coding，"
+    "服务器尚无判定时平台降级为「保留源 coding + meta.tag 打 unmapped」，不阻断、不静默）；"
     "f) 资源 id/fullUrl=确定性 UUID；request={method:PUT,url:Resource/UUID}；"
     "g) 引用按 layout.bundle.refs 注入：field={\"reference\":\"urn:uuid:父UUID\"}（Encounter 父UUID="
     "确定性UUID('Encounter:'_EncounterID 列值)；子资源父=所在就诊的 UUID）；"
+    "**引用清单必须从 bundle 取**：`Set tBundle=tLayout.%Get(\"bundle\")` 再 `tBundle.%Get(\"refs\")`；"
+    "**禁止** `tLayout.%Get(\"refs\")`（顶层没有该键；再配 `$IsObject` 兜底成空数组会让引用注入被**静默跳过**，"
+    "Bundle 里 subject/encounter 仍是裸源键 → FHIR 报 `<HSFHIRErr>MalformedRelativeReference`，实测 2026-09-18）；"
+    "`refs` 取不到时应直接 `Quit $$$ERROR(...)` 显式失败，不得用空数组兜底；"
     "h) Bundle: resourceType=Bundle type=transaction entry=[...]；POST 用 EnsLib.HTTP.GenericMessage："
     "**body 必须是 UTF-8 字节流**——GenericMessage 的 body 是 %RawString（原样字节），若写字符流会在发送时"
     "逐字符按单字节输出，**中文会变成 \"?\"**；正确写法：Set tS=##class(%Stream.GlobalBinary).%New() "
     "Do tS.Write($ZCONVERT(tJSON,\"O\",\"UTF8\")) Set tMsg.Stream=tS（**禁止** %Stream.GlobalCharacter / "
     "%GlobalCharacterStream 作为 HTTP body）；HTTPHeaders：HTTPRequest=POST、URL=^demo.Config(\"fhir\",\"base_path\")、"
     "Content-Type/Accept=application/fhir+json、Authorization=Basic base64(user:pass)（user/pass 取自 "
-    "^demo.Config(\"fhir\",\"username\"/\"password\")）；发往 ^demo.Config(\"fhir\",\"operation\")。"
-    "9. generated_bp.source 只允许类 demo.SqlFhirPatientTxProcess（Extends Ens.BusinessProcess）；"
+    "^demo.Config(\"fhir\",\"username\"/\"password\")）；**发往 layout.http_bo 给出的 Operation 主机名**"
+    "（多管道并存时每个 sql2fhir 组各有自己的 FHIR Operation 实例，布局里就是它的实际名；"
+    "读法与布局同源：`Set tOp=tLayout.%Get(\"http_bo\")`，仅当为空时才回落 "
+    "^demo.Config(\"fhir\",\"operation\")——按全局键派发会把 Bundle 发给**别的管道**的 Operation）。"
+    "9. generated_bp.source 只允许类 demo.SqlFhirPatientTxProcess（Extends demo.TransformProcess）；"
     "禁止 xecute/$zf/^Ens 直接 global 写/Web Application 操作/读密钥；禁止输出类源码之外的其它代码。"
     "10. existing_pipelines 是平台已登记的数据管道事实（id/category/design_skill/组件/状态）："
     "同一 (源,目标) 的管道由平台**更新**而非新增，组件 Category 自动写为该管道的 design_skill，"
     "源 BS 同名跨管道时平台按类别改名（{原名}__{类别}，与组顺序无关）。请据此判断本次是新增管道还是"
     "复用/扩展既有管道，并在 pipeline.note 中说明（决策仍由你作出，平台只提供事实）。"
-    "ObjectScript 硬约束（违反会编译失败）：a) **禁止在 TRY/CATCH 块内使用带参数 QUIT**（#1043）——"
-    "方法返回值一律用方法体顶层 Quit（或顶层 Quit 变量）；b) 工具函数（取值/查找等）写 ClassMethod，"
+    "ObjectScript 硬约束（违反会编译失败）：a) **禁止在 TRY/CATCH 块内使用带参数 QUIT**（#1043；"
+    "实测 2026-09-18 复发：`Try { … Quit tSC … }` 直接编译失败，白烧修复轮次）——"
+    "方法返回值一律用方法体**顶层** Quit（Try 内只置变量/记日志，不做控制流转移）；"
+    "a2) 形参/返回值类型必须是**真实存在**的类（`%Library.Persistent` / `%Library.DynamicObject` / "
+    "`%Library.DynamicArray` / `%Stream.GlobalCharacter` / `%String` / `%Integer` 等）："
+    "`%Library.Object` **不存在**（实测 2026-09-18 编译报 #5373 Class '%Library.Object' … does not exist）；"
+    "b) 工具函数（取值/查找等）写 ClassMethod，"
     "方法体顶层 Quit 值合法；c) 禁止 ##class(EnsLib.HTTP.Headers).%New()——HTTP 头一律用 "
     "msg.HTTPHeaders.SetAt(值, 头名)；d) SendBundle 必须校验同步响应（HTTPHeaders 的 \"Status\" 非 2xx "
     "或响应文本含 OperationOutcome 时，返回 $$$ERROR 并在消息中可见）；e) 禁止在 FOR 循环体内用带参数 "
     "QUIT 返回方法值（需要返回时先置顶层变量，循环外统一 Quit）；f) 调用 "
-    "demo.FHIRTransformHelper.TransformResource / demo.TransformProcess.BuildFHIRResource 时"
+    "demo.FHIRTransformHelper.TransformResource / ..BuildFHIRResource 时"
     "**必须传 JSON 字符串**（用 行对象.%ToJSON()），禁止直接传 %DynamicObject（会触发 Python TypeError）；"
     "**两者都返回 JSON 字符串**（BuildFHIRResource 返回类型是 %String）——返回值当对象用时必须 "
     "`Set tRes=##class(%DynamicObject).%FromJSON(返回值)` 且先用 `$IsObject` 判断，"
     "否则 `Do tRes.%Set(...)` 会报 INVALID OREF；"
-    "读取 ^demo.Config(\"sql2fhir\",\"layout\") 与 ^demo.Mapping 后须 %FromJSON 再取值，写响应/请求头用字符串；"
+    "读取 ^demo.Config(\"sql2fhir\",\"layout\",..%ConfigName)（缺省回退 ^demo.Config(\"sql2fhir\",\"layout\")）与 ^demo.Mapping 后须 %FromJSON 再取值，写响应/请求头用字符串；"
     "g) 调用 ..SendRequestSync / ..SendRequestAsync 的方法**必须声明为 Method（实例方法）**，"
     "不得放在 ClassMethod 内（否则 MPP5377）；纯工具函数（UUID/取值/查找/组装 entry）才用 ClassMethod；"
     "h) 访问 %DynamicObject **必须用 %Get(\"key\") / %Set(\"key\",值) / %Size() / %Get(n)**，"
@@ -138,7 +185,7 @@ SYSTEM_PROMPT_PIPELINE = (
     "i) **JSON 字面量 {…}/[…] 只能包含常量**，含变量时必须用 "
     "##class(%DynamicArray).%New() + %Push(值) 或 ##class(%DynamicObject).%New() + %Set(\"k\",值) 构造"
     "（例如 Set vals=[pid] 会报 #1033 Expected literal）；"
-    "j) **##class(demo.TransformProcess).UnpackSource(request) 返回 JSON 字符串**（不是对象）——"
+    "j) **..UnpackSource(request) 返回 JSON 字符串**（不是对象）——"
     "必须先 `Set row=##class(%DynamicObject).%FromJSON(tSrc)` 再 %Get；"
     "^demo.Config/^demo.Mapping 的取值同样是字符串，需 %FromJSON；禁止对字符串用 %Get；"
     "k) 确定性 UUID 必须是**可打印十六进制文本**：对种子取 SHA1 后先转十六进制"
@@ -152,7 +199,7 @@ SYSTEM_PROMPT_PIPELINE = (
     "m) global 赋值必须用 `Set ^global(sub)=值` 语句；**$Set 只能作为表达式取值，不能 `Do $Set(...)`**"
     "（会报 #1026 Invalid command）；"
     "n) **demo.FHIRTransformHelper.TransformResource(行JSON, fmsJSON) 与 "
-    "demo.TransformProcess.BuildFHIRResource(资源类型, 转换后JSON, 行JSON, fmsJSON) 的 fms 参数必须是 "
+    "..BuildFHIRResource(资源类型, 转换后JSON, 行JSON, fmsJSON) 的 fms 参数必须是 "
     "field_mappings 数组 JSON**：fmsJSON = ##class(%DynamicObject).%FromJSON(^demo.Mapping(id)).%Get(\"field_mappings\").%ToJSON()；"
     "禁止把整个 mapping 对象 JSON 当 fms 传入（会导致 Python 'str' object has no attribute 'get'）；"
     "o) **While/If 的条件必须用圆括号**（`While (cond) { … }`、`If (cond) { … }`），"
@@ -223,8 +270,77 @@ SYSTEM_PROMPT_PIPELINE = (
 )
 
 
+# ===== Plan 层（2026-09-19）：先出"怎么做"的计划（小输出），再按方法逐个生成 =====
+# 背景：整类 BP 生成 ≈ 34.5k completion（含大量模型推理 token）、单次 30~60 分钟且频繁 timeout。
+# 拆成 plan（≤4k token）+ 每方法一次小调用（≤8k）后，单次响应小、可编译可单测、可断点续跑。
+SYSTEM_PROMPT_BP_PLAN = (
+    "你是 IRIS Ensemble 数据管道编排规划师。给定**布局契约**（layout：query_bos / bundle.entries / bundle.refs / "
+    "http_bo）、字段映射（含 term_map 决策）、管道组件清单、以及**父类 demo.TransformProcess 已提供的稳定 API 清单**，"
+    "为聚合 BP（继承父类）产出**执行计划**。**只输出计划，不要写任何代码**。要求："
+    "1. methods 只列**必要**方法（≤8 个）且必须含入口 OnRequest；每个方法职责**单一**（便于逐个生成与验证）；"
+    "2. 每个方法给 purpose（一句话）、steps（≤6 条要点）、verification（compile/unit/runtime 子集）；"
+    "**每个方法保持短小（建议 ≤40 行 ObjectScript）**：大逻辑继续拆成更多小方法（总数 ≤8），"
+    "便于逐个生成与验证（实测：单方法输出过大时模型会输出超长内容并被截断）；"
+    "3. calls_parent **只能**引用给定父类 API 清单里的方法名（不许发明）；calls_self 只能引用本计划的方法名；"
+    "4. 计划必须说明**如何读布局的关键键**：query_bos[].mapping_id（子资源字段映射）、bundle.entries[].mapping_id、"
+    "bundle.refs（在 bundle 里，顶层没有）、http_bo（本管道 FHIR Operation 的实例名）；"
+    "5. **签名里的类型必须是 IRIS 类型**（`%String`/`%Integer`/`%Boolean`/`%Library.DynamicObject`/"
+    "`%Library.Persistent`/`%Status`/`%Library.DynamicArray`…）：**不要**写 `String`/`Integer`/`Object` 这类"
+    "非 IRIS 名（编译会报 `#5500 method formal argument type … is invalid`）；"
+    "6. 对**纯函数**方法给 `unit` 样例：{args:[...], expect_contains:\"...\"}（`args` 传字符串/JSON 文本）；"
+    "样例必须与方法行为**一致**（平台会用该样例真实调用并断言；不一致会被判失败）；"
+    "**只在显而易见、能确定返回值时**给样例，不确定就 null；"
+    "**可独立验证的纯逻辑请单独列为 ClassMethod 方法**（无实例依赖），便于平台在生成期直接单测；"
+    "依赖业务主机上下文（SendRequestSync/%Process）的方法 unit 给 null；"
+    "**术语判码不要自己实现**（父类经共享 BO `demo.TerminologyOperation` 处理，Plan 里说明『交给父类』即可）；"
+    "7. 给出 verification 总表、risks（≤3 条）、fallback（失败时怎么办，例如『整类生成（显式标注）』）。"
+    "严格输出 JSON（不要输出其他文字），格式："
+    '{"plan":{"schema":1,"class_name":"demo.SqlFhirPatientTxProcess","parent":"demo.TransformProcess",'
+    '"summary":"…","methods":[{"name":"OnRequest","signature":"Method OnRequest(request As %Library.Persistent, '
+    'Output response As %Library.Persistent) As %Status","purpose":"入口：…","steps":["…"],'
+    '"calls_parent":["GetMappingFms"],"calls_self":["ProcessPatient"],"verification":["compile","runtime"],'
+    '"unit":null}],"verification":[{"step":"compile","tool":"OBJ.Load","expect":"ok"}],'
+    '"risks":["…"],"fallback":"整类生成（显式标注）"}}'
+)
+
+# 单方法生成的事实块（今天/前几天实测踩过的坑，全部为**事实**约束）
+BP_METHOD_FACTS = (
+    "1) 只输出**一个方法**的完整源码（含方法头与花括号），不要类头/其它方法/Markdown 代码围栏；",
+    "2) 调用父类能力用 `..Foo(...)`（如 `..GetMappingFms(id)`/`..BuildFHIRResource(...)`/`..TermCoding(...)`）；"
+    "**禁止** `##class(demo.TransformProcess).Foo(...)` 静态调用实例方法；",
+    "3) `Try { … }` 块内**禁止带参数 Quit**（编译报 #1043）：块内只赋值，返回值在方法体顶层 `Quit tSC`；",
+    "4) `Output response` 必须是 `%Library.Persistent`（如 `Set response=##class(Ens.Response).%New()`）；"
+    "**禁止**把 `%DynamicObject`/`%Stream` 赋给它（运行期 ErrBPTerminated）；",
+    "5) 只调用**存在**的助手：父类 API 清单里的方法，或本类计划里的方法（否则编译 MPP5376）；",
+    "6) `$Get()` 未定义返回 \"\"，与 0 比较必须显式归一：`Set tCnt=+$Get(x)`；判空用 `= \"\"`（`(\"\"=0)` 为 FALSE）；",
+    "7) 子表查询/HTTP 发送失败**不许静默**：`If $$$ISERR(tSC) { $$$LOGERROR($System.Status.GetErrorText(tSC)) ... }` 或上抛；",
+    "8) 引用注入取 `Set tBundle=tLayout.%Get(\"bundle\")` 再 `tBundle.%Get(\"refs\")`（顶层没有 refs），取不到要显式失败；",
+    "9) 布局里的 `query_bos[].mapping_id` / `bundle.entries[].mapping_id` / `http_bo` 是**平台注入的实例级事实**，"
+    "必须读它们（别按名字拼装、别读全局兜底键）；读不到要显式失败；",
+    "10) 术语双 coding 由父类 `..BuildFHIRResource` + 共享 BO 完成，本方法**不要**自己查术语；",
+    "11) **只实现这一步计划里的方法**，保持短小（建议 ≤60 行 ObjectScript）：把循环/组装拆到计划里的"
+    "其它方法；不要把别的方法的逻辑塞进来（输出过大易被截断、也会让后续步骤重复实现）；",
+    "12) 给 `%DynamicObject`/`%DynamicArray` 设值必须用方法：`Do tObj.%Set(\"key\", v)`、`Do tArr.%Push(v)`、"
+    "`Do tArr.%Set(idx, v)`；**禁止** `Set tObj.key=v` / `Set tArr.idx=v`（编译报 `#1027 Error in SET command`）；"
+    "取值 `tObj.%Get(\"key\")`、`tArr.%Get(idx)`；",
+    "13) 字符串拼接用 `_`（`Set tS=tA_\"-\"_tB`）；不要把 `+` 当拼接；比较用 `=`，不等用 `'=`；"
+    "**后置条件不能带空格**：写 `Quit:x=\"\"`（能编译），写 `Quit:x = \"\"` 会报 `#1054 Invalid expression : '='`；",
+    "14) 若你确认**计划里的 unit 样例写错了**（与方法正确行为不符），可在返回 JSON 里额外给 "
+    "`unit_fix:{\"args\":[...],\"expect_contains\":\"…\"}`：平台会采纳新样例后重测（**别为了让断言过而"
+    "把方法改成错误实现**）；",
+)
+
+SYSTEM_PROMPT_BP_METHOD = (
+    "你是 IRIS ObjectScript 工程师。按给定**计划**只生成**一个方法**的源码。硬性事实（必须遵守）："
+    + "".join(BP_METHOD_FACTS) +
+    "输出严格 JSON（不要输出其他文字），格式："
+    '{"method":{"name":"<方法名>","source":"Method <方法名>(<参数>) As <返回类型>\\n{\\n    …\\n}"}}'
+)
+
+
 # ===== 公共调用逻辑（token 日志 + 一次重试） =====
-def _call_llm(system_prompt: str, user_content: str, agent_name: str) -> dict:
+def _call_llm(system_prompt: str, user_content: str, agent_name: str,
+              max_tokens: int | None = None) -> dict:
     """调用 LLM 一次并解析 JSON 返回。
 
     超时策略（缺陷 N9 修复）：单次读超时 + 墙钟总预算双重兜底。
@@ -261,7 +377,7 @@ def _call_llm(system_prompt: str, user_content: str, agent_name: str) -> dict:
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.2,
-                max_tokens=LLMConfig.MAX_TOKENS,
+                max_tokens=max_tokens or LLMConfig.MAX_TOKENS,
             )
             usage = getattr(resp, "usage", None)
             if usage is not None:
@@ -416,8 +532,14 @@ def recommend_pipeline(mappings: list[dict], source_type: str, target_type: str,
                        target_runtime: dict | None = None,
                        existing_pipelines: list[dict] | None = None,
                        bp_compile_feedback: str | None = None,
-                       bp_patch_mode: bool = False) -> dict:
-    """数据管道设计 Agent（规划师）：选 Skill + 生成组件拓扑。"""
+                       bp_patch_mode: bool = False,
+                       bp_plan_mode: bool = False) -> dict:
+    """数据管道设计 Agent（规划师）：选 Skill + 生成组件拓扑。
+
+    `bp_plan_mode=True`（2026-09-19 Plan 层）：**只出拓扑**——明确要求**不要输出整份
+    `generated_bp` 源码**（平台随后用"计划 + 逐方法生成"产出聚合 BP）。动机：整类源码生成
+    ≈34.5k completion（含模型推理 token）、单次 30~60 分钟且频繁 timeout。
+    """
     # 注入当前 (源,目标) 可匹配的管道设计 Skill 目录（id/status/rules/bo_contract），供 planner 选型决策
     matched_skills = [
         {"id": s["id"], "name": s.get("name", ""), "status": s.get("status", ""),
@@ -441,9 +563,70 @@ def recommend_pipeline(mappings: list[dict], source_type: str, target_type: str,
             "existing_pipelines": existing_pipelines or [],
             "bp_compile_feedback": bp_compile_feedback or "",
             "bp_patch_request": bool(bp_patch_mode),
+            # Plan 层：本次**不要**输出整份 BP 源码（平台按计划逐方法生成）——避免 34.5k completion 大调用
+            "bp_plan_request": bool(bp_plan_mode),
         }, ensure_ascii=False, indent=2)
-    result = _call_llm(SYSTEM_PROMPT_PIPELINE, user_content, "数据管道设计Agent")
+    prompt = SYSTEM_PROMPT_PIPELINE
+    if bp_plan_mode:
+        prompt = (SYSTEM_PROMPT_PIPELINE
+                  + "【本次特别要求（Plan 层）】只输出 design_skill 与 pipeline.components；"
+                  "**不要**输出 generated_bp / method_updates 源码——平台会先用计划（方法编排）"
+                  "再逐个方法生成聚合 BP。输出 JSON 里不要包含 generated_bp 字段。")
+    result = _call_llm(prompt, user_content, "数据管道设计Agent")
     pipeline = result.get("pipeline")
     if not isinstance(pipeline, dict):
         raise AgentError("pipeline 必须是对象")
+    return result
+
+
+# ===== Plan 层入口（小输出：计划 / 单方法） =====
+def plan_bp_source(*, layout: dict, mappings: list[dict], components: list[dict],
+                   design_skill: str, bp_class: str, parent_api: list[str],
+                   facts: dict | None = None, max_tokens: int = 4000) -> dict:
+    """Plan 层：请 Agent **只产出计划**（方法编排/调用关系/验证策略），不写代码。
+
+    为什么：整类生成 ≈34.5k completion（含模型推理 token）→ 单次 30~60 分钟、易 timeout；
+    计划输出 ≤4k token，落库可审计，并为"逐方法生成 + 断点续跑"提供依据。
+    失败抛 `AgentError`（显式，不静默）。
+    """
+    user_content = json.dumps({
+        "design_skill": design_skill,
+        "bp_class": bp_class,
+        "parent_class_api": parent_api,
+        "layout": layout,
+        "mappings": mappings,
+        "components": components,
+        "facts": facts or {},
+    }, ensure_ascii=False, indent=2)
+    result = _call_llm(SYSTEM_PROMPT_BP_PLAN, user_content, "数据管道设计Agent(计划)",
+                       max_tokens=max_tokens)
+    if not isinstance(result.get("plan"), dict):
+        raise AgentError("BP 计划输出不合规：缺 plan 对象")
+    return result
+
+
+def generate_bp_method(*, plan_step: dict, bp_class: str, skeleton: str, layout: dict,
+                       parent_api: list[str], facts: dict | None = None,
+                       feedback: str = "", max_tokens: int = 16000) -> dict:
+    """按计划生成**一个方法**的源码（小输出）。返回 {"method":{"name","source"}}。
+
+    参数:
+        plan_step: 该方法的计划项（name/purpose/steps/calls_parent/calls_self/verification/unit）
+        skeleton: 已生成方法的**签名清单**（避免重复定义、便于互相调用）
+        feedback: 上一轮编译/单测失败原文（只针对这一步重写）
+    """
+    user_content = json.dumps({
+        "bp_class": bp_class,
+        "parent_class_api": parent_api,
+        "plan": plan_step,
+        "layout": layout,
+        "class_skeleton": skeleton,
+        "compile_feedback": feedback or "",
+        "facts": facts or {},
+    }, ensure_ascii=False, indent=2)
+    result = _call_llm(SYSTEM_PROMPT_BP_METHOD, user_content, "数据管道设计Agent(方法)",
+                       max_tokens=max_tokens)
+    m = result.get("method")
+    if not isinstance(m, dict) or not str(m.get("source") or "").strip():
+        raise AgentError("方法输出不合规：缺 method.source")
     return result

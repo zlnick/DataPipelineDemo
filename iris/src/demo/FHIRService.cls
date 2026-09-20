@@ -16,14 +16,36 @@ Method OnProcessInput(pInput As %RegisteredObject, Output pOutput As %Registered
 
 /// 从队列表 FHIRQueue 取一条 pending 记录，发送到转换流程（TransformProcess），
 /// 随后标记为 processed。每次调用只处理一条 → 每条数据独立会话。
+///
+/// 队列是**全局表**：多个数据管道并存时，本 BS 只允许消费**本管道映射集**的行
+/// （^demo.Config("bs_mappings", <本BS名>) = JSON 数组，生成时写入）。
+/// 否则任一组都会抢走别组的行并标记 processed → 别组拿不到数据（静默丢数据），
+/// 且本组 BP 会按自己的目标类型派发（实测 TransformProcess__fhir2db 派发
+/// SQLOp_Observation 报 ErrBusinessDispatchNameNotRegistered）。
+/// 未配置该键时保持历史行为（消费任意 pending 行，兼容单管道旧环境）。
 Method ProcessOneFromQueue() As %Status
 {
     Set tSC = $$$OK
     Try {
+        Set tSql = "SELECT TOP 1 ID, ResourceType, ResourceId, ResourceJson, MappingId "
+            _ "FROM FHIRQueue WHERE Status='pending'"
+        Set tIds = $Get(^demo.Config("bs_mappings", ..%ConfigName))
+        If tIds '= "" {
+            Set tArr = ##class(%DynamicArray).%FromJSON(tIds)
+            Set tIn = ""
+            Set tIter = tArr.%GetIterator()
+            While tIter.%GetNext(.tKey, .tVal) {
+                Set tVal = $Get(tVal)
+                // 映射 id 只允许字母/数字/下划线（防注入），其余忽略
+                If $MATCH(tVal, "^[A-Za-z0-9_]+$") {
+                    Set tIn = tIn _ $Select(tIn = "": "", 1: ",") _ "'" _ tVal _ "'"
+                }
+            }
+            If tIn '= "" Set tSql = tSql _ " AND MappingId IN (" _ tIn _ ")"
+        }
+        Set tSql = tSql _ " ORDER BY ID"
         Set tRS = ##class(%SQL.Statement).%New()
-        Set tSC2 = tRS.%Prepare(
-            "SELECT TOP 1 ID, ResourceType, ResourceId, ResourceJson, MappingId "
-            _ "FROM FHIRQueue WHERE Status='pending' ORDER BY ID")
+        Set tSC2 = tRS.%Prepare(tSql)
         If $$$ISOK(tSC2) {
             Set tRset = tRS.%Execute()
             If tRset.%Next() {

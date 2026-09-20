@@ -22,6 +22,13 @@
           </el-button>
           <el-button type="success" :loading="running" @click="handleRun">{{ t('pipelines.runBtn') }}</el-button>
           <el-button @click="refreshAll">{{ t('pipelines.refreshBtn') }}</el-button>
+          <!-- 增量生成：默认只生成"新增/变更"的管道；勾选后强制全量重生成 -->
+          <el-tooltip :content="t('pipelines.forceRegenTip')" placement="top">
+            <span class="ml8">
+              <el-switch v-model="forceRegen" size="small" class="mr4" />
+              <span class="gray">{{ t('pipelines.forceRegen') }}</span>
+            </span>
+          </el-tooltip>
           <el-button type="info" plain :disabled="!aiInfo" @click="aiLogVisible = true">
             {{ t('pipelines.aiAuditBtn') }}
           </el-button>
@@ -201,6 +208,42 @@
       </el-table>
     </el-card>
 
+    <!-- 术语映射盘点（术语服务器 = 事实源）：生成前只读盘点结果 / 缺映射时给出待办 + 补录方式 -->
+    <el-card shadow="never" v-if="termGateFail || termCatalog" class="mb16">
+      <template #header>
+        <span class="card-title">{{ t('pipelines.termSummaryTitle') }}</span>
+      </template>
+      <el-alert
+        v-if="termGateFail"
+        type="error"
+        :closable="false"
+        show-icon
+        :title="termGateFailTitle"
+      >
+        <div>{{ termGateFail.message }}</div>
+        <div class="mt8">{{ t('pipelines.termGateFailHint') }}</div>
+        <div class="mono mt8">{{ t('pipelines.termGateFailCmd') }}</div>
+        <div class="mt8">{{ t('pipelines.termGateFailAfter') }}</div>
+      </el-alert>
+      <template v-else>
+        <el-alert
+          :type="termTodo.length ? 'warning' : 'success'"
+          :closable="false"
+          show-icon
+          :title="termCatalogTitle"
+        />
+        <div v-if="termTodo.length" class="mt8">
+          <div class="gray">{{ t('pipelines.termTodoHint') }}</div>
+          <div class="mt8">
+            <el-tag size="small" type="warning" class="mr6" v-for="x in termTodo" :key="x">{{ x }}</el-tag>
+          </div>
+        </div>
+        <div class="mt8">
+          <el-tag size="small" type="info" class="mr6" v-for="p in termPairs" :key="p">{{ p }}</el-tag>
+        </div>
+      </template>
+    </el-card>
+
     <!-- 管道验证报告（生成后的拓扑/编译/启动/消息流转检查） -->
     <el-card shadow="never" v-if="validation" class="mb16">
       <template #header><span class="card-title">{{ t('pipelines.valReport') }}</span></template>
@@ -347,6 +390,9 @@ const { t } = useI18n()
 
 const running = ref(false)
 const generating = ref(false)
+// 增量生成（P4）：强制重生成开关（默认关）→ 关时"已存在且未变更"的管道不提交、不重生成
+const forceRegen = ref(false)
+const instancesSkipped = ref(0)
 const mockGenerating = ref(false)
 const logs = ref([])
 const logsLoading = ref(false)
@@ -415,6 +461,32 @@ const budgetTitle = computed(() => {
   if (b.over_capacity) parts.push(b.note || t('pipelines.budgetOver'))
   return parts.join(' ｜ ')
 })
+
+// —— 术语映射盘点（术语服务器 = 事实源）：生成响应里的 term_catalog/term_summary/term_todo + 严格模式中止 ——
+const termCatalog = ref(null)    // 生成前只读盘点摘要（jobs/pairs/covered/negative/missing/todo）
+const termSummary = ref(null)    // 生成后复核（jobs/todo/covered/negative；缺映射只告警不阻断）
+const termTodo = ref([])         // **待办清单**：服务器尚无映射的源编码（运行期降级处理）
+const termGateFail = ref(null)   // 严格模式（strict_terms）中止：message + term_catalog
+
+const termGateFailTitle = computed(() => {
+  const g = termGateFail.value?.term_catalog || {}
+  const n = (g.missing || []).length + (g.pending || []).length + (g.unresolved || []).length
+  if (!n) return t('pipelines.termGateNoServer')
+  return t('pipelines.termGateFailTitle', { n })
+})
+
+const termCatalogTitle = computed(() => {
+  const g = termCatalog.value || {}
+  const pairs = (g.pairs || []).length
+  return t('pipelines.termSummary', {
+    pairs, covered: g.covered ?? 0, negative: g.negative ?? 0,
+  })
+})
+
+// 本次涉及的体系对（源体系 → 目标体系），供界面快速确认用了哪些术语服务
+const termPairs = computed(() =>
+  (termCatalog.value?.pairs || []).map((p) => `${p.sourceSystem} → ${p.targetSystem}`)
+)
 
 async function loadItems() {
   const data = await pipelineApi.items()
@@ -572,36 +644,61 @@ async function buildPipelinesFromMappings(mappings, dsList, targetRows) {
     return assetCands[s] || assetCands[s.split('.').pop()] || assetCands[String(m?.asset || '')] || []
   }
   // 目标表/实体 → 目标记录（含 type）
-  const tgtByTable = {}
+  // ⚠ 必须按 `类型:表名` 消歧：同一实体名跨目标重名（DB 的 Patient 与 FHIR 的 Patient）时，
+  //   只按裸表名索引会让后者覆盖前者 → FHIR 的 Patient 映射被归到 DB 目标组（实测缺陷 G：
+  //   分组出现「目标 TG33372(DB) | 映射 ['R1','R1_3']」而 FHIR 组缺 Patient）。
+  const tgtByKey = {}
   for (const t of targetRows || []) {
-    if (t && t.table && !tgtByTable[t.table]) tgtByTable[t.table] = t
+    if (!t || !t.table) continue
+    const k = `${String(t.type || '').toUpperCase()}:${t.table}`
+    if (!tgtByKey[k]) tgtByKey[k] = t
+    if (!tgtByKey[t.table]) tgtByKey[t.table] = t  // 兼容：类型缺失/未知时按裸名（首个）
   }
-  // 先按「目标」分组：同一目标的映射必须归到同一个源数据源；
-  // 数据源选择 = 能覆盖该组源表最多的那个（避免「两个数据源都有同名 Patient 表」把一组映射拆散，
-  // 例如 FHIR 组的 Patient/Encounter/Diagnosis/MedicationOrder 应整体归到同时含这些表的数据源）
-  const byTarget = {}
+  // 映射 → 所属目标：优先「映射声明的类型 + 表名」精确命中，再退裸表名
+  const tgtOf = (m) => {
+    const tt = String(m?.target_type || '').toUpperCase()
+    return tgtByKey[`${tt}:${m?.target_table}`] || tgtByKey[m?.target_table] || {}
+  }
+  // 先按「源数据源 + 目标」分组（缺陷 A2，2026-09-17）：分组键**必须含源数据源**——
+  // 3 个源并存时它们都有同名资产（`Patient`），只按目标分组会把三个源的 Patient 映射并进同一组
+  // （票数并列 → 只能取一个源 → 9 条映射退化成 3 组且组内混源，界面无法表达"多源 → 同一目标"）。
+  // 源数据源判定：优先映射声明的 `source_id`（缺陷 A 后 /ai/recommend 与 /mappings 均已回填），
+  // 缺失（历史数据/手工登记）才按该条映射的资产候选回退。
+  const sidOf = (m) => {
+    const declared = String(m?.source_id || '').trim()
+    if (declared) return declared
+    return candsOf(m)[0]?.dsId || ''
+  }
+  const byKey = {}
   for (const m of mappings) {
-    const tg = tgtByTable[m.target_table]
-    const key = `${tg?.target_id || tg?.id || m.target_table}`
-    byTarget[key] = byTarget[key] || []
-    byTarget[key].push(m)
+    const tg = tgtOf(m)
+    const tkey = `${tg.target_id || tg.id || `${String(m.target_type || '').toUpperCase()}:${m.target_table}`}`
+    const key = `${sidOf(m)}|${tkey}`
+    byKey[key] = byKey[key] || []
+    byKey[key].push(m)
   }
   const pipelines = []
-  for (const ms of Object.values(byTarget)) {
-    const score = {}
-    for (const m of ms) {
-      for (const c of candsOf(m)) {
-        score[c.dsId] = (score[c.dsId] || 0) + 1
+  for (const ms of Object.values(byKey)) {
+    let dsId = sidOf(ms[0])
+    if (!dsId) {
+      // 历史口径兜底：没有任何 source_id 时按资产名票选（同名跨源无法区分，仅作兼容）
+      const score = {}
+      for (const m of ms) {
+        for (const c of candsOf(m)) {
+          score[c.dsId] = (score[c.dsId] || 0) + 1
+        }
       }
+      dsId = Object.entries(score).sort((a, b) => b[1] - a[1])[0]?.[0] || ''
     }
-    const best = Object.entries(score).sort((a, b) => b[1] - a[1])[0]
-    const dsId = best ? best[0] : ''
-    const dsType = (candsOf(ms[0]).find((c) => c.dsId === dsId) || {}).dsType || ''
-    const tg = tgtByTable[ms[0].target_table] || {}
+    const dsType = (dsList.find((d) => d.id === dsId)?.type)
+      || (candsOf(ms[0]).find((c) => c.dsId === dsId) || {}).dsType || ''
+    const tg = tgtOf(ms[0])
     pipelines.push({
       source_type: dsType || (ms[0].target_type === 'SOAP' ? 'FHIR' : 'SQL'),
       source_id: dsId || undefined,
-      target_type: ms[0].target_type || (tg.type === 'SOAP' ? 'SOAP' : 'DB'),
+      // 目标类型以**注册目标**为准（同一实体名可能跨类型重名：DB.Patient vs FHIR.Patient，
+      // 映射上的 type 只是 AI/归一结果；注册侧才知道这一组是哪个目标）——映射 type 作兜底
+      target_type: String(tg.type || '').toUpperCase() || ms[0].target_type || 'DB',
       target_id: tg.target_id || tg.id,
       mappings: ms,
     })
@@ -619,6 +716,7 @@ async function handleGenerate() {
   }
   generating.value = true
   try {
+    termGateFail.value = null
     const plans = (await modelApi.plans())?.items || []
     const plan = [...plans].reverse().find((p) => p.status === 'confirmed') || null
     // FHIR 源配置动态取自已登记数据源（endpoint 在记录顶层、账号在 auth，不写死）
@@ -636,9 +734,44 @@ async function handleGenerate() {
     let result
     if ((mixedTypes.size > 1 || mixedSources.size > 1) && dsList.length) {
       const targetRows = (await targetApi.list())?.items || []
-      const pipelines = await buildPipelinesFromMappings(mappings, dsList, targetRows)
-      if (pipelines.length > 1) {
-        result = await pipelineApi.generate({ pipelines })
+      let pipelines = await buildPipelinesFromMappings(mappings, dsList, targetRows)
+      // —— 增量（P4）：只提交**新增/变更组** ——
+      // 已存在同身份 (source_id, target_id) 且 mapping_ids 完全一致的组：输入未变 → 不提交
+      // （后端 P1/P3 同口径兜底；这里先过滤，减少无谓请求与界面噪音）
+      // `forceRegen=true` 时不跳过（用于手工改动后强制重生成）。
+      if (!forceRegen.value && pipelines.length) {
+        const inst = (await pipelineApi.instances())?.items || []
+        const sameIds = (a, b) => {
+          const A = (a || []).map(String).sort()
+          const B = (b || []).map(String).sort()
+          return A.length > 0 && A.length === B.length && A.every((x, i) => x === B[i])
+        }
+        const kept = []
+        const skipped = []
+        for (const p of pipelines) {
+          const ids = (p.mappings || []).map((m) => m.id).filter(Boolean)
+          const hit = inst.find((r) => r.source_id === p.source_id && r.target_id === p.target_id
+            && r.status !== 'superseded')
+          if (hit && sameIds(hit.mapping_ids, ids)) skipped.push(p)
+          else kept.push(p)
+        }
+        if (skipped.length) {
+          instancesSkipped.value = skipped.length
+          ElMessage.info(t('pipelines.generateSkippedUnchanged', { n: skipped.length }))
+        } else {
+          instancesSkipped.value = 0
+        }
+        pipelines = kept
+      }
+      if (pipelines.length >= 1) {
+        // ⚠ 即使只剩 1 组也走**多管道**提交：后端会把未提交的既有管道自动并入；
+        //   单管道路径是"整份替换 Production"，会把别的管道清掉（实测缺陷 2026-09-20）。
+        result = await pipelineApi.generate({ pipelines, force: forceRegen.value })
+      } else {
+        // 全部组都未变更 → 不发请求，直接提示"无变更"
+        ElMessage.success(t('pipelines.generateNothingChanged'))
+        await refreshAll()
+        return
       }
     }
     if (!result) {
@@ -648,10 +781,16 @@ async function handleGenerate() {
         source_models: plan?.source_models || [],
         target_models: plan?.target_models || [],
         config,
+        // 增量生成逃生开关：勾选后强制全量重生成（后端同口径）
+        force: forceRegen.value,
       })
     }
     validation.value = result?.validation || null
     budget.value = result?.license_budget || null
+    // 术语映射盘点（术语服务器 = 事实源）：只读摘要 + **待办清单**（缺映射默认降级，不阻断生成）
+    termCatalog.value = result?.term_catalog || null
+    termSummary.value = result?.term_summary || null
+    termTodo.value = result?.term_todo || result?.term_summary?.todo || []
     if (result?.pipeline_error) {
       // 生成成功但管道实体未登记：显式提示（不静默）
       ElMessage.warning(t('pipelines.pipelineError', { msg: result.pipeline_error }))
@@ -667,6 +806,21 @@ async function handleGenerate() {
       ElMessage.success(t('pipelines.generateDone'))
     }
     await refreshAll()
+  } catch (e) {
+    // 术语**严格模式**中止（TERM_MAP_INCOMPLETE，仅 strict_terms=true 时发生）：后端已带 400 +
+    // 缺哪些码/怎么补录，这里把结构化信息留在页面上（而不是只闪一条 ElMessage）。
+    const info = e?.response?.data?.data || null
+    if (info && (info.reason === 'TERM_MAP_INCOMPLETE' || info.term_catalog)) {
+      termCatalog.value = null
+      termSummary.value = null
+      termTodo.value = []
+      termGateFail.value = {
+        message: e?.response?.data?.message || e?.message || '',
+        term_catalog: info.term_catalog || {},
+      }
+    } else {
+      throw e
+    }
   } finally {
     generating.value = false
   }
@@ -709,6 +863,7 @@ onUnmounted(() => timer && clearInterval(timer))
 .mt4 { margin-top: 4px; }
 .mr4 { margin-right: 4px; }
 .mr6 { margin-right: 6px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .ml4 { margin-left: 4px; }
 .ml8 { margin-left: 8px; }
 .mt12 { margin-top: 12px; }

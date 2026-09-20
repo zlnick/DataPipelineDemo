@@ -9,6 +9,7 @@
 
 import json
 import logging
+import time
 
 from backend.services import iris_connector, type_registry
 
@@ -17,14 +18,51 @@ logger = logging.getLogger(__name__)
 PRODUCTION_NAME = "demo.DataflowProduction"
 
 
-def _get_table_columns(table: str, target_models: list[dict] | None = None) -> list[str]:
-    """查询目标表/实体列名。
+# 目标类型的同义标记：模型/实体上的 schema 字段是判据（DB 实体 = SQLUser、FHIR = FHIR、SOAP = SOAP）
+_TYPE_ALIASES = {
+    "DB": {"DB", "SQLUSER", "SQL"},
+    "FHIR": {"FHIR"},
+    "SOAP": {"SOAP", "WSDL"},
+}
+
+
+def _model_type_token(obj: dict) -> str:
+    """取模型/实体/目标的类型标记（schema 优先，其次 type/target_type）；无标记返回 ""。"""
+    for k in ("schema", "type", "target_type"):
+        v = str(obj.get(k) or "").strip().upper()
+        if v:
+            return v
+    return ""
+
+
+def _type_matches(obj: dict, want: str) -> bool:
+    """声明类型与对象类型是否一致。
+
+    **同名跨类型是常态**（DB 表 `Patient` 与 FHIR 资源 `Patient` 同名），按名匹配列结构时
+    必须带上类型，否则 DB 映射会被拿 FHIR 列结构校验（实测致映射被误剔除/误改）。
+    对象无类型标记时放行（历史数据兼容）。
+    """
+    if not want:
+        return True
+    token = _model_type_token(obj)
+    if not token:
+        return True
+    return token in _TYPE_ALIASES.get(want, {want})
+
+
+def _get_table_columns(table: str, target_models: list[dict] | None = None,
+                       target_type: str | None = None) -> list[str]:
+    """查询目标表/实体列名（**类型感知**：同名跨类型不混用）。
 
     优先从传入的 target_models 或持久化的 Target/TargetInterface 获取列名结构
     （支持 SOAP 实体或未建 SQL 表的目标）；无匹配时降级查 information_schema。
+
+    target_type 非空时：只采纳同类型的模型/实体（DB→SQLUser、FHIR→FHIR、SOAP→SOAP），
+    且降级 SQL 查询仅对 DB 类型生效——避免 FHIR/SOAP 目标名与 SQL 表名同名时误取列。
     """
     if not table:
         return []
+    want = str(target_type or "").strip().upper()
 
     def _extract_cols(obj: dict) -> list[str]:
         cols = obj.get("columns") or obj.get("fields") or []
@@ -38,20 +76,24 @@ def _get_table_columns(table: str, target_models: list[dict] | None = None) -> l
 
     # 1. 优先从请求传入的 target_models / targets 匹配
     for tm in target_models or []:
-        tm_table = tm.get("table") or tm.get("name") or tm.get("target_name") or ""
-        if tm_table == table:
-            cols = _extract_cols(tm)
-            if cols:
-                return cols
+        tm_table = (tm.get("table") or tm.get("name") or tm.get("target_name")
+                    or tm.get("entity_name") or "")
+        if tm_table != table or not _type_matches(tm, want):
+            continue
+        cols = _extract_cols(tm)
+        if cols:
+            return cols
 
     # 2. 查 Repository 中持久化的 Target / TargetInterface
     try:
         from backend.services import repository
         for tg in repository.list_targets():
+            if not _type_matches(tg, want):
+                continue
             # SOAP 实体或 DB 表
             for tb in tg.get("tables") or []:
                 tb_name = tb.get("table") or tb.get("entity_name") or ""
-                if tb_name == table:
+                if tb_name == table and _type_matches(tb, want):
                     cols = _extract_cols(tb)
                     if cols:
                         return cols
@@ -63,7 +105,9 @@ def _get_table_columns(table: str, target_models: list[dict] | None = None) -> l
     except Exception as exc:  # noqa: BLE001
         logger.debug("从 Repository 获取列名失败: %s", exc)
 
-    # 3. 降级查数据库 information_schema.columns
+    # 3. 降级查数据库 information_schema.columns（仅 SQL/DB 目标适用）
+    if want and want not in _TYPE_ALIASES["DB"]:
+        return []
     try:
         rows = iris_connector.query(
             "SELECT column_name FROM information_schema.columns "
@@ -126,7 +170,7 @@ def check_recommendations(mappings: list[dict], target_models: list[dict] | None
         if not table:
             issues.append({"severity": "error", "item": mid, "message": "缺少目标表 target_table"})
             continue
-        cols = _get_table_columns(table, target_models)
+        cols = _get_table_columns(table, target_models, m.get("target_type"))
         open_fhir = is_open_fhir_target(table, target_models)
         if not cols and not open_fhir:
             issues.append({"severity": "error", "item": mid,
@@ -158,6 +202,30 @@ def _path_root(path: str) -> str:
     return p.split("[")[0].split(".")[0]
 
 
+def _path_candidates(path: str) -> set[str]:
+    """路径的等价写法候选（逐级剥前缀 + 去数组下标），用于与"已知字段清单"容错比对。
+
+    背景（2026-09-16 缺陷 L 的姊妹问题，2026-09-17 实测噪声）：`mapping.source` 是**自由文本**，
+    前缀写法不固定 —— FHIR 路径可能是 `Patient.name[0].family`（带资源名前缀）也可能是
+    `name[0].family`（资产字段清单里的形态）；SQL 列可能是 `ID` / `Patient.ID` / `SQLUser.Patient.ID`。
+    原实现只比对"首段"（`_path_root`）→ 正确的 FHIR 映射被误报「源路径 … 不在资产 … 的已知字段中」
+    （5 条噪音告警，会误导用户去"修"本来正确的映射）。现让**任一等价形态命中**即算已知。
+    """
+    p = (path or "").strip()
+    if not p or p.startswith("concat("):
+        return set()
+    parts = p.split(".")
+    out: set[str] = set()
+    for i in range(len(parts)):
+        cand = ".".join(parts[i:])
+        if not cand:
+            continue
+        out.add(cand.lower())
+        out.add(cand.split("[")[0].lower())
+        out.add(cand.split(".")[0].split("[")[0].lower())
+    return out
+
+
 def check_source_fields(assets: list[dict], mappings: list[dict]) -> dict:
     """检查转换关系的源字段路径是否在已知资产字段中（warning 级，供 AI 语义判断）。
 
@@ -169,8 +237,9 @@ def check_source_fields(assets: list[dict], mappings: list[dict]) -> dict:
     asset_roots: dict[str, set[str]] = {}
     for a in assets or []:
         fs = set(a.get("fields", []))
-        all_known_fields.update(fs)
-        asset_roots[a.get("name", "")] = fs | {_path_root(f) for f in fs}
+        all_known_fields.update({str(f).lower() for f in fs})
+        asset_roots[a.get("name", "")] = ({str(f).lower() for f in fs}
+                                          | {_path_root(f).lower() for f in fs})
 
     for m in mappings or []:
         src = m.get("source", "")
@@ -187,13 +256,16 @@ def check_source_fields(assets: list[dict], mappings: list[dict]) -> dict:
             path = str(fm.get("source") or "")
             if not path:
                 continue
-            root = _path_root(path)
-            # 函数/常量/已有已知字段均算合法
-            if path.startswith("concat(") or " " in path or root in known or root in all_known_fields:
+            # 函数/常量/已有已知字段均算合法（多候选逐级匹配，见 _path_candidates）
+            if path.startswith("concat(") or " " in path:
+                continue
+            cands = _path_candidates(path)
+            if cands & known or cands & all_known_fields:
                 continue
             issues.append({"severity": "warning", "item": f"{m.get('id', '?')}.{path}",
                            "message": f"源路径 {path} 不在资产 {src} 的已知字段中"})
     return {"ok": True, "issues": issues}
+
 
 
 def check_pipeline_topology(topology: dict | None, source_type: str | None = None,
@@ -467,7 +539,37 @@ def _pipeline_has_messages(minutes: int = 60) -> int:
 def check_target_effect(target_types: list[str] | None = None,
                         expected: dict[str, int] | None = None,
                         fhir_base: str = "",
-                        strict: bool = True) -> dict:
+                        strict: bool = True,
+                        wait_seconds: int = 0) -> dict:
+    """目标侧落地效果事实检查（**有界等待版**：防"生成后立即计数"的竞态假失败）。
+
+    2026-09-17 实测（Round 2，SQL 源 → FHIR 组）：生成接口在同一秒内就做落地判定，源适配器刚投出的
+    行还在 `BP → HTTPOperation` 途中 → FHIR `Patient` 计数 0 → 判 error「落地数 0 < 预期 1」
+    （假失败：生成后数秒复查即 3）。故加**有界等待**：仅当判定失败时以 3s 间隔复判，直到
+    成功或超出 `wait_seconds`；`wait_seconds=0`（默认）行为与旧版一致（单次判定）。
+
+    判定本身见 `_evaluate_target_effect`（FHIR 资源计数 / DB 表行数 + 预期对比）。
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + max(0, int(wait_seconds))
+    warned = False
+    while True:
+        res = _evaluate_target_effect(target_types, expected, fhir_base, strict)
+        if res.get("ok") or _time.monotonic() >= deadline:
+            return res
+        if not warned:
+            logger.info("目标落地检查未通过（可能有在途消息），最多等待 %ds 后复判：%s",
+                        int(wait_seconds),
+                        [i.get("message") for i in (res.get("issues") or [])][:2])
+            warned = True
+        _time.sleep(3)
+
+
+def _evaluate_target_effect(target_types: list[str] | None = None,
+                            expected: dict[str, int] | None = None,
+                            fhir_base: str = "",
+                            strict: bool = True) -> dict:
     """目标侧落地效果事实检查（FHIR：资源计数；DB：目标表行数）。
 
     用于 C2 判断"事务是否真的落库"——避免"消息 Completed 但目标为空"（如 FHIR 200 + OperationOutcome 回滚）。
@@ -489,7 +591,10 @@ def check_target_effect(target_types: list[str] | None = None,
     _flowing = _pipeline_has_messages() > 0
     if "FHIR" in types:
         from backend.config import to_internal_url
-        base = to_internal_url(fhir_base or FHIRConfig.BASE_URL or "").rstrip("/") + "/"
+        # 兜底地址用 **目标** 仓库（FHIRSERVER）：本函数是"转换结果是否落地"的判定，
+        # 不能跟着 FHIRConfig.BASE_URL（演示默认 = 源仓库 DemoFHIR）走，否则会去数源仓库。
+        base = to_internal_url(
+            fhir_base or FHIRConfig.TARGET_BASE_URL or "").rstrip("/") + "/"
         auth = base64.b64encode(
             f"{FHIRConfig.USERNAME}:{FHIRConfig.PASSWORD}".encode()).decode()
         # 计数集合 = 平台核心资源 ∪ 调用方声明的预期资源（布局驱动，避免"只数四类"漏判）
@@ -550,7 +655,69 @@ def check_target_effect(target_types: list[str] | None = None,
     return {"ok": not errors, "issues": issues, "counts": counts}
 
 
-def check_query_dispatch(topology: dict | None = None) -> dict:
+def _layout_query_bos(bp_names: list[str] | None = None) -> list[str]:
+    """读取 sql2fhir 布局声明的查询 BO 名清单（去重）。
+
+    读取顺序（多管道隔离后）：
+    ① 拓扑里每个聚合 BP 的**实例级**布局 `^demo.Config("sql2fhir","layout",<BP名>)`；
+    ② 全局键 `^demo.Config("sql2fhir","layout")`（单管道口径 / 历史兼容）。
+    元素可能是 `{"bo_name": "..."}` 或直接是名字字符串；读不到返回 []（不静默猜测）。
+    """
+    raws: list[str] = []
+    for bp in (bp_names or []):
+        try:
+            r = iris_connector.global_get("^demo.Config", "sql2fhir", "layout", str(bp))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("读取 sql2fhir 实例布局(%s)失败: %s", bp, exc)
+            r = None
+        if r:
+            raws.append(r)
+    try:
+        g = iris_connector.global_get("^demo.Config", "sql2fhir", "layout")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("读取 sql2fhir 全局布局失败: %s", exc)
+        g = None
+    if g:
+        raws.append(g)
+    out: list[str] = []
+    for raw in raws:
+        try:
+            layout = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except ValueError:
+            continue
+        for bo in (layout or {}).get("query_bos") or []:
+            nm = bo.get("bo_name") if isinstance(bo, dict) else bo
+            if nm and str(nm) not in out:
+                out.append(str(nm))
+    return out
+
+
+
+def _layout_present(bp_names: list[str] | None = None) -> bool:
+    """是否存在**可读**的 sql2fhir 布局记录（实例级或全局键，即使 `query_bos` 为空）。
+
+    用途：区分两种"读不到查询 BO"的情形（二者都必须跳过检查，但理由不同、便于排障）：
+    ① 布局**不存在**（异常/历史数据）→ 无法区分查询 BO 与 DB/SOAP 目标操作组件；
+    ② 布局存在但声明 `query_bos=[]` —— **单表来源**（如只映射 Patient→Patient）按设计
+       就没有子表查询，绝不能退化成"把拓扑里唯一的 SQLOperation 当查询 BO"。
+    读不到 → False（fail-open）。
+    """
+    if not bp_names:
+        return False
+    for bp in bp_names:
+        try:
+            if iris_connector.global_get("^demo.Config", "sql2fhir", "layout", str(bp)):
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("读取 sql2fhir 实例布局(%s)失败: %s", bp, exc)
+    try:
+        return bool(iris_connector.global_get("^demo.Config", "sql2fhir", "layout"))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("读取 sql2fhir 全局布局失败: %s", exc)
+        return False
+
+
+def check_query_dispatch(topology: dict | None = None, wait_seconds: int = 0) -> dict:
     """事实检查：聚合 BP 收到业务消息后，是否**真的向查询 BO 派发过子表查询**。
 
     背景（实测静默缺陷）：BP 用 `If (tCnt=0)` / `While (i<tCnt)` 比较空值（ObjectScript
@@ -561,19 +728,58 @@ def check_query_dispatch(topology: dict | None = None) -> dict:
     返回: {"ok", "checked", "bp_messages", "missing": [...], "issues": [...]}
     - checked=False：拓扑里没有「查询 BO + 聚合 BP」组合（如 SQL→SOAP/DB 管道），跳过；
     - 聚合 BP 尚无业务消息：只报 info/warning（源适配器可能还没首次轮询），不判失败。
+    - wait_seconds>0：先**有界等待首个业务消息**再判定（生成链路传 20s；0=旧行为立即判定），
+      否则会漏掉「BP 已有消息却从未派发子表查询」的静默缺陷（实测 2026-09-18）。
     """
     comps = (topology or {}).get("components") or []
-    bos = [c.get("name") for c in comps if c.get("type") == "SQLOperation" and c.get("name")]
+    names = {str(c.get("name")) for c in comps if c.get("name")}
     bps = [c.get("name") for c in comps if c.get("type") == "PatientTxProcess" and c.get("name")]
-    if not bos or not bps:
+    sqlops = [c.get("name") for c in comps if c.get("type") == "SQLOperation" and c.get("name")]
+    if not bps or not sqlops:
         return {"ok": True, "checked": False, "issues": [], "missing": []}
+    # 查询 BO 集合 = **sql2fhir 布局声明的 query_bos ∩ 本次拓扑**（布局是唯一事实源）。
+    # ⚠ 不能把拓扑里的 SQLOperation 当查询 BO：多管道场景（sql2db + sql2fhir 同 Production）
+    #   里 `SQLOp_PatientSource` 是 **DB 目标**操作组件；该组被许可调度停用/无消息时，
+    #   旧口径会误报「BP 从未向查询 BO 派发」（并把 DB 目标名塞进 missing）→ 触发一次
+    #   无谓的 BP 方法修复。
+    # ⚠⚠ 2026-09-18 实测缺陷（本函数旧版）：**单表来源**的 sql2fhir 组（只映射 Patient，
+    #   布局 `query_bos=[]`）在拓扑里恰好只有 1 个 SQLOperation（= DB 目标）时，会落进
+    #   "单一 SQLOperation 且无布局（历史兼容）"分支 → 把 DB 目标当查询 BO → 误报 error →
+    #   回喂 bp_code 修复 → AI 据此**幻觉出 `QueryChild`/`Ens.Util.Log` 逻辑** → 编译失败
+    #   `#1054 Invalid expression`，白白烧掉修复轮次。故**删除该推断分支**：
+    #   布局读不到/未声明子表查询时一律跳过（fail-open），只报可读原因。
+    layout_bos = _layout_query_bos(bps)
+    bos = [b for b in layout_bos if b in names]
+    if not bos:
+        if layout_bos:
+            hint = (f"sql2fhir 布局声明的查询 BO {layout_bos} 均不在本次拓扑"
+                    "（可能是其它管道的陈旧布局）")
+        elif len(sqlops) > 1:
+            hint = "拓扑含多个 SQLOperation 且无 sql2fhir 布局声明 → 无法区分查询 BO 与 DB 目标操作组件"
+        elif _layout_present(bps):
+            hint = ("本组 sql2fhir 布局未声明子表查询（单表来源，如只映射 Patient）"
+                    "→ 按设计无子表查询派发")
+        else:
+            hint = ("无 sql2fhir 布局声明，无法确认唯一的 SQLOperation 是否为查询 BO"
+                    "（多管道下它通常是 DB/SOAP 目标操作组件，不能当查询 BO）")
+        return {"ok": True, "checked": False, "missing": [], "issues": [
+            {"severity": "warning", "item": "query_dispatch",
+             "message": hint + " → 跳过子表查询派发检查"}]}
     def _count(target: str) -> int:
         rows = iris_connector.query(
             "SELECT COUNT(*) FROM Ens.MessageHeader WHERE TargetConfigName = ? "
             "AND SourceConfigName NOT LIKE 'Ens.%'", [target])
         return int(rows[0][0]) if rows else 0
     try:
-        in_bp = sum(_count(bp) for bp in bps)
+        # 有界等待首个业务消息：生成后源适配器可能尚未首次轮询 → in_bp==0 直接跳过会**漏掉**
+        # "BP 从未派发子表查询"这类静默缺陷（实测 2026-09-18：层级记账 off-by-one → Bundle 只有
+        # Patient、消息全 Completed、零错误）。给一个明确的等待窗口（默认 0 = 旧行为）。
+        deadline = time.monotonic() + max(0, int(wait_seconds or 0))
+        while True:
+            in_bp = sum(_count(bp) for bp in bps)
+            if in_bp or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
         if in_bp == 0:
             return {"ok": True, "checked": False, "bp_messages": 0, "missing": [],
                     "issues": [{"severity": "warning", "item": "query_dispatch",
@@ -604,6 +810,14 @@ def classify_runtime_error(text: str) -> dict:
                "ILLEGAL VALUE", "Invalid command",
                # 实测缺口：对象方法不存在是**运行期**错误（编译期不报），原先未列入 → BP 修复不触发
                "METHOD DOES NOT EXIST", "ErrBPTerminated")
+    ref_kw = ("MalformedRelativeReference", "RelativeReference", "InvalidReference")
+    if any(k in t for k in ref_kw):
+        # 实测 2026-09-18：BP 从 layout **顶层** 读 refs（不存在该键）+ $IsObject 兜底成空数组
+        # → 引用注入被静默跳过 → Bundle 里 subject/encounter 仍是裸源键 → FHIR 拒收。
+        # 这是 **BP 代码**缺陷（不是映射缺陷）→ 必须回喂 BP 方法修复，而不是改映射。
+        return {"kind": "bp_code",
+                "advice": "引用注入未生效（BP 未按 layout.bundle.refs 写 urn:uuid: 引用，"
+                          "常见于读成顶层 layout.refs 并用空数组兜底）→ method_updates 修复 BP"}
     if any(k in t for k in schema_kw):
         return {"kind": "fhir_schema",
                 "advice": "修正字段映射/转换指令（C1 update_mapping）后重新生成"}
@@ -637,7 +851,8 @@ def run_pipeline_validation(topology: dict | None, source_type: str = "FHIR",
                             source_types: list[str] | None = None,
                             target_types: list[str] | None = None,
                             expect_targets: dict[str, int] | None = None,
-                            effect_target_types: list[str] | None = None) -> dict:
+                            effect_target_types: list[str] | None = None,
+                            effect_wait: int = 30) -> dict:
     """数据管道专项验证（供管道验证-修复 Agent C2 使用）。
 
     覆盖：拓扑完整性 + 编译 + 启动 + 消息流转 + **目标落地效果**（FHIR/DB 计数）
@@ -647,6 +862,8 @@ def run_pipeline_validation(topology: dict | None, source_type: str = "FHIR",
         调用方在有分组被许可调度停用时传「未被停用分组的类型」——那些分组组件已生成但未启动，
         目标必然无数据，若纳入判定会把"已生成但停用"误判为失败（实测缺陷：多管道第二条
         管道被调度停用 → 500，用户以为生成失败）。
+    effect_wait: 落地判定的**有界等待秒数**（默认 30；0=单次判定）。
+        生成后立即计数存在竞态（在途消息尚未落库）→ 实测假失败「FHIR Patient 落地数 0 < 预期 1」。
     多管道场景传 source_types/target_types（并集）。
     """
     # 生成/重启后消息仍在队列或处理中 → 有界等待（并重投挂起消息），避免误判为失败
@@ -663,7 +880,7 @@ def run_pipeline_validation(topology: dict | None, source_type: str = "FHIR",
                               f"（未完成 {_settle.get('pending')} 条）"},
         "smoke": check_smoke(),
         # 子表查询派发事实检查（聚合 BP 是否真的调过查询 BO）——防"消息全 Completed 但 Bundle 缺资源"
-        "query_dispatch": check_query_dispatch(topology),
+        "query_dispatch": check_query_dispatch(topology, wait_seconds=20),
     }
     # 目标侧落地效果（FHIR/DB 计数）—— 防"消息 Completed 但目标为空"
     _ttypes = (list(effect_target_types) if effect_target_types is not None
@@ -674,7 +891,8 @@ def run_pipeline_validation(topology: dict | None, source_type: str = "FHIR",
     if not _skip_effect and (expect_targets or _ttypes):
         eff = check_target_effect(_ttypes, expect_targets or {},
                                   _fhir_base_from_topology(topology),
-                                  strict=bool(_settle.get("settled")))
+                                  strict=bool(_settle.get("settled")),
+                                  wait_seconds=effect_wait)
         results["target_effect"] = {"ok": eff.get("ok"), "issues": eff.get("issues", []),
                                     "counts": eff.get("counts", {}),
                                     "message": f"目标计数: {eff.get('counts', {})}"}
@@ -915,21 +1133,20 @@ def set_items_enabled(names: list[str], enabled: bool,
     csv = ",".join(names)
     if not csv:
         return {"ok": False, "message": "未指定组件名", "items": []}
-    try:
-        res = iris_connector.class_method_value(
-            "demo.PipelineQuery", "SetItemsEnabled", production, csv,
-            1 if enabled else 0)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "message": str(exc), "items": names}
-    config_ok = str(res).endswith(":ok")
-    # ② 运行期即时生效（配置层已写；运行期失败不回滚配置，但必须显式报出）
+    want = 1 if enabled else 0
+    # ① **运行期优先**（2026-09-18 P3 修复：先运行期、再落配置）
+    #    原实现先写配置：`EnableConfigItem(name,0,1)` 随后看到配置已是目标态 → 返回
+    #    `<Ens>ErrGeneral … already disabled/already enabled in Production` → **空操作**
+    #    → 作业照跑（实测：停用后 180s 的 6 个主机 job 仍为 1，许可不释放；与 N1 同构、方向相反）。
+    #    先调运行期（此刻配置仍是原值 → 转换是真实转换，API 返回 "1"）→ 作业立即停/起；
+    #    IRIS 会同步更新该项配置，随后落配置只是持久化 + 幂等复核。
     applied: list[str] = []
     failed: list[dict] = []
     for n in names:
         try:
             st = iris_connector.class_method_value(
-                "Ens.Director", "EnableConfigItem", n, 1 if enabled else 0, 1)
-        except Exception as exc:  # noqa: BLE001 - 生产未运行时运行期切换不可用（配置已写好）
+                "Ens.Director", "EnableConfigItem", n, want, 1)
+        except Exception as exc:  # noqa: BLE001 - 生产未运行时运行期切换不可用（配置层仍会写）
             failed.append({"name": n, "error": str(exc)[:160]})
             continue
         txt = "".join(ch for ch in str(st) if 32 <= ord(ch) < 127)[:160]
@@ -940,6 +1157,15 @@ def set_items_enabled(names: list[str], enabled: bool,
             applied.append(n)
         else:
             failed.append({"name": n, "result": txt})
+    # ② 落配置（持久化；运行期改动可能已由 IRIS 同步 → 幂等）
+    res, config_ok = "", False
+    try:
+        res = iris_connector.class_method_value(
+            "demo.PipelineQuery", "SetItemsEnabled", production, csv, want)
+        config_ok = str(res).endswith(":ok")
+    except Exception as exc:  # noqa: BLE001 - 运行期已生效，配置写失败要显式报出（不吞）
+        logger.warning("落配置失败（运行期已生效）: %s", exc)
+        failed.append({"name": "(config)", "error": str(exc)[:160]})
     # ③ 复核**真正的运行态**：配置 Enabled=1 ≠ 主机已起。
     #    实测（2026-09-15）：组件生成时 Enabled="false"（许可调度停用），用户一键启用时平台先写
     #    配置 Enabled=1 再调 EnableConfigItem → 后者看到配置已启用，直接返回
@@ -947,6 +1173,7 @@ def set_items_enabled(names: list[str], enabled: bool,
     #    UI 显示已启用、IsItemEnabled=1、runtime_applied 非空，但 `^Ens.Runtime("ConfigItem",n,"Job")=0`、
     #    源 BS 完全不轮询（静默不生效）。故此处按 Job 事实复核，必要时做「停用→启用」对来真正拉起主机。
     restarted: list[str] = []
+    retried_down: list[str] = []
     still_down: list[str] = []
     still_up: list[str] = []
     for n in names:
@@ -954,24 +1181,37 @@ def set_items_enabled(names: list[str], enabled: bool,
         up = _item_running(n)
         if up == want_up:
             continue
-        if want_up:
-            # 配置已启用但主机未起 → 先运行期停用再启用（实测这一对能真正拉起主机）
-            try:
+        try:
+            if want_up:
+                # 配置已启用但主机未起 → 先运行期停用再启用（实测这一对能真正拉起主机）
                 iris_connector.class_method_value("Ens.Director", "EnableConfigItem", n, 0, 1)
                 iris_connector.class_method_value("Ens.Director", "EnableConfigItem", n, 1, 1)
                 restarted.append(n)
-            except Exception as exc:  # noqa: BLE001 - 重启失败进 still_down，由用户重启生产收敛
-                logger.warning("运行期拉起组件 %s 失败: %s", n, exc)
+            else:
+                # 2026-09-18 P3：停用方向的**镜像补救**（配置已停但主机仍在跑 → 先启用再停）
+                iris_connector.class_method_value("Ens.Director", "EnableConfigItem", n, 1, 1)
+                iris_connector.class_method_value("Ens.Director", "EnableConfigItem", n, 0, 1)
+                retried_down.append(n)
+        except Exception as exc:  # noqa: BLE001 - 补救失败进 still_*，由下面的生产重启收敛兜底
+            logger.warning("运行期%s组件 %s 失败: %s", "拉起" if want_up else "停止", n, exc)
         if _item_running(n) != want_up:
             (still_down if want_up else still_up).append(n)
     if restarted:
         logger.info("运行期「停用→启用」拉起主机: %s", restarted)
+    if retried_down:
+        logger.info("运行期「启用→停用」真正停止主机: %s", retried_down)
+    # ③b 兜底：仍有不一致 → **一次有界 Production 重启收敛**（全量下发配置；P3）
+    converged = False
+    if still_up or still_down:
+        converged = _converge_by_production_restart(production)
+        if converged:
+            still_down = [n for n in still_down if not _item_running(n)]
+            still_up = [n for n in still_up if _item_running(n)]
     if still_down or still_up:
-        logger.warning("运行期启停未完全生效（请重启 Production 收敛，或检查许可单元）: "
-                       "未起=%s 未停=%s", still_down, still_up)
+        logger.warning("运行期启停未完全生效（已尝试运行期补救%s）: 未起=%s 未停=%s",
+                       " + 生产重启收敛" if converged else "", still_down, still_up)
     # ④ 复核配置-运行一致性，返回差异（调用方/UI 可据此提示"需重启生产"）
     mismatch: list[str] = []
-    want = 1 if enabled else 0
     for n in names:
         try:
             if int(iris_connector.class_method_value(
@@ -984,8 +1224,40 @@ def set_items_enabled(names: list[str], enabled: bool,
     return {"ok": config_ok, "result": str(res), "units": license_units(),
             "enabled": bool(enabled), "items": names,
             "runtime_applied": applied, "runtime_failed": failed,
-            "runtime_restarted": restarted, "runtime_still_down": still_down,
-            "runtime_still_up": still_up, "runtime_mismatch": mismatch}
+            "runtime_restarted": restarted, "runtime_retried_stop": retried_down,
+            "runtime_still_down": still_down,
+            "runtime_still_up": still_up, "runtime_mismatch": mismatch,
+            "converged_by_restart": converged}
+
+
+def _converge_by_production_restart(production: str = PRODUCTION_NAME) -> bool:
+    """有界 Production 重启收敛（P3 兜底）：StopProduction → StartProduction，全量下发配置。
+
+    为什么需要：个别主机可能在运行期启停 API 之后仍与配置不一致（作业没停/没起）。
+    重启生产 = IRIS 按持久化配置重新下发一次，是**确定性收敛**手段（平台原来的提示就是
+    "请重启 Production 收敛"，此处把它自动化）。返回是否执行且收敛成功（running=1）。
+    非破坏性：只重启生产进程，不改配置、不删数据、不动其它组件。
+    """
+    import time as _t
+    try:
+        iris_connector.class_method_value("Ens.Director", "StopProduction")
+        for _ in range(20):                       # 最多等 ~20s 让生产真正停下
+            _t.sleep(1)
+            try:
+                running = iris_connector.class_method_value(
+                    "Ens.Director", "IsProductionRunning")
+                if not running or str(running) in ("0", "False", "false"):
+                    break
+            except Exception:  # noqa: BLE001 - 查询失败按"继续等"处理
+                pass
+        started = iris_connector.class_method_value(
+            "Ens.Director", "StartProduction", production)
+        ok = str(started).strip() in ("1", "True", "true")
+        logger.warning("为收敛运行期启停差异，已重启 Production（start=%s）", started)
+        return ok
+    except Exception as exc:  # noqa: BLE001 - 收敛失败不抛（调用方按 still_* 显式报告）
+        logger.warning("Production 重启收敛失败: %s", exc)
+        return False
 
 
 def save_validation_issue(pattern: str, resolution: str,
@@ -1039,15 +1311,20 @@ def check_connection(sources: list[dict] | None = None,
         health: dict = {"ok": False, "detail": "", "checked_at": datetime.datetime.now().isoformat()}
         try:
             if kind == "FHIR":
-                from backend.config import FHIRConfig
-                url = (conn.get("endpoint") or conn.get("base_url")
-                       or FHIRConfig.BASE_URL or "").strip()
-                _, _poll = connection_profiler._fhir_capabilities(
+                # ⚠ 回环归一：登记值常是浏览器视角的 http://localhost:52773/...，backend 在独立
+                #   容器里连不上 → 门禁会误报「Connection refused」。与 connection_profiler
+                #   的 profile_source/profile_target 同口径（对外保存的仍是登记值）。
+                from backend.config import FHIRConfig, to_internal_url
+                url = to_internal_url((conn.get("endpoint") or conn.get("base_url")
+                                       or FHIRConfig.SOURCE_BASE_URL or FHIRConfig.BASE_URL
+                                       or "").strip())
+                cap, _poll = connection_profiler._fhir_capabilities(
                     url, conn.get("username") or "", conn.get("password") or "")
-                health["ok"] = True
-                health["detail"] = "metadata 可达"
+                health["ok"] = bool(cap)
+                health["detail"] = "metadata 可达（fhir %s）" % (cap.get("fhir_version") or "?")
             elif kind == "SOAP":
-                url = (conn.get("endpoint") or conn.get("base_url") or "").strip()
+                from backend.config import to_internal_url
+                url = to_internal_url((conn.get("endpoint") or conn.get("base_url") or "").strip())
                 h = connection_profiler._http_reachable(url)
                 health.update(h)
             elif kind in ("SQL", "DB"):
@@ -1058,6 +1335,7 @@ def check_connection(sources: list[dict] | None = None,
                 health["detail"] = f"未支持类型 {kind}"
         except Exception as exc:  # noqa: BLE001
             health["detail"] = str(exc)[:200]
+            health["ok"] = False
         return health
 
     for rt in (sources or []) + (targets or []):

@@ -16,6 +16,7 @@
 import copy
 import json
 import logging
+import re
 
 from backend.services.llm_client import AgentError, _call_llm
 
@@ -138,6 +139,92 @@ def analyze_target_interfaces(target_type: str, tables: list[dict],
     }, ensure_ascii=False, indent=2)
     result = _call_llm(SYSTEM_PROMPT_TARGET, user_content, agent)
     return _ok_items(result)
+
+
+# ===== 系统提示词：无数据时按 FHIR R4 规范补字段 =====
+SYSTEM_PROMPT_FHIR_FIELDS = (
+    "你是 FHIR R4 规范专家。给定若干 FHIR 资源类型（这些类型在数据源里**暂时没有样例数据**），"
+    "按 **FHIR R4 规范**（必要时结合 US Core 约束）给出每个类型的**常用可映射元素路径**。要求："
+    "1. 只输出 R4 规范定义的元素，**不要发明扩展或自定义元素**；"
+    "2. 路径用 `.` 连接，多值元素用 `[0]`（例：identifier[0]、name[0].family、telecom[0].value、"
+    "code.coding[0].code、subject）；"
+    "3. 每个类型最多 30 个路径，优先**可映射业务元素**：标识/编号、名称、状态、编码（code/coding）、"
+    "日期时间、引用（subject/patient/encounter/performer）、数量/单位、性别、地址等；"
+    "4. 不要输出纯结构元素（text、contained、extension、meta、modifierExtension、id 除外）；"
+    "5. 只依据 R4 规范，不臆造；输出保持中文注释。"
+    "严格输出 JSON（不要输出其他文字），格式："
+    '{"items":[{"name":"Account","fields":["identifier[0]","status","type[0].coding[0].code",'
+    '"subject","servicePeriod.start"],"note":"账号：标识/状态/类型/主体引用/服务期"}]}'
+)
+
+# AI 规范字段补全的类型上限（单次调用；145 类全量会让请求过大且无必要）
+FHIR_AI_FIELDS_MAX_TYPES = 20
+# 单类型字段数上限（防 LLM 输出过长）
+FHIR_AI_FIELDS_MAX_PER_TYPE = 40
+# 合法路径形态：段用 . 连接，段可带 [n] 下标（与转换引擎/AI 映射的访问路径一致）
+_FIELD_PATH_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\[\d+\])?(\.[A-Za-z][A-Za-z0-9_]*(\[\d+\])?)*$")
+
+
+def _clean_field_paths(raw) -> list[str]:
+    """清洗 LLM 给出的字段路径：只保留合法形态、去空去重、保序、限量。
+
+    只做**首尾空白**清理（内部空格/怪异字符 = 非法形态，直接丢弃，不"修好"）。
+    """
+    out: list[str] = []
+    for f in (raw or []):
+        s = str(f).strip().lstrip(".")
+        if not s or not _FIELD_PATH_RE.match(s):
+            continue
+        if s.startswith(("meta", "text", "contained", "extension", "modifierExtension")):
+            continue
+        if s not in out:
+            out.append(s)
+        if len(out) >= FHIR_AI_FIELDS_MAX_PER_TYPE:
+            break
+    return out
+
+
+def complete_fhir_resource_fields(resource_types: list[str], facts: dict | None = None,
+                                  max_types: int = FHIR_AI_FIELDS_MAX_TYPES,
+                                  agent: str = "接口分析Agent(FHIR规范字段)") -> dict:
+    """**无样例数据**时按 FHIR R4 规范补该资源类型的可映射字段路径（一次 LLM 调用）。
+
+    为什么需要：FHIR 是标准，字段不该"靠库里有数据才知道"。已建模的 11 类由平台规范快照兜底
+    （`connection_profiler` 的 `spec_model`），其余类型由本 Agent 依 R4 规范给出，并在运行契约里
+    标注 `provenance=ai_spec`（可审计；绝不静默退回规则文案）。
+
+    参数:
+        resource_types: 待补的资源类型名（调用方负责限量，超出 max_types 的会被截断）
+        facts: 探测事实摘要（fhir_version / endpoint 等），仅作上下文
+    返回:
+        {类型: {"fields": [...], "note": "..."}}；输出不合规（缺 items / 全部无法解析）抛 AgentError
+    """
+    types = [str(t).strip() for t in (resource_types or []) if str(t).strip()]
+    if not types:
+        return {}
+    if max_types and max_types > 0:
+        types = types[:max_types]
+    user_content = json.dumps({
+        "requested_types": types,
+        "facts": _mask(facts or {}),
+    }, ensure_ascii=False, indent=2)
+    result = _call_llm(SYSTEM_PROMPT_FHIR_FIELDS, user_content, agent)
+    items = _ok_items(result)
+    if not items:
+        raise AgentError("FHIR 规范字段补全输出不合规（缺 items）")
+    _want = {t.lower() for t in types}          # 只接受**请求过**的类型（LLM 多给的忽略）
+    out: dict = {}
+    for it in items:
+        name = str(it.get("name") or "").strip()
+        if not name or name.lower() not in _want:
+            continue
+        fields = _clean_field_paths(it.get("fields"))
+        if not fields:
+            continue
+        out[name] = {"fields": fields, "note": str(it.get("note") or "")[:200]}
+    if not out:
+        raise AgentError("FHIR 规范字段补全输出不合规（各类型 fields 均无法解析为合法路径）")
+    return out
 
 
 # ===== 运行契约解读 =====

@@ -22,6 +22,11 @@ L = E.derive_sql2fhir_layout(M, META)
 L = E.enrich_layout_with_mappings(L, M)
 print("entries:", [(e["target_resource"], e["mapping_id"]) for e in L["bundle"]["entries"]])
 assert all(e["mapping_id"] for e in L["bundle"]["entries"]), "每个 entry 应注入 mapping_id"
+# 2026-09-18 修：query_bos[] **同样**必须有 mapping_id（子资源字段映射的取值来源），
+# 否则聚合 BP 会拿到空映射 → 子资源组装成空资源 → FHIR 必填元素缺失 → 事务整体回滚。
+print("query_bos:", [(b["target_resource"], b.get("mapping_id")) for b in L["query_bos"]])
+assert all(b.get("mapping_id") for b in L["query_bos"]), "每个查询 BO 应注入 mapping_id"
+assert L.get("unmapped_query_bos") == [], "不应有缺映射的查询 BO"
 
 comps = E.build_sql2fhir_components(
     L, {"dsn": "CLINIC"},

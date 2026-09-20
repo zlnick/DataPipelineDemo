@@ -49,12 +49,79 @@ def category_of(design_skill=None, source_type=None, target_type=None) -> str:
 
 def pipeline_id(source_id=None, target_id=None, design_skill=None,
                 source_type=None, target_type=None) -> str:
-    """确定性管道 ID：同一 (源, 目标) 恒等 → 同一 id（重复生成即更新）。"""
+    """确定性管道 ID：同一 (源, 目标) 恒等 → 同一 id（重复生成即更新）。
+
+    ⚠ 2026-09-19（P0a 身份稳定）：**只认业务键 (source_id, target_id)** —— 设计 Skill 由 LLM 选择，
+    不得影响身份（否则同一业务管道会因 LLM 换了 skill、或某次 source_id 缺失而登记成**两套实例**）。
+    缺业务键时返回**空串**（调用方必须显式处理：拒绝生成，而不是退化成 `PIPE_<skill>` 造出幽灵实例）。
+    """
     src, tgt = slug(source_id), slug(target_id)
     if src and tgt:
         return f"PIPE_{src}_{tgt}"
-    skill = slug(design_skill) or slug(f"{source_type}2{target_type}")
-    return f"PIPE_{skill or 'unknown'}"
+    return ""
+
+
+def pipeline_id_fallback_note(source_id=None, target_id=None) -> str:
+    """身份缺失时给调用方的可读说明（源/目标必须能解析出数据源与目标 id）。"""
+    miss = []
+    if not slug(source_id):
+        miss.append("源数据源（source_id）")
+    if not slug(target_id):
+        miss.append("目标（target_id）")
+    return "无法确定管道身份：缺少 %s —— 请在界面上明确选择源数据源与目标后重试" % "、".join(miss)
+
+
+def _component_fingerprint(c: dict) -> dict:
+    """组件**定义**指纹（刻意**不含 `enabled`**：enabled 属运行态，由 P2 增量保留，不参与"是否变更"）。"""
+    return {
+        "name": str(c.get("name") or ""),
+        "className": str(c.get("className") or ""),
+        "category": str(c.get("category") or ""),
+        "settings": sorted(
+            [str(s.get("target") or ""), str(s.get("name") or ""), str(s.get("value") or "")]
+            for s in (c.get("settings") or []) if isinstance(s, dict)),
+    }
+
+
+def component_signature(components: list[dict] | None,
+                        mapping_ids: list[str] | None = None,
+                        extra: dict | None = None) -> str:
+    """管道**定义签名**（确定性，供增量生成判断"这条管道是否已存在且未变更"）。
+
+    组成：组件定义指纹（按 name 排序）+ 映射 id（排序）+ `extra`（如 sql2fhir 的 BP 源码/布局哈希）。
+    ⚠ 必须含**内容**（mapping_ids / extra）——否则"改了映射却判 unchanged"会静默失效（红线不允许）。
+    ⚠ 不含 `enabled`（运行态另由 P2 保留），也不含 `design_skill`（LLM 可改选，不应算变更）。
+    """
+    import hashlib
+    import json as _json
+
+    items = [_component_fingerprint(c) for c in (components or []) if isinstance(c, dict)]
+    items.sort(key=lambda x: x["name"])
+    payload = {
+        "components": items,
+        "mappings": sorted(str(x) for x in (mapping_ids or [])),
+        "extra": {str(k): extra[k] for k in sorted((extra or {}).keys())},
+    }
+    blob = _json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def find_instance(source_id: str | None, target_id: str | None) -> dict | None:
+    """按**业务身份**（源数据源 + 目标）取管道实例（身份不含 LLM 选择的 skill）。"""
+    pid = pipeline_id(source_id, target_id)
+    return get_instance(pid) if pid else None
+
+
+def is_unchanged(source_id: str | None, target_id: str | None,
+                 signature: str) -> tuple[bool, dict | None]:
+    """该业务身份是否**已存在且定义未变更**（→ 增量生成时复用其存储组件，不重跑 Agent B）。
+
+    返回 (unchanged, existing_record)；签名不一致或不存在 → (False, rec-or-None)。
+    """
+    rec = find_instance(source_id, target_id)
+    if rec and signature and str(rec.get("signature") or "") == str(signature):
+        return True, rec
+    return False, rec
 
 
 def split_components(components: list[dict] | None) -> tuple[list[str], list[str]]:
@@ -112,7 +179,9 @@ def group_by_category(items: list[dict] | None = None,
         buckets.setdefault(str(rec.get("category") or "unknown"), []).append(rec)
     groups = []
     for cat, members in buckets.items():
-        own = [n for r in members for n in (r.get("component_names") or [])]
+        # 按名去重：同类别多组（如两个 SQL 源的 sql2db）时，各实例的组件名不同（`__sql2db` / `__sql2db_2`），
+        # 直接平铺会把重复名累计成双倍计数（2026-09-17 实测）。
+        own = sorted({n for r in members for n in (r.get("component_names") or [])})
         enabled = [n for n in own
                    if int((prod.get(n) or {}).get("enabled") or 0) == 1
                    and str((prod.get(n) or {}).get("category") or "") == cat]
@@ -180,28 +249,113 @@ def reconcile_states(production_items: list[dict] | None = None) -> list[dict]:
     return out
 
 
+def input_signature(source_id: str | None, target_id: str | None,
+                    mappings: list[dict] | None, source_type: str = "",
+                    target_type: str = "", extra: dict | None = None) -> str:
+    """**入参签名**（生成前即可算，不需要 LLM）：判断"这条管道是否已存在且输入未变"。
+
+    组成：业务身份 + 源/目标类型 + **映射内容**（id/源/目标/字段映射，排序）+ `extra`
+    （如源/目标运行契约的关键位、sql2fhir 布局推导输入）。
+    未变 → 增量生成**跳过 Agent B**，直接复用存储的 `ai_components`（省 LLM 调用与抖动）。
+    """
+    import hashlib
+    import json as _json
+
+    maps = []
+    for m in mappings or []:
+        if not isinstance(m, dict):
+            continue
+        fields = sorted(
+            [str(f.get("source") or ""), str(f.get("target") or ""), str(f.get("transform") or "")]
+            for f in (m.get("field_mappings") or []) if isinstance(f, dict))
+        maps.append({
+            "id": str(m.get("id") or ""),
+            "source": str(m.get("source") or ""),
+            "target_table": str(m.get("target_table") or ""),
+            "target_type": str(m.get("target_type") or ""),
+            "fields": fields,
+        })
+    maps.sort(key=lambda x: x["id"])
+    payload = {
+        "identity": [slug(source_id), slug(target_id), str(source_type or ""),
+                     str(target_type or "")],
+        "mappings": maps,
+        "extra": {str(k): extra[k] for k in sorted((extra or {}).keys())},
+    }
+    blob = _json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
 def upsert_from_generation(*, source_id: str | None = None, target_id: str | None = None,
                            source_type: str = "", target_type: str = "",
                            design_skill: str | None = None,
                            category_hint: str | None = None,
                            mapping_ids: list[str] | None = None,
                            components: list[dict] | None = None,
+                           ai_components: list[dict] | None = None,
+                           is_sql2fhir: bool = False,
+                           layout: dict | None = None,
+                           source_config: dict | None = None,
+                           target_config: dict | None = None,
+                           signature: str | None = None,
+                           applied_signature: str | None = None,
                            routes: dict | None = None, ai: dict | None = None,
                            validation: dict | None = None, name: str | None = None,
+                           reused: bool = False,
                            production_items: list[dict] | None = None) -> dict:
     """生成成功后登记/更新管道实例（同身份更新，不新增）。返回实例记录。
 
     参数:
-        source_id/target_id/design_skill: 身份三要素（相同即同一管道）；
-        components: 本次拓扑组件（用于拆分 own/shared 组件名）；
+        source_id/target_id: **业务身份**（相同即同一管道；缺任一 → 拒绝登记，见 P0a）；
+        design_skill: 设计 Skill（**属性**，非身份；变更写入 skill_history）；
+        components: 本次拓扑组件（用于拆分 own/shared 组件名 + **存完整定义**供增量复用）；
+        signature/applied_signature: 定义签名 / 本次实际应用到 Production 的合并签名（增量 diff 依据）；
         routes: 路由表键（如 {"source_bs": "SQLService_Patient"}）；
         ai: AI 驱动审计（driven/supplemented）；validation: 验证报告摘要。
     """
     now = datetime.now().isoformat()
-    pid = pipeline_id(source_id, target_id, design_skill, source_type, target_type)
+    pid = pipeline_id(source_id, target_id)
+    if not pid:
+        # P0a：身份缺失**不登记**（否则会退化成 PIPE_<skill> 幽灵实例 = "两套 SQL-SOAP"）
+        raise ValueError(pipeline_id_fallback_note(source_id, target_id))
     category = str(category_hint or "").strip() or category_of(
         design_skill, source_type, target_type)
     own, shared = split_components(components)
+    own_defs = [dict(c) for c in (components or [])
+                if isinstance(c, dict) and str(c.get("name") or "") in set(own)]
+    # ⚠ 只存**可渲染**的组件（必须有 className）：曾把 Agent 原始组件（无 className/settings）
+    #   误存进定义 → 下次复用会渲染出不合规拓扑（实测 2026-09-20）。缺参数时宁可少存
+    #   （判据会因此判"定义不完整" → 走正常生成重建 = 自愈），也不存污染物。
+    _no_cls = [str(c.get("name") or c.get("type") or "?") for c in own_defs
+               if not str(c.get("className") or "").strip()]
+    if _no_cls:
+        logger.warning("管道实例登记：丢弃 %d 个无 className 的组件（不可渲染，不写入定义）: %s",
+                       len(_no_cls), _no_cls)
+        own_defs = [c for c in own_defs if str(c.get("className") or "").strip()]
+    # —— 复用用的"冻结定义"：**渲染成功的参数（className/settings）+ 改名前名字** ——
+    # 为什么需要它（2026-09-20 实测）：复用组若直通 Agent 原始 `ai_components`（无 className/settings）
+    # 会因拓扑校验失败而 500；若走注册表参数化链路又会**丢掉 SOAP 目标 BO**。冻结定义两头都对：
+    #   · 参数完整（就是上一轮渲染成功的那份，能直接渲染）；
+    #   · 名字是**改名前**形态（`SQLService_Patient` / `SOAPOp_PatientService`）→ 渲染时按同一规则
+    #     确定性重命名（`__{类别}`），不会出现 `…__sql2soap__sql2soap` 这类二次后缀。
+    _ai_by_type: dict[str, list[str]] = {}
+    for _c in (ai_components or []):
+        if isinstance(_c, dict):
+            _ai_by_type.setdefault(str(_c.get("type") or ""), []).append(str(_c.get("name") or ""))
+    _used: dict[str, int] = {}
+    render_defs: list[dict] = []
+    for _c in own_defs:
+        _t = str(_c.get("type") or "")
+        _names = _ai_by_type.get(_t) or []
+        _i = _used.get(_t, 0)
+        _pre = _names[_i] if _i < len(_names) and _names[_i] else str(_c.get("name") or "")
+        _used[_t] = _i + 1
+        # 兜底：无配对时把 `__{类别}` 后缀剥掉，回到改名前形态
+        if not _pre:
+            _suf = "__" + slug(category)
+            _nm = str(_c.get("name") or "")
+            _pre = _nm[:-len(_suf)] if _suf and _nm.endswith(_suf) else _nm
+        render_defs.append({**_c, "name": _pre})
     rec = repository.get_json(GLOBAL, pid) or {}
     history = list(rec.get("skill_history") or [])
     if rec.get("design_skill") and design_skill and rec["design_skill"] != design_skill:
@@ -222,12 +376,28 @@ def upsert_from_generation(*, source_id: str | None = None, target_id: str | Non
         "category": category,
         "component_names": own,
         "shared_component_names": shared,
+        # P0（增量生成的地基）：**存完整组件定义**供未变更管道复用（不重跑 Agent B）+ 定义签名
+        "components": own_defs,
+        # 复用（未变更）时**真正拿来渲染**的定义：渲染成功的参数 + 改名前名字（见上方说明）
+        "render_components": render_defs,
+        # 复用注入用：本组**未改名**的原始组件（含 infra；名字经 build_multi_pipeline_topology
+        # 重新确定性命名 → 与首次生成结果一致）
+        "ai_components": [dict(c) for c in (ai_components or rec.get("ai_components") or [])
+                          if isinstance(c, dict)],
+        "is_sql2fhir": bool(is_sql2fhir or rec.get("is_sql2fhir")),
+        "layout": layout if layout is not None else rec.get("layout"),
+        # 源/目标配置（供"未提交的既有管道自动并入"时忠实重建：DB 列清单 / FHIR 端点 / SOAP 服务）
+        "source_config": source_config if source_config is not None else rec.get("source_config"),
+        "target_config": target_config if target_config is not None else rec.get("target_config"),
+        "signature": signature or rec.get("signature") or "",
+        "applied_signature": applied_signature or rec.get("applied_signature") or "",
         "routes": routes or rec.get("routes") or {},
         "status": "active",
         "ai": ai or rec.get("ai") or {},
         "created_at": rec.get("created_at") or now,
         "updated_at": now,
-        "generation_count": int(rec.get("generation_count") or 0) + 1,
+        # 复用（未变更）的管道**不虚增"生成次数"**：本次只是按存储定义并入，没重新生成
+        "generation_count": int(rec.get("generation_count") or 0) + (0 if reused else 1),
     })
     if validation is not None:
         rec["last_validation"] = {
@@ -325,8 +495,23 @@ def set_enabled(pid: str, enabled: bool) -> dict:
         prod_now = {str(i.get("name")): i for i in pipeline_validator.production_items()}
 
         def _billable(nm: str) -> bool:
-            """JavaGateway 等基础设施不计入业务主机预算（业务主机常驻各占 1 个单元）。"""
-            return "JavaGateway" not in str((prod_now.get(nm) or {}).get("className") or "")
+            """单条管道的容量账：**共享基础设施不计入**（判据 = Category=="shared"）。
+
+            打标方是生成端 `routes/pipelines._stamp_categories`：JavaGateway / FHIRSyncService /
+            TerminologyOperation 归 `shared`（跨管道共享、全局仅 1 实例、被当前活动的**任何**管道
+            共同依赖）。把它们算进某条管道的容量 → 「最大的一条管道永远启不动」：
+            2026-09-18 实测（新增共享术语 BO 后）CLINIC→FHIR 组（6 主机）被自身预算判为
+            「需 9 个单元 > 8」而拒绝启用，而 IRIS 实际同时运行 9 个主机 + 后端访问正常
+            （共享件本就真实占用许可，由 IRIS 兜底；这里只决定"哪条管道能起"）。
+            与生成期预算（`pipeline_validator.schedule_groups` 亦不计 infra）口径一致。
+            """
+            it = prod_now.get(nm) or {}
+            cls = str(it.get("className") or "")
+            cat = str(it.get("category") or "")
+            if cat == "shared":
+                return False
+            return not ("JavaGateway" in cls or "FHIRSyncService" in cls
+                        or "TerminologyOperation" in cls)
 
         enabled_now = {n for n, i in prod_now.items()
                        if int(i.get("enabled") or 0) == 1 and _billable(n)}
@@ -365,6 +550,12 @@ def set_enabled(pid: str, enabled: bool) -> dict:
                 return {"ok": False, "instance": rec, "projected": projected,
                         "units": units, "disabled_others": [], "rolled_back": True,
                         "message": msg}
+    # 透明化：共享基础设施仍**真实占用**许可（本函数不计入单管道容量账）→ 若「管道主机 +
+    # 共享主机 + 后端」超过许可单元，这里显式告警（不阻断：IRIS 侧才是最终裁决），避免"静默超订"。
+    shared_enabled = [n for n, i in {str(x.get("name")): x
+                                     for x in pipeline_validator.production_items()}.items()
+                      if int(i.get("enabled") or 0) == 1
+                      and not _billable(n)] if (enabled and units) else []
     res = pipeline_validator.set_items_enabled(names, enabled)
     if not res.get("ok"):
         return {"ok": False, "message": res.get("message") or res.get("result"), "result": res}
@@ -376,10 +567,16 @@ def set_enabled(pid: str, enabled: bool) -> dict:
             "instance": get_instance(pid), "suspended_others": suspended,
             "disabled_others": disabled_others,
             "units": res.get("units"), "enabled": bool(enabled),
+            # 许可透明化：共享基础设施不计入单管道容量账，但真实占单元 → 一并回报供 UI/诊断判断
+            "shared_hosts": shared_enabled,
+            "total_hosts": (len(names) + len(shared_enabled)) if enabled else 0,
             # 运行期双写复核（set_items_enabled）：不一致说明需重启生产才收敛
             "runtime_applied": res.get("runtime_applied") or [],
             "runtime_failed": res.get("runtime_failed") or [],
             "runtime_restarted": res.get("runtime_restarted") or [],
+            # P3：停用方向的运行期补救 + 兜底收敛（UI/诊断可据此判断"是否真的停了/是否重启过生产"）
+            "runtime_retried_stop": res.get("runtime_retried_stop") or [],
+            "converged_by_restart": bool(res.get("converged_by_restart")),
             "runtime_still_down": res.get("runtime_still_down") or [],
             "runtime_still_up": res.get("runtime_still_up") or [],
             "runtime_mismatch": res.get("runtime_mismatch") or []}
@@ -393,7 +590,12 @@ def active_categories() -> list[str]:
 
 
 def existing_pipelines_brief(limit: int = 20) -> list[dict]:
-    """已存在管道的事实清单（注入 Agent B 上下文；不替代 AI 决策）。"""
+    """已存在管道的事实清单（注入 Agent B 上下文；不替代 AI 决策）。
+
+    2026-09-19（P0a）补强：把**业务身份**（source_id/target_id）、既有 `design_skill`、
+    `mapping_ids`、`signature`、生成次数一并给出 —— 让 LLM 对同一 (源,目标) **复用同一 Skill/组件编排**，
+    避免"两次提交生成两套 SQL-SOAP"；但身份与归属**仍由平台决定**（LLM 只建议 skill）。
+    """
     brief: list[dict] = []
     for rec in list_instances()[:limit]:
         brief.append({
@@ -403,8 +605,24 @@ def existing_pipelines_brief(limit: int = 20) -> list[dict]:
             "source_id": rec.get("source_id"), "target_id": rec.get("target_id"),
             "design_skill": rec.get("design_skill"), "status": rec.get("status"),
             "components": rec.get("component_names") or [],
+            "mapping_ids": rec.get("mapping_ids") or [],
+            "signature": rec.get("signature") or "",
+            "generation_count": int(rec.get("generation_count") or 0),
+            "identity_note": ("同一 (source_id,target_id) 恒为同一条管道；重复生成只更新不新增"
+                              "（design_skill 变更记入 skill_history）"),
         })
     return brief
+
+
+def set_applied_signature(pid: str, signature: str) -> bool:
+    """记录"本次实际应用到 Production 的合并签名"（P3：全量未变更 → 跳过重渲染/重启的判断依据）。"""
+    rec = get_instance(pid)
+    if not rec:
+        return False
+    rec["applied_signature"] = str(signature or "")
+    rec["updated_at"] = datetime.now().isoformat()
+    repository.set_json(GLOBAL, pid, rec)
+    return True
 
 
 def _config_value(sub: str, key: str) -> str:
@@ -469,6 +687,7 @@ def sync_from_production(production_items: list[dict] | None = None) -> dict:
         return src_id, tgt_id
 
     created, updated, records = 0, 0, []
+    skipped: list[str] = []      # 身份反查不到的类别（只记日志/回报，不登记幽灵实例）
     for cat, names in by_cat.items():
         src_bs = next((n for n in names
                        if any(h in str((prod.get(n) or {}).get("className") or "")
@@ -491,6 +710,12 @@ def sync_from_production(production_items: list[dict] | None = None) -> dict:
         tgt_name = str((mp or {}).get("target_table") or route.get("table") or "")
         src_id, tgt_id = _resolve_ids(src_name, tgt_name, route)
         pid = pipeline_id(src_id, tgt_id, cat, src_type, tgt_type)
+        if not pid:
+            # P0a：身份不完整（反查不到源数据源/目标）→ 不登记幽灵实例，显式记录（迁移场景常见）
+            logger.warning("sync_from_production：类别 %s 反查不到业务身份（src=%s tgt=%s）→ 跳过登记",
+                           cat, src_id, tgt_id)
+            skipped.append(cat)
+            continue
         prev = repository.get_json(GLOBAL, pid) or {}
         own = [n for n in names if n not in shared_names]
         record = {
@@ -518,7 +743,9 @@ def sync_from_production(production_items: list[dict] | None = None) -> dict:
             created += 1
         records.append(record)
     reconcile_states(production_items=prod_items)
-    logger.info("管道实例回填：新增 %d，更新 %d（类别 %s）", created, updated, sorted(by_cat))
+    logger.info("管道实例回填：新增 %d，更新 %d（类别 %s）%s", created, updated, sorted(by_cat),
+                ("；跳过（身份反查不到）%s" % sorted(skipped)) if skipped else "")
     return {"created": created, "updated": updated, "instances": records,
+            "skipped": sorted(skipped),
             "categories": sorted(by_cat), "production_items": prod_items}
 

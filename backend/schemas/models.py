@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ConnectionRuntime(BaseModel):
@@ -110,12 +110,24 @@ class FieldMapping(BaseModel):
 
 
 class MappingItem(BaseModel):
-    """转换关系项。"""
+    """转换关系项。
+
+    ⚠ 2026-09-19（P0 修复）：本模型曾是**有损 DTO** —— 缺 `source_id`/`status` 等字段，
+    而单管道路径会用 `model_dump()` 的结果 **再存一次** `^demo.Mapping` → 已登记的
+    「数据源维度」被抹掉 → `repository.save_mappings` 判定身份不同 → 每次生成**派生重复映射**
+    （实测 `M714233` → `_2` → `_3`…；也是历史重复映射的成因）。现补字段 + `extra="allow"`
+    （任何附加字段都原样透传，杜绝同类静默丢字段）。
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     id: str = Field(..., description="转换关系 ID，如 M1")
     source: str = Field("", description="兼容旧版的单一源资产名称")
+    source_id: Optional[str] = Field(None, description="源数据源 id（身份维度，必须透传不丢）")
+    target_id: Optional[str] = Field(None, description="目标 id（身份维度，必须透传不丢）")
+    status: Optional[str] = Field(None, description="确认状态（confirmed/draft…）")
     target_table: str = Field("", description="兼容数据库目标的表名")
-    target_type: str = Field("DB", description="目标类型（DB/SOAP）")
+    target_type: str = Field("DB", description="目标类型（DB/SOAP/FHIR）")
     field_mappings: list[FieldMapping] = Field(default_factory=list)
     source_assets: list[str] = Field(default_factory=list)
     target_model_id: Optional[str] = None

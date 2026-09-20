@@ -183,6 +183,10 @@ def _layout(patient_table, patient_id_col, bos, bundle):
     return {"design_skill": "sql2fhir-patient-tx",
             "patient_table": patient_table, "patient_id_col": patient_id_col,
             "query_bos": bos, "bundle": {"resource_order": order, **bundle},
+            # FHIR 目标 Operation 的**实际主机名**（多管道并存时按实例改名，如
+            # HTTPOperation__sql2fhir_patient_tx）：聚合 BP 必须读它而不是全局键，
+            # 否则 Bundle 会被发给别的管道的 Operation（2026-09-17 实测缺陷 A6）。
+            "http_bo": "HTTPOperation",
             "derivation_rule": "参与表=mapping 涉及集合；BO 数=|参与子表数|；聚合按引用图+外键推导"}
 
 
@@ -194,6 +198,14 @@ def enrich_layout_with_mappings(layout: dict, mappings: list[dict]) -> dict:
 
     mappings 为 pipeline 原 mapping 条目（含 id/source/target_table）；仅注入目标=FHIR 且
     source 表匹配的 mapping（同表多 mapping 取第一个，并在 note 里说明）。
+
+    ⚠ 2026-09-18 修（实测缺陷）：`mapping_id` 必须**同时**注入 `query_bos[]`。AI 生成的聚合 BP
+    对每个子资源查询 BO 用 `tQB.%Get("mapping_id")` 取该资源的字段映射；布局只给
+    `bundle.entries` 注入时，`tQB.%Get("mapping_id")` 恒为空 → `TransformResource(row, "[]")`
+    → 转换行是空 `{}` → 子资源**只带 resourceType/id** → FHIR 服务器报
+    `MissingRequiredProperty（Encounter 缺 class/status）` → 整个 transaction **回滚**
+    （Patient 也不落地），而消息只是红、平台校验此前看不见。故本函数同时补齐并回报
+    `unmapped_query_bos`（调用方据此**显式失败**，不留静默）。
     """
     by_src: dict[str, str] = {}
     for m in mappings or []:
@@ -207,9 +219,18 @@ def enrich_layout_with_mappings(layout: dict, mappings: list[dict]) -> dict:
         e = dict(e)
         e["mapping_id"] = by_src.get(e.get("source_table"), "") or None
         entries.append(e)
+    bos, unmapped = [], []
+    for b in layout.get("query_bos", []) or []:
+        b = dict(b)
+        b["mapping_id"] = by_src.get(b.get("source_table"), "") or None
+        if not b["mapping_id"]:
+            unmapped.append(str(b.get("target_resource") or b.get("source_table") or "?"))
+        bos.append(b)
     out = dict(layout)
     out["bundle"] = dict(out.get("bundle", {}))
     out["bundle"]["entries"] = entries
+    out["query_bos"] = bos
+    out["unmapped_query_bos"] = unmapped
     return out
 
 
@@ -241,7 +262,12 @@ def build_sql2fhir_components(layout: dict, source_config: dict | None = None,
 
     cfg_src = source_config or {}
     cfg_tgt = target_config or {}
-    dsn = cfg_src.get("dsn") or "localTarget"
+    # SQL 源 DSN：数据源已注册的 dsn 优先，其次按 jdbc_url 的命名空间推导（演示默认 SQL 源 = USER），
+    # 最后才回落 localTarget —— 与 jdbc_dsn.register_for_datasource 同口径
+    from backend.services import jdbc_dsn as _jdbc_dsn_src
+    dsn = (cfg_src.get("dsn")
+           or _jdbc_dsn_src.namespace_of(cfg_src.get("jdbc_url") or "")
+           or "localTarget")
     bp_name = "SqlFhirPatientTxProcess"   # 由数据管道设计 Agent 生成源码的 BP 组件名（无预置资产）
     comps = []
     patient = layout["patient_table"]

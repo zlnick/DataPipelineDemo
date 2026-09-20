@@ -111,12 +111,48 @@ DESIGN_SKILLS = [
                         "$$$LOGERROR(\"QueryChild 失败 \"_tQBName_\": \"_$System.Status.GetErrorText(tSC)) Quit tSC }`；"
                         "禁止 `Set tBody=\"\"` 式吞错（空结果与失败必须可区分）；发 Bundle 前核对 layout.bundle.entries "
                         "声明的资源是否都已产出，缺失记 `$$$LOGWARNING`（不静默返回成功）。",
+            "子表查询的层级记账（实测缺陷 2026-09-18）": "query_bos[] 的 `depth` 即该资源所在层：**患者层 = level 0**"
+                        "（`tLevelCnt(0)=1` + `tLevelIds(0,0)=患者ID`），depth=1 的子表（Encounter）产出记 level 1，"
+                        "depth=2（Diagnosis/MedicationOrder）记 level 2；取父行集合用 `tLevelCnt(depth-1)` /"
+                        " `tLevelIds(depth-1,i)`（或维护 `depends_on` 源表名 → ID 集合）。"
+                        "实测反例：患者写成 `tLevelCnt(1)`（整体上移一层）→ Encounter 取 level 0 = 0 → 查询整体跳过；"
+                        "Diagnosis/MedicationOrder 取 level 1 = 患者 ID 当 EncounterID → 0 行 →"
+                        " **Bundle 只有 Patient 一条 entry，消息全 Completed、零错误**（静默失败，只有目标侧子资源为 0）。",
+            "子资源字段映射的取值来源（实测缺陷 2026-09-18）": "每个子资源的字段映射必须取 **`query_bos[i].mapping_id`**"
+                        "（平台已为 query_bos[] 与 bundle.entries[] 注入同一个映射 id），例如 "
+                        "`Set tFms=..GetMappingFms(tQB.%Get(\"mapping_id\"))`。"
+                        "若只从 bundle.entries 取（或把 id 写死/留空）→ 映射为空 `[]` → "
+                        "`TransformResource(row, \"[]\")` 返回 `{}` → 子资源**只带 resourceType/id** →"
+                        " FHIR 服务器报 `<HSFHIRErr>MissingRequiredProperty`（如 Encounter 缺 `class`/`status`）→"
+                        " **整个 transaction 回滚（连同 Bundle 的 Patient 也不落地）**，消息 Status=Error。"
+                        "平台侧已加完整性校验：布局里任一查询 BO 缺映射 id 时**生成即显式失败**，不再产出静默坏 BP。",
+            "引用注入的取值路径（实测缺陷 2026-09-18）": "布局结构 = `{ patient_table, patient_id_col, query_bos[], http_bo,"
+                        " bundle: { entries, refs, resource_order } }` —— **refs 在 bundle 里，顶层没有该键**。"
+                        "BP 必须 `Set tBundle=tLayout.%Get(\"bundle\")` 再 `tBundle.%Get(\"refs\")`；"
+                        "写成 `tLayout.%Get(\"refs\")` 并用 `$IsObject` 兜底成空数组 → 引用注入**静默跳过**"
+                        "（Bundle 里 subject/encounter/patient 仍是裸源键）→ FHIR 拒收 "
+                        "`<HSFHIRErr>MalformedRelativeReference`（The reference value 'X…' in property (subject) "
+                        "of Type 'Encounter' is malformed），消息 Status=Error 而 Patient 也可能一并没落地。"
+                        "`refs` 取不到时应 `Quit $$$ERROR(...)` 显式失败。",
+            "编译期硬约束（实测 2026-09-18 复发，生成端已静态准入）": "① 跨行 `Try { … }` 块内**禁止带参数的 `Quit`**"
+                        "（编译报 `#1043 QUIT argument not allowed`）——返回值只在方法体**顶层** `Quit 变量`，"
+                        "Try 里仅赋值/记日志；② 方法形参/返回值类型必须真实存在：`%Library.Object` **不存在**"
+                        "（`#5373 Class '%Library.Object' … does not exist`），用 `%Library.Persistent` / "
+                        "`%Library.DynamicObject` / `%Library.DynamicArray` / `%Stream.GlobalCharacter` / "
+                        "`%String` 等；③ 访问 `%DynamicObject` 带下划线键必须 `%Get(\"key\")`（点号会 #UNDEFINED）。",
             "响应对象类型（实测缺陷）": "OnRequest 的 `Output response As %Library.Persistent` **必须**赋持久消息类"
                         "（`Set response=##class(Ens.Response).%New()`）；若赋 `%DynamicObject`/%Stream/%DynamicArray，"
                         "框架收尾（Ens.BusinessProcess.%responseGet）会调 %OpenId 报 "
                         "`<METHOD DOES NOT EXIST>%OpenId,%Library.DynamicObject` → `ErrBPTerminated`："
                         "**入站消息被标 Error，而 Bundle 其实已成功投递、目标数据已落地**（极易被误判为管道失败，"
                         "实测 Condition/Encounter/MedicationRequest 都落地但消息 Status=8）。摘要用 `$$$LOGINFO`。",
+            "派发目标必须取「实例名」而不是按名拼装（实测缺陷 A6）": "多管道并存时平台会把**同名的目标 BO 按管道实例改名**"
+                        "（`SQLOp_PatientSource` → `SQLOp_PatientSource__sql2db`、`HTTPOperation` → "
+                        "`HTTPOperation__sql2fhir_patient_tx`）；此时按约定拼名（`SQLOp_{表}` / `SOAPOp_{服务}`）"
+                        "或读全局键（`^demo.Config(\"fhir\",\"operation\")`）都会指向**别的管道或不存在的主机** → "
+                        "`ErrBusinessDispatchNameNotRecognized`/`NotRegistered`、目标零落地，而源 BS→BP 那跳消息仍是"
+                        " Completed（静默失败）。聚合 BP 的正确读法：**查询 BO 用 layout.query_bos[].bo_name、"
+                        "FHIR Operation 用 layout.http_bo**（平台在写布局时已按实例名对齐），两者缺失才回落约定/全局键。",
             "注意": "SELECT 勿配 ResponseClass（多行只回第一行且丢行）；默认 JSON 响应保留全行；"
                     "DSN 需 JGService 指向 JavaGateway",
         },
@@ -261,6 +297,35 @@ DESIGN_SKILLS = [
         "engine": "现由 pipelines.py 既有 executor 提供（收编基线）；Skill 通道接入时保持回归",
         "status": "ready",
         "note": "行为基线=现有 FHIR→SOAP 路径（回归用）。",
+    },
+    {
+        "id": "fhir2fhir",
+        "name": "FHIR→FHIR 搬运设计 Skill",
+        "kind": "design-skill",
+        "role": "FHIR 源增量抓取 → FHIR 目标 REST 写入",
+        "purpose": "FHIR 源增量抓取/逐条入队后，经转换组装为 FHIR 资源（PUT /transaction）写入"
+                   "**另一个** FHIR 仓库（如演示默认 源 DemoFHIR → 目标 FHIRSERVER）。",
+        "applies_to": {"source": "FHIR", "target": "FHIR"},
+        "input": "FHIR 源 endpoint/auth + FHIR 目标 base_url/auth + 映射",
+        "output": "管道组件拓扑 + design_skill 决策记录",
+        "params": [
+            {"name": "fhir_source_config", "source": "FHIR endpoint/auth", "required": True, "note": ""},
+            {"name": "fhir_target_config", "source": "FHIR base_url/auth", "required": True, "note": ""},
+        ],
+        "topology_spec": [
+            {"role": "抓取服务", "type": "FHIRSyncService", "note": "增量同步（两仓库数据隔离，etl 到目标）"},
+            {"role": "逐条服务", "type": "FHIRService", "note": "队列表逐条"},
+            {"role": "转换 BP", "type": "TransformProcess", "note": "FHIRRequest→目标资源 JSON"},
+            {"role": "FHIR BO", "type": "HTTPOperation", "note": "REST PUT/transaction"},
+        ],
+        "rules": ["源/目标是两个独立 FHIR 仓库（数据隔离）", "写入为幂等 upsert（同 id 覆盖）"],
+        "assets": {"BS": "demo.FHIRSyncService/demo.FHIRService", "BP": "demo.TransformProcess",
+                   "FHIRBO": "EnsLib.HTTP.GenericOperation"},
+        "dependencies": ["transformation-agent", "C1", "pipeline-validate-agent"],
+        "trigger": "生成数据管道且源=FHIR、目标=FHIR（不同仓库）",
+        "engine": "由 Agent B 输出组件拓扑 + 注册表参数化（无专属 executor）",
+        "status": "ready",
+        "note": "实测 2026-09-20 由 Agent B 实际选用（源 DemoFHIR → 目标 FHIRSERVER），此条为收编登记。",
     },
 ]
 

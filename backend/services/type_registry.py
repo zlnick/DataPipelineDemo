@@ -57,6 +57,13 @@ COMMON_COMPONENTS = [
     {"type": "JavaGateway", "className": "EnsLib.JavaGateway.Service",
      "role": "gateway", "comment": "Java 网关（SQL Operation JDBC 连接）",
      "settings": {"%gatewayName": "%Java Server"}},
+    # 共享术语 BO：术语转换能力在 IRIS 上的唯一出口（任何管道的 BP 都可 SendRequestSync 调它）。
+    # role=infra → 不进 LLM 的 available_components 枚举（基础设施不由 Agent 选型），
+    # 但进 get_common_components()（拓扑校验放行 + 平台按需追加）。
+    {"type": "TerminologyOperation", "className": "demo.TerminologyOperation",
+     "role": "infra",
+     "comment": "术语转换共享 BO（调术语服务器 /terminology/mapping/lookup）",
+     "settings": {"TermServer": "iris-terminology", "TermPort": 52773, "Timeout": 5}},
 ]
 
 # ---------------- Skill 专属组件的生成契约（非预置资产） ----------------
@@ -72,13 +79,19 @@ PIPELINE_ASSET_COMPONENTS = [
 
 
 def get_available_components() -> list[dict]:
-    """全部组件枚举（type/role/desc，供 LLM 管道 Agent 选择）。"""
+    """全部组件枚举（type/role/desc，供 LLM 管道 Agent 选择）。
+
+    ⚠ 排除 `role=infra` 的基础设施组件（如 TerminologyOperation）：它们由**平台按需追加**
+    （判据 = 映射里是否有 term_map 决策），不是 Agent 的可选决策项。
+    """
     comps = []
     for srcs in SOURCE_COMPONENTS.values():
         comps.extend({"type": c["type"], "role": c["role"], "desc": c["comment"]} for c in srcs)
     for tgts in TARGET_COMPONENTS.values():
         comps.extend({"type": c["type"], "role": c["role"], "desc": c["comment"]} for c in tgts)
     for c in COMMON_COMPONENTS:
+        if c.get("role") == "infra":
+            continue
         comps.append({"type": c["type"], "role": c["role"], "desc": c["comment"]})
     return comps
 

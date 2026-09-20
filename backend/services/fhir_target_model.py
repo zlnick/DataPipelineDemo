@@ -38,12 +38,17 @@ US_CORE_RESOURCE_MODELS = {
             {"name": "class_code", "type": "code", "required": True,
              "note": "v3.ActCode: IMP(住院)/AMB(门诊)/EMER(急诊)…"},
             {"name": "type", "type": "codeableConcept", "required": False,
-             "note": "US Core MS，可空或 SNOMED 就诊类型"},
+             "note": "US Core MS，可空或 SNOMED 就诊类型；**中文/自由文本请用 type_text**"},
+            {"name": "type_text", "type": "string", "required": False,
+             "note": "就诊类型文本（type[0].text；源为中文明文时落这里，不要把明文塞进 coding.code）"},
             {"name": "subject", "type": "Reference(Patient)", "required": True},
             {"name": "period_start", "type": "dateTime", "required": True},
             {"name": "period_end", "type": "dateTime", "required": False},
             {"name": "reason_code", "type": "codeableConcept", "required": False,
-             "note": "可沿用国标 ICD-10 主诊断码（CodeSystem=urn:cn-nhsa:icd10-gbt2016）"},
+             "note": "可沿用国标 ICD-10 主诊断码（CodeSystem=urn:cn-nhsa:icd10-gbt2016）；"
+                     "中文/自由文本请用 reason_text"},
+            {"name": "reason_text", "type": "string", "required": False,
+             "note": "就诊原因文本（reasonCode[0].text；源为中文明文时落这里）"},
         ],
     },
     "Condition": {
@@ -85,7 +90,9 @@ US_CORE_RESOURCE_MODELS = {
              "note": "US Core MS；源无开嘱人时可给演示 Practitioner 引用或省略"},
             {"name": "dose", "type": "quantity", "required": False, "note": "dosage[].doseAndRate[].dose"},
             {"name": "route", "type": "codeableConcept", "required": False,
-             "note": "SNOMED route 或文本"},
+             "note": "SNOMED route 编码；**中文/自由文本（如“口服”）请用 route_text**"},
+            {"name": "route_text", "type": "string", "required": False,
+             "note": "给药途径文本（dosageInstruction[0].route.text；源为中文明文时落这里）"},
             {"name": "frequency", "type": "string", "required": False,
              "note": "dosage[].timing 简写"},
         ],
@@ -263,6 +270,8 @@ _COLUMN_PATHS: dict[str, dict[str, str]] = {
         "period_start": "period.start",
         "period_end": "period.end",
         "reason_code": "reasonCode[0]",
+        "reason_text": "reasonCode[0].text",
+        "type_text": "type[0].text",
     },
     "Condition": {
         "clinicalStatus": "clinicalStatus",
@@ -283,6 +292,7 @@ _COLUMN_PATHS: dict[str, dict[str, str]] = {
         "requester": "requester",
         "dose": "dosageInstruction[0].doseAndRate[0].doseQuantity",
         "route": "dosageInstruction[0].route",
+        "route_text": "dosageInstruction[0].route.text",
         "frequency": "dosageInstruction[0].text",
     },
 }
@@ -383,6 +393,36 @@ def column_constraints(resource_type: str) -> dict[str, dict]:
     if not ent:
         return {}
     return {c["name"]: c.get("constraints", {}) for c in ent.get("columns", [])}
+
+
+def source_field_paths(resource_type: str) -> list[str]:
+    """已建模资源在 R4/US Core 模型里的**可访问字段路径**（供 FHIR 源字段发现兜底）。
+
+    FHIR 是标准：**没有样例数据也能知道该资源有哪些元素**。平台把 US Core 已建模的 11 类资源
+    的元素路径（数组以 `[0]` 表示，与转换引擎/AI 映射的访问路径一致，如 `name[0].family`、
+    `identifier[0]`、`telecom[0].value`）作为**规范快照**提供，无数据时用它兜底。
+    未建模类型返回 `[]`（调用方转 AI 按 FHIR R4 规范推断，或保持为空）。
+    """
+    ent = next((e for e in build_entities([resource_type])
+                if e.get("columns") and not e.get("open")), None)
+    if not ent:
+        return []
+    out: list[str] = []
+    for c in ent.get("columns", []):
+        path = str(c.get("path") or c.get("name") or "").strip()
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
+def source_field_paths_all(resource_types: list[str] | None = None) -> dict[str, list[str]]:
+    """批量版：{资源类型: 字段路径列表}（仅返回已建模类型）。"""
+    out: dict[str, list[str]] = {}
+    for rt in (resource_types or DEFAULT_RESOURCE_TYPES):
+        paths = source_field_paths(rt)
+        if paths:
+            out[rt] = paths
+    return out
 
 
 def model_schema(resource_type: str) -> dict | None:
