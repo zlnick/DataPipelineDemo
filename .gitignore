@@ -45,3 +45,7 @@ data/rxnorm_vec_run.log
 # 同步方式见 tools/datakit/README.md 第七节；run.sh 与 README.md 仍入库）
 tools/datakit/host/
 tools/datakit/container/
+
+# 后台进程 / 重定向日志（不纳入版本库）
+nohup.out
+*.out
