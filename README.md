@@ -158,6 +158,37 @@ Production 拓扑并交给 IRIS 编译启动。
 
 前置条件：已安装 Docker 与 Docker Compose。
 
+> **新环境前置（克隆到其它机器时必看）**
+>
+> 1. **子模块依赖：术语服务器是独立项目**。`termsrv` 以 **git submodule** 引入
+>    （[`zlnick/iris-terminology-server`](https://github.com/zlnick/iris-terminology-server)，分支 `demo-community`），
+>    `iris-terminology` 容器**就是由它构建**的：
+>    - 克隆时带上子模块：`git clone --recurse-submodules https://github.com/zlnick/DataPipelineDemo.git`
+>    - 已克隆但忘了：`git submodule update --init --recursive`
+>      （缺子模块时 `iris-terminology` **构建失败**；平台主体仍能跑，但术语能力降级为
+>      "保留源编码 + `meta.tag=urn:cn-nhsa:term-map|unmapped`"，`term_map_build.py` 等工具不可用）
+>    - **构建方式**：compose 里该服务为 `build: context: ./termsrv`（`termsrv/iris/Dockerfile`）→
+>      `docker compose up -d` 会**自动构建**；也可单独构建/重建：
+>      `docker compose build iris-terminology && docker compose up -d iris-terminology`
+>    - **术语数据**放在**独立数据目录** `./data/iris-terminology`（与演示程序主体互不影响）：
+>      容器**重建后**重跑 `python3 tools/term_map_seed.py` 重新播种映射，
+>      或用 `bash tools/termsrv_load.sh` 把平台扩展类**热加载**进运行中的容器（不重建、不丢数据）；
+>      原始术语素材在 `data/terms-inbox/`（`nrdl.tsv` / `cbih.tsv` / `icd10_main.csv`）。
+> 2. **JDBC 驱动 jar：一条命令搞定，无需去官网下载**。backend 的"数据源连通测试 / 选 schema·表 / 分析列 /
+>    DB 元数据发现"走 **JayDeBeApi + JPype**，需要 `intersystems-jdbc-*.jar`（InterSystems 专有件，**不入版本库**）；
+>    但 **IRIS 官方镜像自带该驱动**，故提供一键提取脚本：
+>    ```bash
+>    docker compose up -d iris        # 先起 IRIS（驱动就在镜像里）
+>    bash tools/fetch_jdbc_jar.sh     # 提取到 ./jdbc/（免下载、版本与 IRIS 一致）
+>    docker compose up -d             # 再起其余服务
+>    ```
+>    （服务已全起来也可：提取后 `docker compose restart backend`；⚠ 该重启会重跑 `init_data.py` 重建目标表，
+>    **与环境已有演示数据时请勿随意执行**。需要**自定义驱动**时，把 jar 直接放进 `./jdbc/` 即可。）
+> 3. **`.env`**：`cp .env.example .env` 并填 `LLM_BASE_URL / LLM_API_KEY / LLM_MODEL`
+>    （不填则 AI 功能**显式报错**、不静默降级；平台仍可启动）。
+> 4. `data/embedding-model`（本地向量模型）**无需手工准备**：embedding 容器首次启动会
+>    **自动从 ModelScope 下载**（`Qwen/Qwen3-Embedding-0.6B`，需网络）。
+
 ```bash
 # 1. 配置 LLM（AI 推荐功能；不配则 AI 接口返回明确提示）
 cp .env.example .env

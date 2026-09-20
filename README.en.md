@@ -170,6 +170,40 @@ design the Production topology and hand it to IRIS to compile and start.
 
 Prerequisites: Docker + Docker Compose.
 
+> **New-environment prerequisites (read this when cloning onto another machine)**
+>
+> 1. **Submodule dependency — the terminology server is a separate project.** `termsrv` is pulled in as a
+>    **git submodule** ([`zlnick/iris-terminology-server`](https://github.com/zlnick/iris-terminology-server),
+>    branch `demo-community`), and the `iris-terminology` container **is built from it**:
+>    - Clone with submodules: `git clone --recurse-submodules https://github.com/zlnick/DataPipelineDemo.git`
+>    - Already cloned without it? `git submodule update --init --recursive`
+>      (without the submodule the `iris-terminology` build fails; the main platform still runs, but
+>      terminology degrades to "keep source coding + `meta.tag=urn:cn-nhsa:term-map|unmapped`",
+>      and tools such as `term_map_build.py` are unavailable)
+>    - **How it is built**: the compose service uses `build: context: ./termsrv` (`termsrv/iris/Dockerfile`),
+>      so `docker compose up -d` **builds it automatically**; to build/rebuild it alone:
+>      `docker compose build iris-terminology && docker compose up -d iris-terminology`
+>    - **Terminology data** lives in its **own data directory** `./data/iris-terminology` (independent from the
+>      demo platform): after a container rebuild, re-seed with `python3 tools/term_map_seed.py`, or hot-load the
+>      platform extension classes into the running container with `bash tools/termsrv_load.sh` (no rebuild, no data
+>      loss). Raw terminology material ships in `data/terms-inbox/` (`nrdl.tsv` / `cbih.tsv` / `icd10_main.csv`).
+> 2. **JDBC driver jar — one command, no download.** The backend's "test connection / pick schema & tables /
+>    analyze columns / DB metadata discovery" uses **JayDeBeApi + JPype** and needs `intersystems-jdbc-*.jar`
+>    (a proprietary InterSystems artifact, **not committed to this repo**). The **official IRIS image already
+>    ships it**, so a one-shot extraction script is provided:
+>    ```bash
+>    docker compose up -d iris        # start IRIS first (the driver is inside the image)
+>    bash tools/fetch_jdbc_jar.sh     # extract it into ./jdbc/ (no download; same version as IRIS)
+>    docker compose up -d             # then start the rest
+>    ```
+>    (If everything is already running: extract, then `docker compose restart backend`; ⚠ that restart re-runs
+>    `init_data.py` and rebuilds the target tables — **don't do it casually on an environment that already holds
+>    demo data**. To use a **custom driver**, simply drop the jar into `./jdbc/`.)
+> 3. **`.env`**: `cp .env.example .env` and fill `LLM_BASE_URL / LLM_API_KEY / LLM_MODEL`
+>    (without it AI features fail **explicitly** rather than silently degrading; the platform still starts).
+> 4. `data/embedding-model` (local embedding model) needs **no manual step**: the embedding container
+>    **downloads it automatically from ModelScope** on first start (`Qwen/Qwen3-Embedding-0.6B`, needs network).
+
 ```bash
 cp .env.example .env   # then fill LLM_BASE_URL / LLM_API_KEY / LLM_MODEL
 docker compose up -d   # first run builds images & initializes FHIR Server + target tables
