@@ -201,32 +201,16 @@ curl -s "http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/Patient?_summ
 4. **本目录的 `host/`、`container/` 是副本**，权威版本在仓库 `tools/`（少数在仓库根）；
    ⚠ 副本**不入库**（`.gitignore` 已忽略这两个目录），所以新克隆的仓库里只有 `run.sh` + 本 README，
    `./run.sh <脚本>` 会自动回退到 `tools/` 找同名脚本，功能不受影响；
-   原始脚本更新后按需同步副本：
+   原始脚本更新后**一键同步副本**（推荐）：
 
 ```bash
-cd <仓库根>
-cp tools/gen_test_patient.py tools/seed_clinic.py tools/check_fhir.py \
-   tools/check_new_patient.py tools/check_name_encoding.py tools/clean_old_fhir.py \
-   tools/del_probe_patient.py tools/regenerate_pipeline.py tools/gen_multi_pipeline.py \
-   tools/verify_license_budget.py tools/e2e_diag.py tools/datakit/host/
-cp tools/clinic_tables.py tools/clinic_seed_data.py tools/add_one_patient.py \
-   tools/rescan_sql_source.py tools/reset_ui_env.py tools/test_llm.py \
-   tools/list_prod_items.py tools/diag_msgs.py tools/diag_errors.py \
-   tools/diag_shared_components.py \
-   tools/check_pair_sink.py tools/dump_appdata.py tools/icd10_import.py \
-   tools/rxnorm_import.py tools/uscore_condition_import.py \
-   generate_mock_data.py tools/seed_fhir_demo.py tools/datakit/container/
-cp tools/test_db_key_fact.py tools/datakit/container/
-cp tools/test_bp_static_admission.py tools/datakit/container/
-cp tools/test_dead_config_prune.py tools/datakit/container/
-cp tools/test_terminology_bo.py tools/verify_terminology_bo_render.py tools/datakit/container/
-cp tools/test_items_enable_disable.py tools/datakit/container/
-cp tools/test_source_path_resolve.py tools/datakit/container/
-cp tools/test_target_columns_source.py tools/datakit/container/
-cp tools/test_source_normalize.py tools/datakit/container/
-cp tools/test_pipeline_component_isolation.py tools/datakit/container/
-cp tools/term_map_build.py tools/datakit/container/
+bash tools/datakit/sync.sh            # 同步所有"已有副本"（单向 tools/ → datakit/，绝不反向）
+bash tools/datakit/sync.sh --check    # 只报告差异（有差异退出码 1）；并报出孤儿副本
+bash tools/datakit/sync.sh --add <脚本名> --to host|container   # 给新脚本登记副本
 ```
+
+   ⚠ **副本过期会造成「测试假绿/假红」**（`run.sh` 优先执行副本）→ 改完 `tools/` 下的脚本后请跑一次 `sync.sh`。
+   （历史做法是一长串手工 `cp`，已由上述脚本取代；需要时可在 git 历史里查回。）
 
 5. 想跑本目录之外的脚本（诊断/实验类如 `tools/diag_*.py`、`tools/test_*.py`）也可以直接用 `run.sh`：
    `./run.sh diag_name.py` —— 裸名在 `host/`、`container/` 找不到时会在 `tools/` 里查找同名脚本，并按依赖自动选执行环境。

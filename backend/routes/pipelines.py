@@ -3,7 +3,6 @@
 import json
 import logging
 import random
-import re
 import time
 from datetime import datetime, timezone
 
@@ -11,10 +10,10 @@ from flask import Blueprint, request
 
 from backend.config import Config, FHIRConfig
 from backend.schemas.models import PipelineGenerateRequest
+# P0 清理（2026-09-21）：`transformation_validator` / `type_registry` / `validate_agent` / `wsdl_importer`
+# 已随 Step 4 迁到 services/pipeline_generate.py，routes 内不再使用 → 移除导入（其余保持原样）。
 from backend.services import (iris_connector, llm_client, pipeline_instances,
-                              pipeline_validator, repository,
-                              transformation_validator, type_registry,
-                              validate_agent, wsdl_importer)
+                              pipeline_validator, repository)
 # 「身份 / 签名 / 冻结定义」= **唯一实现**（backend/services/pipeline_identity.py，Step 1 重构）：
 # 单管道与多管道两条入口共用同一份 → 结构上不再出现"两处各算一次"导致的口径漂移
 # （S2 入库签名≠比较签名 / P0a 幽灵身份 等静默缺陷的根因）。
@@ -69,9 +68,8 @@ logger = logging.getLogger(__name__)
 
 pipelines_bp = Blueprint("pipelines", __name__, url_prefix="/api/pipelines")
 
-# 模板库组件枚举（从类型注册表动态生成，供 Agent B 数据管道设计使用）
-AVAILABLE_COMPONENTS = type_registry.get_available_components()
-
+# P0（2026-09-21）：本文件原先各自算一份组件枚举（与 services/pipeline_generate.AVAILABLE_COMPONENTS
+# 重复、可能漂移）；实测 routes 内已无使用者、外部亦无引用 → 删除，统一由服务层持有唯一一份。
 
 
 def _active_items_from_topology(topology: dict) -> list[str]:
@@ -102,32 +100,8 @@ def _stamp_categories(topology: dict, category: str) -> dict:
     return topology
 
 
-def _source_bs_names(topology: dict) -> list[str]:
-    """拓扑中的源业务主机名（SQLService / FHIRService / FHIRSyncService）。"""
-    names: list[str] = []
-    for c in (topology or {}).get("components") or []:
-        if str((c or {}).get("type") or "") in ("SQLService", "FHIRService"):
-            n = str((c or {}).get("name") or "").strip()
-            if n and n not in names:
-                names.append(n)
-    return names
-
-
-def _all_pipeline_source_bs_names() -> list[str]:
-    """全部已登记管道的源 BS 名（判码缓存刷新遇许可不足时可按需暂停腾单元）。"""
-    names: list[str] = []
-    try:
-        for rec in pipeline_instances.list_instances():
-            routes = rec.get("routes") or {}
-            cand = list(routes.get("source_bs_names") or [])
-            if routes.get("source_bs"):
-                cand.append(routes["source_bs"])
-            for n in cand:
-                if n and n not in names:
-                    names.append(n)
-    except Exception as exc:  # noqa: BLE001 - 诊断性读取失败不影响生成
-        logger.warning("读取已登记管道源 BS 列表失败: %s", exc)
-    return names
+# P0（2026-09-21）已删除两个**全仓 0 引用**的死函数：`_source_bs_names`、
+# `_all_pipeline_source_bs_names`（判码缓存刷新已改走共享 BO，不再需要按需暂停源 BS）。
 
 
 @pipelines_bp.post("/generate")

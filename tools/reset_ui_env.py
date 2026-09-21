@@ -633,6 +633,42 @@ def clear_clinic_tables() -> list:
 
 
 
+def _reset_repo_official(label: str, base: str) -> bool:
+    """用**官方内置 API** 清空一个 FHIR 仓库：`HS.FHIRServer.Installer.Reset("", pAppKey)`。
+
+    与逐条 DELETE 的区别（2026-09-21 实测，189 条）：官方 Reset **秒级**清空该 repository 的**全部资源**，
+    且**不动** endpoint / Web Application / schema 类（`/metadata` 仍 200、PUT/DELETE 仍可用）。
+
+    ⚠ 已知行为：调用会抛 `<THROW>`（两次一致）**但删除已生效** → 这里**不把异常当失败**，
+    真实结果由调用方以"逐类计数是否为 0"复核；只有官方路径整体不可用（连接失败 / 类缺失）才返回 False
+    交回退（逐条 DELETE）。
+
+    返回 True = 已走官方路径（含"抛异常但可能已生效"，需复核）；False = 官方不可用，请回退。
+    """
+    import iris                        # noqa: PLC0415 - 仅此处需要 Native SDK
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    try:
+        parts = urlsplit(base).path.strip("/").split("/")       # csp/healthshare/<ns>/fhir/r4
+        p_app_key = "/" + "/".join(parts)
+        ns = parts[2].upper() if len(parts) > 2 else "USER"      # FHIRSERVER / DEMOFHIR
+        conn = _dbapi(ns)
+        try:
+            native = iris.createIRIS(conn)
+            try:
+                native.classMethodValue("HS.FHIRServer.Installer", "Reset", "", p_app_key)
+                log.info("%s: 官方 Reset 返回成功（pAppKey=%s）", label, p_app_key)
+            except Exception as exc:  # noqa: BLE001 - 已知会抛 <THROW> 但删除已生效
+                log.info("%s: 官方 Reset 抛异常（已知行为，以计数复核为准）: %s",
+                         label, str(exc)[:110])
+        finally:
+            conn.close()
+        return True
+    except Exception as exc:  # noqa: BLE001 - 官方路径不可用 → 回退逐条 DELETE
+        log.warning("%s: 官方 Reset 不可用（回退逐条 DELETE）: %s", label, str(exc)[:140])
+        return False
+
+
 def purge_fhir_resources():
     """清空 FHIR **两个仓库**（源 DemoFHIR + 目标 FHIRSERVER）上的演示资源。
 
@@ -671,6 +707,20 @@ def purge_fhir_resources():
 
     for label, base in FHIR_REPOS:
         total = 0
+        # ① 优先**官方 Reset**（秒级、彻底、不动 endpoint / Web App / schema）——见 _reset_repo_official；
+        #    随后**逐类复核计数**（调用抛 <THROW> 不代表失败，以复核为准）；仍有残留才回退逐条 DELETE。
+        if _reset_repo_official(label, base):
+            remain_after = 0
+            for rt in FHIR_CLEAN_TYPES:
+                after = _search(base, rt)
+                remain = len((after or {}).get("entry", []) or [])
+                if remain:
+                    remain_after += remain
+                    log.info("%s: FHIR %s 官方 Reset 后仍有 %s 条", label, rt, remain)
+            if not remain_after:
+                log.info("%s: 官方 Reset 已清空该仓库（复核剩余 0）", label)
+                continue
+            log.warning("%s: 官方 Reset 未清空（剩余 %s）→ 回退逐条 DELETE", label, remain_after)
         for rt in FHIR_CLEAN_TYPES:
             bundle = _search(base, rt)
             if not bundle:

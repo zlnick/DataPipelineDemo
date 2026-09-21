@@ -18,23 +18,24 @@
 import json
 import logging
 import re
-import time
-from datetime import datetime, timezone
+from datetime import datetime
 
-from backend.config import Config, FHIRConfig
+# P0 清理（2026-09-21）：移除迁移后不再使用的导入 —— `time`、`timezone`、`FHIRConfig`、
+# `validate_agent`、`sql_source_meta`、`BO_PREFIX`（逐项实测：仅在 import 行出现 1 次）。
+from backend.config import Config
 from backend.services import (iris_connector, llm_client, pipeline_instances,
                               pipeline_validator, repository,
                               transformation_validator, type_registry,
-                              validate_agent, wsdl_importer)
+                              wsdl_importer)
 # 同层依赖：上下文归一（Step 2 迁出）与身份/签名（Step 1 迁出）—— 这里是它们的**唯一使用者入口**
 from backend.services.pipeline_context import (
     c1_assets, c1_target_models, configs_for_identity, datasource_for_mappings,
     fhir_http_host_port, get_table_columns, merge_fhir_target_config,
     registered_table_columns, resolve_sql_source_tables, scope_source_context,
-    source_tables_from_mappings, sql_source_meta, target_dsn, target_for_mappings,
+    source_tables_from_mappings, target_dsn, target_for_mappings,
 )
 from backend.services.pipeline_identity import (
-    BO_PREFIX, dedup_groups_by_identity, frozen_defs_from_instance, group_identity,
+    dedup_groups_by_identity, frozen_defs_from_instance, group_identity,
     inc_input_signature, running_items, stored_definition_complete,
 )
 
