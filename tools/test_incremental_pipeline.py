@@ -184,6 +184,9 @@ _pl = _src("backend/routes/pipelines.py") or ""
 _pi = _src("backend/services/pipeline_instances.py") or ""
 check("_dedup_groups_by_identity" in _pl and "PIPELINE_IDENTITY_MISSING" in _pl,
       "E1 多管道：身份校验 + 去重接线在位")
+check("def _inc_input_signature" not in _pl and "def _dedup_groups_by_identity" not in _pl
+      and "from backend.services.pipeline_identity import" in _pl,
+      "E1c 身份/签名**已无本地实现**（唯一实现模块 + 别名导入）")
 # 单/多管道签名口径必须一致（否则单管道重放永远判"变更"→ 重渲染把别的管道整份换掉）
 _single_sig = _pl.split("# ⚠ 签名口径必须与多管道路径")[-1]
 check("_inc_input_signature({" in _single_sig, "E1b 单管道路径复用 `_inc_input_signature`（两条路径签名口径一致）")
@@ -357,5 +360,21 @@ _t2 = {"components": [{"name": "A_bs", "category": "sql2soap", "enabled": True},
 PL._converge_component_enabled(_t2, {"suspended": []}, {"sql2soap"}, {"sql2soap"})
 check(all(c["enabled"] is False for c in _t2["components"]),
       "H6 未变更但实例此前 suspended（用户选择）→ 保持停用")
+print("\n==== I. 身份/签名「唯一实现」（Step 1 重构：消除『两处各算一次』）====")
+from backend.services import pipeline_identity as _PI2      # noqa: E402
+
+check(PL._inc_input_signature is _PI2.inc_input_signature,
+      "I1 routes 的 `_inc_input_signature` 就是 services 的实现（**同一对象**，非副本）")
+check(PL._group_identity is _PI2.group_identity
+      and PL._dedup_groups_by_identity is _PI2.dedup_groups_by_identity,
+      "I2 身份 / 去重 同为唯一实现")
+check(PL._stored_definition_complete is _PI2.stored_definition_complete
+      and PL._frozen_defs_from_instance is _PI2.frozen_defs_from_instance,
+      "I3 完整性守卫 / 冻结定义 同为唯一实现")
+check(PL._running_items is _PI2.running_items and PL._BO_PREFIX == _PI2.BO_PREFIX,
+      "I4 运行态快照 / 目标 BO 前缀 同为唯一实现")
+check(PL._inc_input_signature(_seq) == _PI2.inc_input_signature(_seq),
+      "I5 同一输入经两条引用路径得到**同一签名**（S2 类缺陷结构上不可能再发生）")
+
 print("\n==== 结果: %d PASS / %d FAIL ====" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

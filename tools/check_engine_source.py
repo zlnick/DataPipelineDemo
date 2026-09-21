@@ -178,8 +178,15 @@ check("def input_signature" in _inc[0] and "def component_signature" in _inc[0]
       "H1 服务层：input_signature / component_signature / is_unchanged")
 check('return ""' in _inc[0].split("def pipeline_id_fallback_note")[0].split("def pipeline_id")[1],
       "H2 pipeline_id 缺身份返回空串（不再退化成 PIPE_<skill> 幽灵实例）")
-check("def _dedup_groups_by_identity" in _inc[1] and "PIPELINE_IDENTITY_MISSING" in _inc[1],
-      "H3 多管道：同身份组去重 + 身份缺失拒绝")
+check("def dedup_groups_by_identity" in _read("backend/services/pipeline_identity.py")
+      and "dedup_groups_by_identity as _dedup_groups_by_identity" in _inc[1]
+      and "def _dedup_groups_by_identity" not in _inc[1]
+      and "PIPELINE_IDENTITY_MISSING" in _inc[1],
+      "H3 同身份组去重 = **唯一实现**（services/pipeline_identity.py）+ 身份缺失拒绝")
+check("def inc_input_signature" in _read("backend/services/pipeline_identity.py")
+      and "inc_input_signature as _inc_input_signature" in _inc[1]
+      and "def _inc_input_signature" not in _inc[1],
+      "H3b 入参签名 = **唯一实现**（单一实现消除 S2「两处各算一次」的结构成因）")
 check("跳过 Agent B" in _inc[1] and "render_skipped" in _inc[1],
       "H4 P1/P3：未变更复用组件、全未变更则免渲染重启")
 check("_converge_component_enabled" in _inc[1] and "停用(调度)" in _inc[1],
