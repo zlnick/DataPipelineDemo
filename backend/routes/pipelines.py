@@ -466,6 +466,228 @@ def generate():
 
 
 
+
+
+@pipelines_bp.post("/run")
+def run():
+    """触发一次转换（FHIRService 定时拉取中，本接口确认状态）。"""
+    result = iris_connector.class_method_value("demo.PipelineQuery", "TriggerFetch")
+    return success({"result": result})
+
+
+@pipelines_bp.get("/status")
+def status():
+    """管道运行状态。"""
+    running = iris_connector.class_method_value("demo.PipelineQuery", "ProductionStatus")
+    return success({"running": bool(running), "production": "demo.DataflowProduction"})
+
+
+@pipelines_bp.get("/items")
+def items():
+    """Production 组件清单 + 许可容量 + 按管道类别分组（供「组件启停」面板与许可预算可视化）。
+
+    背景：IRIS 社区版 `KeyLicenseUnits = 8`，每个 Ens 业务主机（BS/BP/BO）常驻占 1 个
+    许可单元。组件的 Category 即所属数据管道类别（sql2fhir-patient-tx / sql2soap / shared…），
+    categories 字段给出每个类别的组件数与已启用数，用于判断哪条管道正在占用许可。
+    """
+    rows = pipeline_validator.production_items()
+    buckets: dict[str, dict] = {}
+    for r in rows:
+        cat = str(r.get("category") or "")
+        if not cat:
+            continue
+        grp = buckets.setdefault(cat, {"category": cat, "items": [], "enabled_count": 0})
+        grp["items"].append(r.get("name"))
+        if int(r.get("enabled") or 0) == 1:
+            grp["enabled_count"] += 1
+    return success({
+        "items": rows,
+        "units": pipeline_validator.license_units(),
+        "enabled_count": len([r for r in rows if int(r.get("enabled") or 0) == 1]),
+        "categories": sorted(buckets.values(), key=lambda g: g["category"]),
+    })
+
+
+@pipelines_bp.post("/items/toggle")
+def toggle_items():
+    """启用/禁用 Production 组件（等价于手工切换管道占用许可）。
+
+    body: {"names": ["SQLService_Patient"], "enabled": true}
+      或 {"name": "SQLService_Patient", "enabled": false}
+    注意：启用组件会常驻占用 1 个许可单元；启用过多会导致后端无法连接 IRIS（接口 500）。
+    生成流程会在启动前自动做许可预算（让非本次管道组件让路）。
+    """
+    body = request.get_json(silent=True) or {}
+    names = body.get("names") or ([body["name"]] if body.get("name") else [])
+    if not names:
+        return error("请指定要启停的组件名（name 或 names）"), 400
+    enabled = bool(body.get("enabled"))
+    res = pipeline_validator.set_items_enabled(names, enabled)
+    if not res.get("ok"):
+        return error(f"组件启停失败: {res.get('message') or res.get('result')}"), 500
+    return success(res, "组件已启用" if enabled else "组件已禁用")
+
+
+@pipelines_bp.get("/instances")
+def pipeline_instances_list():
+    """数据管道清单（受管理持久实体）+ 按管道类别分组 + 许可占用。
+
+    管道实体 = 「源 + 目标 + 设计 Skill」的稳定对象：组件 Category 即管道类别。
+    status 按 Production 实际 Enabled 回写（active/suspended），不是生成时的历史快照。
+    """
+    prod_items = pipeline_validator.production_items()
+    recs = pipeline_instances.reconcile_states(production_items=prod_items)
+    return success({
+        "items": recs,
+        "groups": pipeline_instances.group_by_category(recs, prod_items),
+        "units": pipeline_validator.license_units(),
+        "enabled_count": len([r for r in prod_items if int(r.get("enabled") or 0) == 1]),
+        "active_count": len([r for r in recs if r.get("status") == "active"]),
+    })
+
+
+@pipelines_bp.get("/instances/<pid>")
+def pipeline_instance_detail(pid):
+    """单条数据管道详情（含组件清单、路由、AI 决策与最近验证结果）。"""
+    rec = pipeline_instances.get_instance(pid)
+    if not rec:
+        return error(f"管道实例不存在: {pid}"), 404
+    return success(rec)
+
+
+@pipelines_bp.delete("/instances/<pid>")
+def pipeline_instance_delete(pid):
+    """删除管道实体记录（仅删实体，不改动 Production 组件与其启停状态）。"""
+    if not pipeline_instances.get_instance(pid):
+        return error(f"管道实例不存在: {pid}"), 404
+    pipeline_instances.delete_instance(pid)
+    return success({"id": pid}, "管道实体已删除（Production 组件未改动）")
+
+
+@pipelines_bp.post("/instances/<pid>/enable")
+def pipeline_instance_enable(pid):
+    """启用一条数据管道（启用其业务主机组件，占用许可单元）。
+
+    注意许可上限：启用后若「已启用组件数 + 1（后端连接）」超过 license_units()，
+    后端连接会被 IRIS 拒绝（接口 500）——此时请先停掉另一条管道。
+    """
+    res = pipeline_instances.set_enabled(pid, True)
+    if not res.get("ok"):
+        return error(f"启用管道失败: {res.get('message')}"), 500
+    return success(res, "管道已启用")
+
+
+@pipelines_bp.post("/instances/<pid>/disable")
+def pipeline_instance_disable(pid):
+    """停用一条数据管道（停其业务主机组件，释放许可单元；无其它活动管道时连共享组件一起停）。"""
+    res = pipeline_instances.set_enabled(pid, False)
+    if not res.get("ok"):
+        return error(f"停用管道失败: {res.get('message')}"), 500
+    return success(res, "管道已停用（许可单元已释放）")
+
+
+@pipelines_bp.post("/instances/sync")
+def pipeline_instance_sync():
+    """从 Production（组件 Category）+ 路由表回填管道实体（历史环境迁移/修复）。
+
+    适用：升级前生成过的 Production 只有组件没有管道实体；或手工改过组件类别需要归位。
+    """
+    res = pipeline_instances.sync_from_production()
+    return success({"created": res.get("created"), "updated": res.get("updated"),
+                    "categories": res.get("categories"),
+                    "instances": res.get("instances")}, "管道实体已同步")
+
+
+@pipelines_bp.get("/logs")
+def logs():
+    """消息流转日志（Ens.MessageHeader 真实消息历史）。"""
+    count = request.args.get("count", 50, type=int)
+    data = iris_connector.class_method_value("demo.PipelineQuery", "GetLogs", count)
+    try:
+        items = json.loads(data or "[]")
+    except json.JSONDecodeError:
+        items = []
+    return success({"items": items})
+
+
+@pipelines_bp.post("/validation-issues")
+def save_validation_issue_route():
+    """沉淀一条验证-修复经验到 ^demo.ValidationIssue（外部工具/审计用）。
+
+    请求体: {"pattern": "...", "resolution": "...", "source": "..."}
+    """
+    body = request.get_json(silent=True) or {}
+    pattern = (body.get("pattern") or "").strip()
+    resolution = (body.get("resolution") or "").strip()
+    if not pattern or not resolution:
+        return error("缺少 pattern/resolution"), 400
+    result = pipeline_validator.save_validation_issue(
+        pattern, resolution, body.get("source") or "api")
+    if not result.get("ok"):
+        return error(result.get("message") or "沉淀失败"), 500
+    return success({"pattern": pattern[:60]}, "经验已沉淀")
+
+
+@pipelines_bp.post("/validation-issues/polish")
+def polish_validation_issues_route():
+    """LLM 研读润色 + 去重验证经验（^demo.ValidationIssue → 结构化知识）。
+
+    供宿主导出到 Obsidian 知识库使用；LLM 失败返回明确错误（不静默回退原文）。
+    """
+    body = request.get_json(silent=True) or {}
+    limit = min(max(int(body.get("limit") or 500), 1), 1000)
+    items = pipeline_validator.load_validation_issues(limit)
+    try:
+        polished = llm_client.polish_validation_issues(items)
+    except llm_client.AgentError as exc:
+        return error(f"知识润色 Agent（LLM）失败: {exc}"), 500
+    except Exception as exc:  # noqa: BLE001
+        logger.error("知识润色失败: %s", exc)
+        return error(f"知识润色失败: {exc}"), 500
+    return success({"items": polished, "count": len(polished),
+                    "raw_count": len(items)}, "知识润色完成")
+
+
+@pipelines_bp.get("/validation-issues")
+def list_validation_issues():
+    """验证-修复 Agent 积累的经验（^demo.ValidationIssue）。
+
+    供审计/导出知识库用（外部脚本可据此转为 IRIS-Dev-Vault 的 04-Pitfalls 笔记）。
+    """
+    limit = request.args.get("limit", 100, type=int)
+    limit = min(max(limit, 1), 500)
+    items = pipeline_validator.load_validation_issues(limit)
+    return success({"items": items, "count": len(items)})
+
+
+def _mock_patients(count: int) -> list[dict]:
+    """生成 count 条模拟 Patient（lastUpdated > 增量游标，触发增量同步）。"""
+    families = ["张", "李", "王", "刘", "陈", "杨", "赵", "黄", "周", "吴"]
+    givens = ["伟", "芳", "娜", "敏", "静", "磊", "军", "洋", "勇", "艳", "杰", "娟", "涛", "明", "超"]
+    cities = ["北京", "上海", "广州", "深圳", "成都", "杭州"]
+    now_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    patients = []
+    stamp = int(time.time() * 1000) % 100000
+    for i in range(count):
+        pid = f"M{stamp}{i}"
+        city = random.choice(cities)
+        patients.append({
+            "resourceType": "Patient",
+            "id": pid,
+            "meta": {"lastUpdated": now_ts},
+            "name": [{"family": random.choice(families), "given": [random.choice(givens)]}],
+            "gender": "male" if i % 2 == 0 else "female",
+            "birthDate": f"{random.randint(1970, 2000)}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}",
+            "telecom": [{"system": "phone", "value": f"13{random.randint(0, 9)}{random.randint(10000000, 99999999)}"}],
+            "address": [{"line": [f"{city}演示街道{random.randint(1, 99)}号"], "city": city}],
+        })
+    return patients
+
+
+@pipelines_bp.post("/generate-mock")
+
+
+
 def generate_mock():
     """演示：按需生成模拟 Patient 数据写入 FHIR（lastUpdated > 增量游标）。"""
     count = request.args.get("count", 3, type=int)

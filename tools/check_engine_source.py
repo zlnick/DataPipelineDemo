@@ -174,6 +174,13 @@ check(bool(_need) and not _missing_api,
       "G1 PARENT_API 中属于父类的 %d 项都在 %s 里有定义（缺: %s）" % (len(_need), CLS.name, _missing_api))
 
 print("\n==== H. 增量生成（P0–P4）接线事实（宿主可见）====")
+_pu = _read("backend/routes/pipelines.py")
+_route_count = len(re.findall(r"@pipelines_bp\.(?:get|post|delete|put)\(", _pu or ""))
+check(_route_count >= 19,
+      "J1 /api/pipelines 路由完整性（%d 条 ≥ 19）：Step 3 曾用行区间替换函数体，"
+      "把 generate() 之后、generate_mock() 之前的 12 条路由一起删掉 → 重启后 404" % _route_count)
+check("def generate_mock" in (_pu or "") and "def _mock_patients" in (_pu or ""),
+      "J2 generate_mock / _mock_patients 未被误删")
 _inc = [_read(r) for r in ("backend/services/pipeline_instances.py",)]
 _inc.append((_read("backend/routes/pipelines.py") or "")
             + (_read("backend/services/pipeline_generate.py") or ""))
