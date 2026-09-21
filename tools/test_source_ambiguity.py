@@ -156,8 +156,9 @@ mp_src, ai_src, pl_src = (_src("backend/routes/mappings.py"), _src("backend/rout
                           _src("backend/routes/pipelines.py"))
 check('"source_ambiguous"' in mp_src, "E1 /api/mappings 响应透出 source_ambiguous")
 check('"source_ambiguous"' in ai_src, "E2 /api/recommend 响应透出 source_ambiguous")
-check(pl_src.count("_missing_patient_root_hint") >= 3,
-      "E3 单/多管道两条错误路径都接上提示（出现 %d 次）" % pl_src.count("_missing_patient_root_hint"))
+check(pl_src.count("_missing_patient_root_hint") == 2,
+      "E3 缺主表提示的**唯一调用点**（多管道路径；Step 3 合并后单管道走同一处）出现 %d 次"
+      % pl_src.count("_missing_patient_root_hint"))
 check("放弃猜测" in mp_src and "放弃猜测" in ai_src, "E4 日志明说『放弃猜测』（可观测）")
 
 print("\n==== 结果: %d PASS / %d FAIL ====" % (PASS, FAIL))

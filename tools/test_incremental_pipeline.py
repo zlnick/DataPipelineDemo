@@ -188,8 +188,10 @@ check("def _inc_input_signature" not in _pl and "def _dedup_groups_by_identity" 
       and "from backend.services.pipeline_identity import" in _pl,
       "E1c 身份/签名**已无本地实现**（唯一实现模块 + 别名导入）")
 # 单/多管道签名口径必须一致（否则单管道重放永远判"变更"→ 重渲染把别的管道整份换掉）
-_single_sig = _pl.split("# ⚠ 签名口径必须与多管道路径")[-1]
-check("_inc_input_signature({" in _single_sig, "E1b 单管道路径复用 `_inc_input_signature`（两条路径签名口径一致）")
+# → Step 3 起：单管道**统一走**多管道入口，签名/校验/调度只有一份实现（结构上不可能漂移）
+_gen_src = _pl.split("def generate():")[-1].split("def generate_mock")[0]
+check("_generate_multi_pipelines([{" in _gen_src and "def _inc_input_signature" not in _pl,
+      "E1b 单管道走统一入口（Step 3：单管道 = 多管道的特例，签名口径只有一份实现）")
 check("跳过 Agent B" in _pl, "E2 P1：未变更组复用组件并跳过 Agent B（日志可审计）")
 check("render_skipped" in _pl, "E3 P3：全部未变且组件在位 → 跳过重渲染/重启")
 check("_converge_component_enabled" in _pl and "停用(调度)" in _pl,
@@ -201,8 +203,8 @@ check("_auto_join_existing_pipelines(" in _pl and "P1b" in _pl,
       "E5c P1b：未提交的既有管道自动并入（只提交变更组也不会清掉别的管道）")
 check("reused=bool(_g.get(\"_unchanged\"))" in _pl, "E5d 复用组不虚增生成次数")
 check("所有数据管道均已存在且未变更" in _pl, "E5e 未变更时给出明确消息（不营造『已生成』假象）")
-check("单管道请求：检测到其它" in _pl and "_generate_multi_pipelines([{" in _pl,
-      "E5f 单管道请求在**存在其它有效管道**时转多管道路径（不整份替换 → 别家管道不消失）")
+check("单管道请求：检测到其它" not in _pl and "_generate_multi_pipelines([{" in _gen_src,
+      "E5f 单管道一律走多管道路径（不再需要探测别的管道 → 结构上不可能整份替换）")
 check("ai_components" in _pl and "component_signature" in _pl,
       "E6 登记时写入组件定义与定义签名")
 check("input_signature" in _pi and "component_signature" in _pi and "is_unchanged" in _pi,
@@ -243,9 +245,9 @@ check(_patched.get("source_id") == "DS1",
       "F3 映射修正写回**保留** `source_id`（合并写，不整条覆盖）")
 check(len(_patched.get("field_mappings") or []) == 2, "F4 修正内容确实生效（字段数 2）")
 _pl_text = _src("backend/routes/pipelines.py") or ""
-check(_pl_text.count("_write_mapping_patch(_m)") >= 5
+check(_pl_text.count("_write_mapping_patch(_m)") >= 3
       and 'set_json("^demo.Mapping", _m["id"]' not in _pl_text,
-      "F5 所有映射写回点都走合并写（不再有整条覆盖）")
+      "F5 所有映射写回点都走合并写（Step 3 后仅剩多管道 3 处，无整条覆盖）")
 check("extra=\"allow\"" in (_src("backend/schemas/models.py") or ""),
       "F6 `MappingItem` 已加 extra=allow（有损 DTO 修复在位）")
 

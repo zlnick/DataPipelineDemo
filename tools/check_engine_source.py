@@ -150,8 +150,8 @@ check("_field_terms_index" in _tv, "F6 C1 用资产 field_terms 事实（缺失�
 _pl = _read("backend/routes/pipelines.py")
 check("fhir_schema_facts" in _pl and "_fsf.apply_facts" in _pl,
       "F7 生成期注入组装事实（fhir_schema_facts.apply_facts）")
-check("mappings=mappings_effective, source_id=source_id" in _pl,
-      "F8 单管路生成传 mappings+source_id（事实来源）")
+check("mappings=[m for _g in groups" in _pl and 'source_id=next((_g.get("source_id")' in _pl,
+      "F8 生成期 FHIR 事实注入传 mappings+source_id（唯一调用点 = 多管道路径）")
 _ftm = _read("backend/services/fhir_target_model.py")
 check(all(c in _ftm for c in ("type_text", "reason_text", "route_text")),
       "F9 目标模型提供 *_text 落点（明文不再塞 coding.code）")
@@ -203,10 +203,11 @@ check('_g["_sig_in"] = _sig_in' in _pl_src and "必须**在此刻**固定签名"
       "H9 多管道在 pop 运行契约前固定签名（否则入库签名 ≠ 比较签名 → 永远判『变更』）")
 check("_auto_join_existing_pipelines(" in _pl_src and "P1b" in _pl_src,
       "H10 P1b：未提交的既有管道按存储定义自动并入（只提交变更组也不会清掉别的管道）")
-check("_inc_input_signature({" in _pl_src.split("# ⚠ 签名口径必须与多管道路径")[-1],
-      "H11 单管道与多管道签名口径一致（都走 `_inc_input_signature`）")
+check("_generate_multi_pipelines([{" in _pl_src.split("def generate():")[-1]
+      and "def _inc_input_signature" not in _pl_src,
+      "H11 单管道与多管道走同一条链路（Step 3 合并：签名/校验只有一份实现）")
 check("extra=\"allow\"" in _read("backend/schemas/models.py")
-      and _pl_src.count("_write_mapping_patch(_m)") >= 5,
+      and _pl_src.count("_write_mapping_patch(_m)") >= 3,
       "H12 有损 DTO 修复 + 映射修正合并写回（不丢 source_id、不派生重复映射）")
 
 print("\n==== 结果: %d PASS / %d FAIL ====" % (PASS, FAIL))

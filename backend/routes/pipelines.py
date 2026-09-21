@@ -1638,6 +1638,9 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
     _strict = bool((request.get_json(silent=True) or {}).get("strict_terms"))
     # 增量生成逃生开关：force=true 时**不**复用存量（强制全量重生成，用于手工改动组件后复位）
     _force_regen = bool((request.get_json(silent=True) or {}).get("force"))
+    # 规则兜底开关（与单管道同口径，差异 #2 合并）：**默认不静默回退** —— 仅当调用方显式
+    # `allow_rule_fallback=true` 时才允许注册表规则兜底，且结果在响应 `ai.rule_fallback` 标注。
+    _allow_rule_fallback = bool((request.get_json(silent=True) or {}).get("allow_rule_fallback"))
     _tgate = _term_precheck([m for g in pipelines for m in (g.get("mappings") or [])],
                             strict=_strict)
     _term_todo = list(_tgate.get("todo") or [])
@@ -1674,6 +1677,20 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                     logger.info("管道组 source_id=%s 无效，按映射源表反查到数据源 %s",
                                 g.get("source_id"), ds.get("id"))
             dcfg = (ds.get("config") or {}) if ds else {}
+            # FHIR 源配置兜底（与单管道同口径）：组未带 endpoint 且取不到数据源时，从**任一
+            # FHIR 数据源**的运行契约取（历史上前端可能取不到字段 → FHIRSyncService 抓不到）。
+            if not src_cfg.get("endpoint") and not ds:
+                for _ds0 in repository.list_datasources():
+                    if (_ds0.get("type") or "") != "FHIR":
+                        continue
+                    _rc0 = ((_ds0.get("runtime") or {}).get("connection")
+                            or repository.datasource_runtime(_ds0)["connection"])
+                    if _rc0.get("endpoint"):
+                        src_cfg["endpoint"] = _rc0.get("endpoint")
+                        src_cfg.setdefault("username", _rc0.get("username") or "superuser")
+                        src_cfg.setdefault("password", _rc0.get("password") or "SYS")
+                        logger.info("FHIR 源配置兜底：采用数据源 %s 的 endpoint", _ds0.get("id"))
+                        break
             # 运行参数统一取归一化契约 connection（repository.datasource_runtime）；
             # 无数据源时留空字典，避免未绑定变量（曾致多管道生成直接 500）
             rconn = (((ds.get("runtime") or {}).get("connection")
@@ -1951,10 +1968,18 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                     logger.info("多管道 Agent B 设计 %s→%s 完成（%d 组件）：%s",
                                 _g["source_type"], _g["target_type"], len(_comps),
                                 [c.get("type") for c in _comps])
-            except Exception as _be:  # noqa: BLE001 - Agent B 失败即报错，不静默回退规则
-                raise ValueError(
-                    f"Agent B 数据管道 AI 生成失败（组 {_g['source_type']}→{_g['target_type']}）：{_be}"
-                ) from _be
+            except Exception as _be:  # noqa: BLE001
+                # 红线：LLM 失败**不静默回退规则**。仅当调用方显式 allow_rule_fallback=true 才允许
+                # 规则兜底（无 LLM key 的演示环境），且必须可审计（响应 ai.rule_fallback）。
+                if not _allow_rule_fallback:
+                    raise ValueError(
+                        f"Agent B 数据管道 AI 生成失败（组 {_g['source_type']}→{_g['target_type']}）：{_be}"
+                        "（如需以类型注册表规则兜底，请显式传 allow_rule_fallback=true）"
+                    ) from _be
+                logger.warning("Agent B 调用失败，已显式允许规则兜底（组 %s→%s）: %s",
+                               _g["source_type"], _g["target_type"], _be)
+                _g["ai_components"] = None        # None → 拓扑构建走注册表规则路径
+                _g["_rule_fallback"] = True
 
         # 管道类别（= 设计 Skill，来自 Agent B 决策）：渲染为 Ens 业务主机 Category，
         # 供管道分组 / 按管道启停 / LLM 上下文；同源同目标的两组同名源 BS 按此改名（消除名字漂移）
@@ -2016,7 +2041,9 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                         "ai": {"driven": True, "groups": [
                             {"category": _g.get("_category"), "source_type": _g["source_type"],
                              "target_type": _g["target_type"], "design_skill": _g.get("design_skill"),
-                             "unchanged": True} for _g in groups]}}
+                             "unchanged": True,
+                             "rule_fallback": bool(_g.get("_rule_fallback"))}
+                            for _g in groups]}}
 
         topology = build_multi_pipeline_topology(groups)
         # sql2fhir 布局**按聚合 BP 实例**写入（一管道一实例；全局键作历史兼容兜底）：
@@ -2326,11 +2353,14 @@ def _generate_multi_pipelines(pipelines: list[dict]) -> dict:
                 "dup_merged": _dup_merged,
                 # AI 驱动信息：每组管道均由 Agent B（LLM）设计拓扑
                 "ai": {
-                    "driven": True,
+                    # 红线审计：任一组走了规则兜底 → driven=False 且按组标注 rule_fallback
+                    "driven": not any(_g.get("_rule_fallback") for _g in groups),
+                    "rule_fallback": any(_g.get("_rule_fallback") for _g in groups),
                     "groups": [{
                         "source_type": _g["source_type"], "target_type": _g["target_type"],
                         "category": _g.get("_category"),
                         "design_skill": _g.get("design_skill"),
+                        "rule_fallback": bool(_g.get("_rule_fallback")),
                         "components": [c.get("type") for c in (_g.get("ai_components") or [])],
                     } for _g in groups],
                 }}
@@ -2636,728 +2666,40 @@ def generate():
         req = PipelineGenerateRequest(**{**body, "mappings": mappings})
     except Exception as exc:
         return error(f"参数校验失败: {exc}"), 400
-    repository.save_mappings([m.model_dump() for m in req.mappings])
-
-    # Agent C1：转换验证-修复（生成前，先保证转换关系合法：列存在/结构完整）
     mappings_effective = [m.model_dump() for m in req.mappings]
-    trans_fix = transformation_validator.validate_and_fix_transformation(
-        mappings_effective, assets=_c1_assets(source_id),
-        target_models=_c1_target_models(mappings_effective))
-    # 采纳 C1 的修复进展：即使未完全解决也不丢弃已修正的映射（避免"全有或全无"把
-    # 引用标注 transform=reference / 必填常量等修复回退，导致 FHIR 事务校验整体被拒）
-    if trans_fix.get("mappings"):
-        mappings_effective = trans_fix["mappings"]
-    if trans_fix["status"] != "ok":
-        logger.warning("转换验证-修复未完全解决（已采纳部分修复）: %s", trans_fix["message"])
-    repository.save_mappings(mappings_effective)
 
-    # —— 术语映射**盘点**（术语服务器 = 术语转换的唯一事实源；**默认放行**）——
-    # 位置：C1 修完映射之后、Agent B（LLM 管道设计）之前。
-    # 2026-09-18 口径：缺映射不再中止（缺什么进"待办清单"，运行期由共享 BO 降级处理）；
-    # 仅 `strict_terms=true` 时按 TERM_MAP_INCOMPLETE 中止（合规场景）。
-    _strict = bool(body.get("strict_terms"))
-    _tgate = _term_precheck(mappings_effective, strict=_strict)
-    if not _tgate.get("ok"):
-        logger.error("单管道生成被术语**严格**预检中止: %s", _tgate.get("message"))
-        return error(_tgate.get("message") or "术语预检未通过（严格模式）", data={
-            "reason": "TERM_MAP_INCOMPLETE",
-            "term_catalog": _term_catalog_brief(_tgate.get("gate") or {})}), 400
-    _term_catalog = _term_catalog_brief(_tgate.get("gate") or {})
-    _term_todo = list(_tgate.get("todo") or [])
-    if _tgate.get("message"):
-        logger.warning("术语待办（默认放行，运行期降级）: %s", _tgate.get("message"))
-
-    mappings_json = json.dumps(mappings_effective, ensure_ascii=False)
-    # FHIR 源配置兜底：统一从数据源运行契约读取（datasource_runtime 归一 endpoint/auth），
-    # 保证 FHIRSyncService 能抓取（前端可能取不到字段的历史问题由此根治）
-    if not (config or {}).get("endpoint"):
-        for _ds in repository.list_datasources():
-            if _ds.get("type") == "FHIR":
-                _rc = (_ds.get("runtime") or {}).get("connection") \
-                    or repository.datasource_runtime(_ds)["connection"]
-                _ep = _rc.get("endpoint") or ""
-                if _ep:
-                    config = {
-                        **(config or {}),
-                        "endpoint": _ep,
-                        "username": (config or {}).get("username") or _rc.get("username") or "superuser",
-                        "password": (config or {}).get("password") or _rc.get("password") or "SYS",
-                    }
-                    break
-    config_json = json.dumps(config, ensure_ascii=False) if config else ""
-
-    # Agent B（LLM）：设计数据管道拓扑——AI 决定组件构成与顺序，注册表只补参数。
-    # LLM 不可用时不再静默走规则；如确需规则兜底（如无 LLM key 的演示环境）须显式 allow_rule_fallback。
-    allow_rule_fallback = bool(body.get("allow_rule_fallback"))
-
-    # —— 增量（P0a/P1/P3，与多管道同口径）——
-    # ① 身份必须完整：缺源数据源/目标 → **拒绝生成**（否则会登记成 PIPE_<skill> 幽灵实例）
-    if not (str(source_id or "").strip() and str(target_id or "").strip()):
-        _msg0 = pipeline_instances.pipeline_id_fallback_note(source_id, target_id)
-        logger.error("单管道生成中止（管道身份不完整）: %s", _msg0)
-        return error(_msg0, data={"reason": "PIPELINE_IDENTITY_MISSING"}), 400
-    # ⓪ 保护：**存在其它有效管道**时改走多管道路径（P1b 会把它们按存储定义自动并入）。
-    #   否则"单管道 = 整份替换 Production"会把现存的别的管道清掉 —— 实测缺陷（2026-09-20）：
-    #   用户先建了 SQL→SOAP，再生成 SQL→FHIR 时前端只提交 1 组 → 走单管道路径 →
-    #   SQL-SOAP 的 3 个组件整组消失、其实例变 superseded（用户视角："管道消失了"）。
-    try:
-        _others = [r for r in pipeline_instances.list_instances()
-                   if r.get("status") != "superseded"
-                   and str(r.get("id")) != pipeline_instances.pipeline_id(source_id, target_id)
-                   and (r.get("ai_components") or [])]
-    except Exception:  # noqa: BLE001 - 读不到既有管道时按"没有"处理（退化为原单管道语义）
-        _others = []
-    if _others:
-        logger.info("单管道请求：检测到其它 %d 条有效管道 %s → 转多管道路径（自动并入，不整份替换）",
-                    len(_others), [str(r.get("id")) for r in _others])
-        _multi2 = _generate_multi_pipelines([{
-            "source_type": source_type, "source_id": source_id,
-            "target_type": target_type, "target_id": target_id,
-            "mappings": mappings_effective}])
-        if _multi2.get("result") != "OK":
-            if _multi2.get("gate") is not None:
-                return error(_multi2.get("message") or "术语预检未通过", data={
-                    "reason": _multi2.get("reason") or "TERM_MAP_INCOMPLETE",
-                    "term_catalog": _multi2.get("gate") or {}}), 400
-            if _multi2.get("reason") == "PIPELINE_IDENTITY_MISSING":
-                return error(_multi2.get("message") or "管道身份不完整", data={
-                    "reason": "PIPELINE_IDENTITY_MISSING"}), 400
-            return error(f"管道生成失败: {_multi2.get('result')}"), 500
-        if _multi2.get("unchanged"):
-            return success(_multi2, "所有数据管道均已存在且未变更（未重新生成）")
-        return success(_multi2, "多管道已生成并启动")
-
-    # ② 入参未变 且 组件仍在 Production 在位 → 跳过重渲染/重启（无变更；force=true 时不跳过）
-    # ⚠ 签名口径必须与多管道路径**完全一致**（`_inc_input_signature`，含运行契约 extra）——
-    #   否则两条路径算出的签名不同：单管道重放永远判"变更"→ 重渲染 → 把别的管道整份换掉
-    #   （实测缺陷）。
-    _force_regen1 = bool(body.get("force"))
-    _sig_in1 = _inc_input_signature({
-        "source_id": source_id, "target_id": target_id,
-        "source_type": source_type, "target_type": target_type,
+    # —— 方案 A Step 3：**单管道 = 多管道的特例**（唯一实现）——
+    # 本次提交 1 组还是 N 组，都走同一条 `_generate_multi_pipelines(groups)`：
+    # 身份校验 / 同身份去重 / 既有管道自动并入 / C1 转换验证 / 术语门禁 / Agent B /
+    # 增量复用（P1）与免重启（P3） / 许可调度 / 拓扑渲染 / 验证-修复闭环 / 实例登记
+    # —— 全部只有一份实现。原先两条平行管线各自实现同一批语义，任何一处漂移都是
+    # **静默缺陷**（S2 签名口径 / T1 单管道整份替换 / T2 复用渲染丢目标 BO / T3 存储定义污染
+    # 的共同成因），此处从结构上消除：单管道走的一定是「组数 = 1」的同一条链路。
+    _m2 = _generate_multi_pipelines([{
+        "source_type": source_type,
+        "source_id": source_id,
+        "target_type": target_type,
+        "target_id": target_id,
+        "source_config": config or {},
+        "target_config": target_config or {},
         "mappings": mappings_effective,
-        "_rt_src": repository.datasource_runtime(ds_obj) if ds_obj else None,
-        "_rt_tgt": repository.target_runtime(locals().get("tg")) if locals().get("tg") else None})
-    _unch1, _rec1 = (False, None) if _force_regen1 else pipeline_instances.is_unchanged(
-        source_id, target_id, _sig_in1)
-    if _unch1:
-        _prod1 = _running_items()
-        _miss1 = [str(n) for n in ((_rec1 or {}).get("component_names") or [])
-                  if str(n) not in _prod1]
-        if _prod1 and not _miss1:
-            logger.info("增量生成（单管道）：%s 输入未变且组件在位 → 跳过重渲染/重启（无变更）",
-                        (_rec1 or {}).get("id"))
-            rec1 = dict(_rec1 or {})
-            rec1["signature"] = _sig_in1
-            return success({
-                "result": "OK", "unchanged": True, "render_skipped": True,
-                "production": "demo.DataflowProduction",
-                "validation": {"ok": True, "error_count": 0, "warning_count": 0, "issues": [],
-                               "note": "增量生成：输入未变、组件已在位 → 未重渲染/重启"},
-                "pipelines": [rec1],
-            }, "该数据管道已存在且未变更（跳过重新生成）")
-        logger.warning("增量生成（单管道）：组件缺失 %s → 走完整重渲染自愈", _miss1[:5])
+    }])
+    if _m2.get("result") != "OK":
+        if _m2.get("gate") is not None:                 # 术语严格模式（strict_terms）
+            return error(_m2.get("message") or "术语预检未通过（严格模式）", data={
+                "reason": _m2.get("reason") or "TERM_MAP_INCOMPLETE",
+                "term_catalog": _m2.get("gate") or {}}), 400
+        if _m2.get("reason") == "PIPELINE_IDENTITY_MISSING":
+            return error(_m2.get("message") or "管道身份不完整", data={
+                "reason": "PIPELINE_IDENTITY_MISSING"}), 400
+        return error(f"管道生成失败: {_m2.get('result')}"), 500
 
-    ai_components: list[dict] | None = None
-    p_result: dict | None = None
-    design_skill = None
-    try:
-        # 上下文精准化：源模型/运行契约收敛到本组映射涉及的表（组件构成仍由 Agent 决策）
-        _src_tables = _source_tables_from_mappings(mappings_effective)
-        _rt_src_scoped, _src_models_scoped = _scope_source_context(
-            (ds_obj or {}).get("runtime") if ds_obj else None, source_models, _src_tables)
-        p_result = llm_client.recommend_pipeline(
-            mappings_effective,
-            source_type=source_type, target_type=target_type,
-            available_components=AVAILABLE_COMPONENTS,
-            source_models=_src_models_scoped,
-            target_models=target_models,
-            transformation_plan=plan or {"mappings": mappings_effective},
-            # 源/目标运行契约（归一 runtime）注入，驱动 AI 基于轮询/投递能力决策（密码由 llm_client 脱敏）
-            source_runtime=_rt_src_scoped,
-            target_runtime=(tg.get("runtime") if locals().get("tg") else None),
-            # 已登记管道事实（同一 (源,目标) → 更新既有管道而非新增；决策仍归 LLM）
-            existing_pipelines=pipeline_instances.existing_pipelines_brief(),
-            # Plan 模式：SQL→FHIR 时只让 Agent B 出拓扑（聚合 BP 由计划+逐方法生成）
-            bp_plan_mode=_bp_plan_mode_for(source_type, target_type))
-        pipeline = p_result.get("pipeline")
-        design_skill = p_result.get("design_skill") if isinstance(p_result, dict) else None
-        if pipeline and pipeline.get("components"):
-            ai_components = pipeline["components"]
-            logger.info("Agent B 数据管道设计 Agent 选 Skill=%s（AI 决策 %d 组件）: %s",
-                        design_skill, len(ai_components),
-                        [c.get("type") for c in ai_components])
-        else:
-            raise llm_client.AgentError("Agent B 未返回任何组件")
-    except Exception as exc:
-        if not allow_rule_fallback:
-            logger.error("Agent B 数据管道 AI 生成失败（不静默回退规则）: %s", exc)
-            return error(f"Agent B 数据管道 AI 生成失败: {exc}"
-                         "（如需以类型注册表规则兜底，请显式传 allow_rule_fallback=true）"), 500
-        logger.warning("Agent B 调用失败，已显式允许规则兜底: %s", exc)
-
-    # 校正 mapping.target_type：前端确认/plan 常缺省存成 "DB"（MappingItem 默认值），
-    # 会导致 TransformProcess 对 SOAP 目标走错 DB 路由。统一按推导的最终 target_type 回写
-    # （SOAP 目标→SOAPOp，DB 目标→SQLOp），并持久化到 ^demo.Mapping。
-    for _m in mappings_effective or []:
-        if isinstance(_m, dict) and _m.get("id"):
-            _m["target_type"] = target_type
-            _write_mapping_patch(_m)
-
-    # —— sql2fhir-patient-tx 分发（Skill 布局 executor + Agent 生成 BP，无平台预置 BP）——
-    # 触发条件：目标=FHIR、Agent B 已选 design_skill=sql2fhir-patient-tx（AI 决策），
-    # 且源为 SQL 并映射覆盖患者主表。布局与 BP 由 Skill/Agent 链路完成，平台只做参数化与准入。
-    # C2 目标落地预期（布局驱动，sql2fhir 分支内按布局声明赋值）：{FHIR 资源: 至少条数}
-    _expect_targets: dict[str, int] = {}
-    _bp_mode_meta: dict = {}          # Plan 链 meta（bp_mode/方法/单测汇总），响应回显（可审计）
-    sql2fhir_flow = False
-    if (target_type == "FHIR" and design_skill == "sql2fhir-patient-tx"
-            and ai_components is not None):
-        from backend.services import sql2fhir_executor as _sfx
-        try:
-            maps_layout, meta = _resolve_sql_source_tables(mappings_effective, source_id)
-            layout = _sfx.derive_sql2fhir_layout(maps_layout, meta)
-            layout = _sfx.enrich_layout_with_mappings(layout, maps_layout)
-            if layout.get("unmapped_query_bos"):
-                return error("sql2fhir 布局不完整：子资源查询 BO 缺少映射 id "
-                             f"{layout['unmapped_query_bos']}（子资源会组装成空资源 → "
-                             "FHIR 必填元素缺失 → 整个 Bundle 事务回滚）"), 500
-        except Exception as _lexc:  # noqa: BLE001
-            logger.error("sql2fhir 布局推导失败（Skill executor）: %s", _lexc, exc_info=True)
-            return error("sql2fhir 布局推导失败（Skill executor）: %s%s" % (
-                _lexc, _missing_patient_root_hint(mappings_effective, source_id))), 500
-        _save_sql2fhir_layout(layout)
-        # 目标落地预期 = 布局声明的资源（每条至少 1 个）：子资源全 0 时不能判"通过"
-        _expect_targets = {str(r): 1
-                           for r in (layout.get("bundle", {}).get("resource_order") or []) if str(r)}
-        _tg_rt = (locals().get("tg") or {}).get("runtime") if locals().get("tg") else None
-        _bp_ok, _bp_msg, _bp_meta = _ensure_sql2fhir_bp_dispatch(
-            p_result, mappings_effective, source_type, target_type,
-            AVAILABLE_COMPONENTS,
-            (ds_obj or {}).get("runtime") if ds_obj else None, _tg_rt,
-            layout=layout, design_skill="sql2fhir-patient-tx",
-            facts={"source": source_type, "target": target_type})
-        _bp_mode_meta = _bp_meta
-        if not _bp_ok:
-            logger.error("Agent 生成 BP 失败（sql2fhir-patient-tx）: %s", _bp_msg)
-            return error(f"Agent 生成 BP 失败（sql2fhir-patient-tx）: {_bp_msg}"), 500
-        ai_components = _sfx.build_sql2fhir_components(layout, source_config, target_config)
-        sql2fhir_flow = True
-        logger.info("sql2fhir-patient-tx 布局+Agent BP 就绪（%d 组件）", len(ai_components))
-
-    # 依据 Agent B（LLM）组件构建拓扑；ai_components=None（规则兜底）时才用纯注册表规则
-    if sql2fhir_flow:
-        # sql2fhir 拓扑由 Skill executor 按布局生成（含 Agent 编译的 BP），不再走注册表参数化重建
-        topology = {"production": "demo.DataflowProduction", "components": ai_components,
-                    "design_skill": "sql2fhir-patient-tx", "ai_supplemented": []}
-    else:
-        topology = build_pipeline_topology(
-            mappings_effective,
-            source_type=source_type, target_type=target_type,
-            suggested_types=None,
-            source_config=source_config, target_config=target_config,
-            ai_components=ai_components)
-    # 管道类别（= Agent B 选定的设计 Skill）：渲染为 Ens 业务主机 Category（分组/启停/LLM 上下文的事实）
-    _category = pipeline_instances.category_of(
-        topology.get("design_skill") or design_skill, source_type, target_type)
-    _stamp_categories(topology, _category)
-    # 本拓扑是否真的生成转换 BP（TransformProcess 主机）：Skill 自带聚合 BP 的组（sql2fhir）没有
-    # 它 → `bp` / `bp_target` 一律不登记（否则留下无读者的死配置，口径与多管道一致）
-    _has_router = any(str(c.get("type")) == "TransformProcess"
-                      for c in (topology.get("components") or []))
-    # 生成期自检 + 布局派发名对齐（单管道不改名，但口径与多管道一致：BP 读显式派发名）
-    _sp_items, _sp_item = _dispatch_targets(
-        topology.get("components") or [], None, target_config)
-    _assert_dispatch_targets(
-        [{"_category": _category, "_bp_items": _sp_items, "_bp_item": _sp_item}],
-        topology.get("components") or [])
-    if sql2fhir_flow and locals().get("layout") and isinstance(layout, dict):
-        layout["http_bo"] = _sp_item or layout.get("http_bo") or ""
-    # 许可调度：放不下的管道分组标 enabled=false（组件照旧生成、初始停用，UI 一键切换）
-    _plan = _license_plan(topology)
-    _susp = _mark_suspended_components(topology, _plan)
-    if _susp:
-        logger.warning("许可调度：以下组件生成后处于停用状态 %s", _susp)
-    # 本组被调度停用（组件已生成、未启动）→ 目标必然无数据：取消落地预期并跳过落地判定，
-    # 否则"已生成但停用"会被判为生成失败（实测：多/单管道第二条被调度停用 → 500 假失败）
-    _susp_cats = {str(c) for c in (_plan.get("suspended") or [])}
-    _self_suspended = str(_category) in _susp_cats
-    if _self_suspended:
-        logger.warning("许可调度：本管道（%s）生成后处于停用状态 → 本次不做目标落地判定",
-                       _category)
-        _expect_targets = {}
-    _effect_target_types = [] if _self_suspended else [target_type]
-    _save_pipeline_topology(topology)
-    # sql2fhir 布局**按聚合 BP 实例**写入（多管道隔离；全局键已在上文写过作历史兼容）——
-    # 单管道时 BP 名即 `SqlFhirPatientTxProcess`，与多管道同口径，便于两口径混用。
-    _agg_bp = next((str(_c.get("name")) for _c in (topology.get("components") or [])
-                    if str(_c.get("type")) == "PatientTxProcess" and _c.get("name")), "")
-    if _agg_bp and locals().get("layout"):
-        _save_sql2fhir_layout(layout, _agg_bp)
-    _save_fhir_runtime_config(topology, target_config,
-                              mappings=mappings_effective, source_id=source_id)
-    # 以及管道目标类型（TransformProcess 路由权威依据，防止 mapping.target_type 缺省 DB 误路由）
-    # 转换 BP 的**自身配置**（单管道只有一条 → BP 名固定 TransformProcess）：
-    # demo.TransformProcess.OnRequest 首选 ^demo.Config("bp", ..%ConfigName)，
-    # 不再依赖全局单值键（后者在多管道下会被后来者覆盖）；同时写：
-    #  - bp_target[源BS] = BP 名（供代码内显式投递的源 BS 读取，如 demo.FHIRService）
-    #  - pipe[源BS] / pipeline.* （兼容历史路径与兜底）
-    if mappings_effective:
-        import iris
-        conn = iris_connector.get_connection()
-        try:
-            native = iris.createIRIS(conn)
-            _m0 = mappings_effective[0]
-            _pipe = {"mapping": _m0.get("id", ""), "target_type": target_type}
-            if target_type == "SOAP":
-                _pipe["service"] = (target_config or {}).get("service") or "default"
-            else:
-                _pipe["table"] = _m0.get("target_table") or ""
-            # 派发目标（显式主机名，口径与多管道一致）：单管道虽不改名，仍写入以便
-            # 与多管道共用同一 BP 读法（生成期自检也会校验其存在性）
-            _sp_items, _sp_item = _dispatch_targets(
-                topology.get("components") or [], None, target_config)
-            if _sp_items:
-                _pipe["items"] = _sp_items
-            if _sp_item:
-                _pipe["item"] = _sp_item
-            _pipe_json = json.dumps(_pipe, ensure_ascii=False)
-            # ① 权威：本 BP 自己的参数（BP 内用 ..%ConfigName 读）
-            #    ⚠ 仅当本拓扑**确有** TransformProcess 主机时才登记（口径同多管道）
-            if _has_router:
-                native.set(_pipe_json, "^demo.Config", "bp", "TransformProcess")
-            _ids_json = json.dumps([str(x.get("id")) for x in mappings_effective if x.get("id")],
-                                   ensure_ascii=False)
-            for _bn in _source_bs_names(topology):
-                # ② 源 BS → BP 投递表（仅本拓扑有转换 BP 时才有意义）
-                if _has_router:
-                    native.set("TransformProcess", "^demo.Config", "bp_target", _bn)
-                native.set(_pipe_json, "^demo.Config", "pipe", _bn)
-                # 本管道映射集：源 BS 据此只消费本管道在 FHIR 队列里的行（多管道不互相抢行）
-                native.set(_ids_json, "^demo.Config", "bs_mappings", _bn)
-            native.set(_m0.get("id", ""),
-                       "^demo.Config", "pipeline", "active_mapping")
-            native.set(target_type,
-                       "^demo.Config", "pipeline", "target_type")
-        finally:
-            iris_connector.reset_connections()
-    logger.info("已构建完整管道拓扑: %s", [c.get("type") for c in topology["components"]])
-
-    # 许可预算：让不属于本次管道的旧管道业务主机让出许可单元（社区版仅 8 个）；
-    # 本次拓扑内部由 apply_license_budget(groups=...) 做容量调度——放不下的分组在上面已标
-    # enabled=false（生成但停用），因此不再出现"超容量即失败"，用户可在 UI 一键切换
-    license_budget = pipeline_validator.apply_license_budget(
-        keep_categories=_pipeline_categories(_category),
-        groups=_topology_groups(topology))
-
-    # 生成前连通性检查（源/目标运行契约门禁：参数/可达性错误在生成前拦截）
-    try:
-        _conn_rt_src = [ds_obj.get("runtime")] if ds_obj else []
-        _conn_rt_tgt = [tg.get("runtime")] if (tg := locals().get("tg")) else []
-        _conn_check = pipeline_validator.check_connection(sources=_conn_rt_src, targets=_conn_rt_tgt)
-        if not _conn_check.get("ok"):
-            _msg = "; ".join(i.get("message", "") for i in _conn_check.get("issues", [])[:3])
-            return error(f"源/目标连通性检查未通过: {_msg}"), 500
-    except Exception as _exc:  # noqa: BLE001 - 连通检查失败不阻断生成主流程
-        logger.warning("连通性检查异常（跳过）: %s", _exc)
-
-    try:
-        result = iris_connector.class_method_value(
-            "demo.PipelineGenerator", "Generate", mappings_json, config_json)
-    except Exception as exc:
-        logger.error("生成管道失败: %s", exc)
-        return error(f"生成管道失败: {exc}"), 500
-
-    # Agent C2：管道验证（拓扑/编译/启动/消息流转 + 目标落地效果 + 运行期错误分类）
-    validation = pipeline_validator.run_pipeline_validation(
-        topology, source_type, target_type, expect_targets=_expect_targets or None,
-        effect_target_types=_effect_target_types)
-
-    # 运行期错误回喂（有界 1 次）：FHIR 结构类错误 → C1 修映射后重生成；
-    # BP 代码类错误 → 记录 method_updates 修复建议（自动 patch 由 Skill 通道执行）。
-    if result != "OK" or not validation.get("ok"):
-        try:
-            _rt = (validation.get("results") or {}).get("runtime") or {}
-            _kinds = _rt.get("kinds") or []
-            if "fhir_schema" in _kinds:
-                logger.info("运行期 FHIR 结构错误 → 回喂 C1 修复映射后重生成")
-                _fix2 = transformation_validator.validate_and_fix_transformation(
-                    mappings_effective, assets=_c1_assets(source_id),
-                    target_models=_c1_target_models(mappings_effective))
-                if _fix2.get("status") == "ok" and _fix2.get("mappings"):
-                    for _m in _fix2["mappings"]:
-                        if isinstance(_m, dict) and _m.get("id"):
-                            _write_mapping_patch(_m)
-                    mappings_effective = _fix2["mappings"]
-                    result = iris_connector.class_method_value(
-                        "demo.PipelineGenerator", "Generate",
-                        json.dumps(mappings_effective, ensure_ascii=False), config_json)
-                    validation = pipeline_validator.run_pipeline_validation(
-                        topology, source_type, target_type,
-                        expect_targets=_expect_targets or None,
-                        effect_target_types=_effect_target_types)
-                    logger.info("运行期回喂重生成结果: result=%s 验证ok=%s",
-                                result, validation.get("ok"))
-            elif "bp_code" in _kinds:
-                from backend.services import generated_bp as _gbp
-                logger.info("运行期 BP 代码错误 → method_updates 增量修复")
-                _reps = _gbp.repair_from_runtime_errors(
-                    mappings=mappings_effective, source_type=source_type,
-                    target_type=target_type, available_components=AVAILABLE_COMPONENTS,
-                    errors_text="\n".join(i.get("message", "") for i in (_rt.get("issues") or [])),
-                    source_runtime=(ds_obj or {}).get("runtime") if ds_obj else None,
-                    target_runtime=(locals().get("tg") or {}).get("runtime"))
-                if _reps.get("ok"):
-                    logger.info("BP 方法修复完成: %s", _reps.get("applied"))
-                    try:
-                        iris_connector.class_method_value("Ens.Director", "StopProduction", 10)
-                        iris_connector.class_method_value("Ens.Director", "StartProduction",
-                                                          "demo.DataflowProduction")
-                    except Exception as _se:  # noqa: BLE001
-                        logger.warning("修复后重启 Production 失败（不阻断）: %s", _se)
-                    result = iris_connector.class_method_value(
-                        "demo.PipelineGenerator", "Generate",
-                        json.dumps(mappings_effective, ensure_ascii=False), config_json)
-                    validation = pipeline_validator.run_pipeline_validation(
-                        topology, source_type, target_type,
-                        expect_targets=_expect_targets or None,
-                        effect_target_types=_effect_target_types)
-                else:
-                    logger.warning("BP 方法修复未通过: %s", _reps.get("message"))
-        except Exception as _re:  # noqa: BLE001 - 回喂失败不阻断主流程
-            logger.warning("运行期错误回喂失败（不影响主流程）: %s", _re)
-
-    # 管道验证-修复闭环：生成失败或验证不通过时，由 Agent C2 判断并分层修复
-    fix_result: dict | None = None
-    if result != "OK" or not validation["ok"]:
-        logger.warning("生成/管道验证未通过（生成=%s 验证错误=%d），进入管道验证-修复闭环",
-                       result, validation["error_count"])
-
-        def _generate_with_topology(topo, mp):
-            """按给定拓扑 + 映射重新生成（供管道验证-修复 Agent 的 generate_fn）。"""
-            _save_pipeline_topology(topo)
-            mp_json = json.dumps(mp, ensure_ascii=False)
-            return iris_connector.class_method_value(
-                "demo.PipelineGenerator", "Generate", mp_json, config_json)
-
-        fix_result = validate_agent.validate_and_fix_pipeline(
-            mappings_effective, topology,
-            generate_fn=_generate_with_topology,
-            source_type=source_type, target_type=target_type)
-        if fix_result["status"] != "ok":
-            return error(
-                f"生成管道失败，验证-修复闭环未解决: {result}（{fix_result['message']}）"), 500
-        result = "OK"
-        validation = fix_result["report"]
-        topology = fix_result["topology"]
-        # C2 修复可能改写了拓扑（规则补齐/重建）→ 重新打类别，保证 Category 与最终拓扑一致
-        _stamp_categories(topology, _category)
-        logger.info("管道验证-修复闭环完成: 状态=%s 轮次=%d",
-                    fix_result["status"], len(fix_result["rounds"]))
-
-    # 管道实体登记（受管理持久对象）：同一 (source_id, target_id, design_skill) 更新，不新增
-    pipeline_rec: dict | None = None
-    pipeline_error = ""
-    if result == "OK":
-        try:
-            _src_bs = _source_bs_names(topology)
-            pipeline_rec = pipeline_instances.upsert_from_generation(
-                source_id=source_id, target_id=target_id,
-                source_type=source_type, target_type=target_type,
-                design_skill=topology.get("design_skill") or design_skill,
-                category_hint=_category,
-                mapping_ids=[m.get("id") for m in mappings_effective if m.get("id")],
-                components=topology.get("components"),
-                # P0：存**未改名**原始组件（含 infra）+ 是否 sql2fhir + 布局 + 输入签名，
-                #     供下次增量生成复用（跳过 Agent B、不重渲不重启）
-                ai_components=ai_components or [],
-                is_sql2fhir=bool(locals().get("sql2fhir_flow")),
-                layout=(locals().get("layout") if locals().get("sql2fhir_flow") else None),
-                signature=_sig_in1,
-                applied_signature=pipeline_instances.component_signature(
-                    (topology or {}).get("components"),
-                    mapping_ids=[m.get("id") for m in mappings_effective if m.get("id")]),
-                routes={"source_bs": _src_bs[0] if _src_bs else "",
-                        "source_bs_names": _src_bs},
-                ai={"driven": ai_components is not None,
-                    "rule_fallback": ai_components is None,
-                    "supplemented": (topology or {}).get("ai_supplemented", [])},
-                validation=validation)
-            pipeline_instances.reconcile_states()
-        except Exception as _pie:  # noqa: BLE001 - 登记失败不改变"生成成功"事实，但必须显式暴露
-            pipeline_error = str(_pie)
-            logger.error("管道实体登记失败（生成已成功，实体未登记）: %s", _pie)
-
-    # 术语覆盖**复核**（只读盘点）：运行期由共享 BO 实时查；缺映射进"待办清单"（只告警不阻断）
-    term_summary: dict = {}
-    if result == "OK":
-        try:
-            term_summary = _term_summary(mappings_effective, topology, validation)
-        except Exception as _tc:  # noqa: BLE001 - 复核异常也显式报告（不影响生成结果）
-            logger.warning("生成后术语复核异常（不影响生成）: %s", _tc)
-            term_summary = {"ok": False, "error": str(_tc),
-                            "note": "术语复核异常；运行期由共享 BO 实时查询（缺映射会降级）"}
-
-    # 配置收敛（口径同多管道）：清理指向不存在组件的 `bp` / `bp_target` 陈旧登记
-    config_cleanup: dict = {}
-    if result == "OK":
-        try:
-            config_cleanup = prune_stale_bp_config(
-                keep_bps={"TransformProcess"} if _has_router else set(),
-                keep_srcs=set(_source_bs_names(topology)) if _has_router else set())
-        except Exception as _pce:  # noqa: BLE001 - 收敛失败不改变生成结果
-            logger.warning("配置收敛异常（不影响生成）: %s", _pce)
-            config_cleanup = {"error": str(_pce)}
-
-    return success({
-        "result": result,
-        "production": "demo.DataflowProduction",
-        "validation": validation,
-        # BP 生成链（Plan → Execute）审计：bp_mode / 计划方法清单 / 每方法状态 / 单测汇总
-        "bp_mode": _bp_mode_meta,
-        # 许可预算：本次生成让旧管道组件让出的许可单元（社区版仅 8 个许可单元）
-        "license_budget": license_budget,
-        # 术语覆盖复核 + **待办清单**（运行期由共享 BO 实时查；缺映射默认降级、不阻断）
-        "term_summary": term_summary,
-        "term_todo": _term_todo,
-        # 术语服务器目录/盘点摘要（唯一事实源：覆盖了多少码、缺什么、源库命名空间）
-        "term_catalog": _term_catalog,
-        # 配置收敛：本次生成清理掉的陈旧 `bp` / `bp_target` 登记（无对应组件）
-        "config_cleanup": config_cleanup,
-        # AI 驱动信息：Agent B（LLM）决定组件构成；supplemented 为注册表保底补齐（校验性，非替代）
-        "ai": {
-            "driven": ai_components is not None,
-            "rule_fallback": ai_components is None,
-            "components": [c.get("type") for c in (ai_components or [])],
-            "supplemented": (topology or {}).get("ai_supplemented", []),
-            # 红线审计：C2 修复中规则是否改写了 AI 决策的组件构成（True 则结果非纯 AI）
-            "c2_rule_rebuilt": bool((fix_result or {}).get("rule_applied")),
-        },
-        # 管道实体（受管理对象）：本次生成新建/更新的管道；同身份重复生成只更新不新增
-        "pipeline": pipeline_rec,
-        "pipelines": [pipeline_rec] if pipeline_rec else [],
-        "pipeline_error": pipeline_error,
-    }, "数据管道已生成并启动")
+    if _m2.get("unchanged"):
+        return success(_m2, "该数据管道已存在且未变更（跳过重新生成）")
+    return success(_m2, "数据管道已生成并启动")
 
 
 
-@pipelines_bp.post("/run")
-def run():
-    """触发一次转换（FHIRService 定时拉取中，本接口确认状态）。"""
-    result = iris_connector.class_method_value("demo.PipelineQuery", "TriggerFetch")
-    return success({"result": result})
-
-
-@pipelines_bp.get("/status")
-def status():
-    """管道运行状态。"""
-    running = iris_connector.class_method_value("demo.PipelineQuery", "ProductionStatus")
-    return success({"running": bool(running), "production": "demo.DataflowProduction"})
-
-
-@pipelines_bp.get("/items")
-def items():
-    """Production 组件清单 + 许可容量 + 按管道类别分组（供「组件启停」面板与许可预算可视化）。
-
-    背景：IRIS 社区版 `KeyLicenseUnits = 8`，每个 Ens 业务主机（BS/BP/BO）常驻占 1 个
-    许可单元。组件的 Category 即所属数据管道类别（sql2fhir-patient-tx / sql2soap / shared…），
-    categories 字段给出每个类别的组件数与已启用数，用于判断哪条管道正在占用许可。
-    """
-    rows = pipeline_validator.production_items()
-    buckets: dict[str, dict] = {}
-    for r in rows:
-        cat = str(r.get("category") or "")
-        if not cat:
-            continue
-        grp = buckets.setdefault(cat, {"category": cat, "items": [], "enabled_count": 0})
-        grp["items"].append(r.get("name"))
-        if int(r.get("enabled") or 0) == 1:
-            grp["enabled_count"] += 1
-    return success({
-        "items": rows,
-        "units": pipeline_validator.license_units(),
-        "enabled_count": len([r for r in rows if int(r.get("enabled") or 0) == 1]),
-        "categories": sorted(buckets.values(), key=lambda g: g["category"]),
-    })
-
-
-@pipelines_bp.post("/items/toggle")
-def toggle_items():
-    """启用/禁用 Production 组件（等价于手工切换管道占用许可）。
-
-    body: {"names": ["SQLService_Patient"], "enabled": true}
-      或 {"name": "SQLService_Patient", "enabled": false}
-    注意：启用组件会常驻占用 1 个许可单元；启用过多会导致后端无法连接 IRIS（接口 500）。
-    生成流程会在启动前自动做许可预算（让非本次管道组件让路）。
-    """
-    body = request.get_json(silent=True) or {}
-    names = body.get("names") or ([body["name"]] if body.get("name") else [])
-    if not names:
-        return error("请指定要启停的组件名（name 或 names）"), 400
-    enabled = bool(body.get("enabled"))
-    res = pipeline_validator.set_items_enabled(names, enabled)
-    if not res.get("ok"):
-        return error(f"组件启停失败: {res.get('message') or res.get('result')}"), 500
-    return success(res, "组件已启用" if enabled else "组件已禁用")
-
-
-@pipelines_bp.get("/instances")
-def pipeline_instances_list():
-    """数据管道清单（受管理持久实体）+ 按管道类别分组 + 许可占用。
-
-    管道实体 = 「源 + 目标 + 设计 Skill」的稳定对象：组件 Category 即管道类别。
-    status 按 Production 实际 Enabled 回写（active/suspended），不是生成时的历史快照。
-    """
-    prod_items = pipeline_validator.production_items()
-    recs = pipeline_instances.reconcile_states(production_items=prod_items)
-    return success({
-        "items": recs,
-        "groups": pipeline_instances.group_by_category(recs, prod_items),
-        "units": pipeline_validator.license_units(),
-        "enabled_count": len([r for r in prod_items if int(r.get("enabled") or 0) == 1]),
-        "active_count": len([r for r in recs if r.get("status") == "active"]),
-    })
-
-
-@pipelines_bp.get("/instances/<pid>")
-def pipeline_instance_detail(pid):
-    """单条数据管道详情（含组件清单、路由、AI 决策与最近验证结果）。"""
-    rec = pipeline_instances.get_instance(pid)
-    if not rec:
-        return error(f"管道实例不存在: {pid}"), 404
-    return success(rec)
-
-
-@pipelines_bp.delete("/instances/<pid>")
-def pipeline_instance_delete(pid):
-    """删除管道实体记录（仅删实体，不改动 Production 组件与其启停状态）。"""
-    if not pipeline_instances.get_instance(pid):
-        return error(f"管道实例不存在: {pid}"), 404
-    pipeline_instances.delete_instance(pid)
-    return success({"id": pid}, "管道实体已删除（Production 组件未改动）")
-
-
-@pipelines_bp.post("/instances/<pid>/enable")
-def pipeline_instance_enable(pid):
-    """启用一条数据管道（启用其业务主机组件，占用许可单元）。
-
-    注意许可上限：启用后若「已启用组件数 + 1（后端连接）」超过 license_units()，
-    后端连接会被 IRIS 拒绝（接口 500）——此时请先停掉另一条管道。
-    """
-    res = pipeline_instances.set_enabled(pid, True)
-    if not res.get("ok"):
-        return error(f"启用管道失败: {res.get('message')}"), 500
-    return success(res, "管道已启用")
-
-
-@pipelines_bp.post("/instances/<pid>/disable")
-def pipeline_instance_disable(pid):
-    """停用一条数据管道（停其业务主机组件，释放许可单元；无其它活动管道时连共享组件一起停）。"""
-    res = pipeline_instances.set_enabled(pid, False)
-    if not res.get("ok"):
-        return error(f"停用管道失败: {res.get('message')}"), 500
-    return success(res, "管道已停用（许可单元已释放）")
-
-
-@pipelines_bp.post("/instances/sync")
-def pipeline_instance_sync():
-    """从 Production（组件 Category）+ 路由表回填管道实体（历史环境迁移/修复）。
-
-    适用：升级前生成过的 Production 只有组件没有管道实体；或手工改过组件类别需要归位。
-    """
-    res = pipeline_instances.sync_from_production()
-    return success({"created": res.get("created"), "updated": res.get("updated"),
-                    "categories": res.get("categories"),
-                    "instances": res.get("instances")}, "管道实体已同步")
-
-
-@pipelines_bp.get("/logs")
-def logs():
-    """消息流转日志（Ens.MessageHeader 真实消息历史）。"""
-    count = request.args.get("count", 50, type=int)
-    data = iris_connector.class_method_value("demo.PipelineQuery", "GetLogs", count)
-    try:
-        items = json.loads(data or "[]")
-    except json.JSONDecodeError:
-        items = []
-    return success({"items": items})
-
-
-@pipelines_bp.post("/validation-issues")
-def save_validation_issue_route():
-    """沉淀一条验证-修复经验到 ^demo.ValidationIssue（外部工具/审计用）。
-
-    请求体: {"pattern": "...", "resolution": "...", "source": "..."}
-    """
-    body = request.get_json(silent=True) or {}
-    pattern = (body.get("pattern") or "").strip()
-    resolution = (body.get("resolution") or "").strip()
-    if not pattern or not resolution:
-        return error("缺少 pattern/resolution"), 400
-    result = pipeline_validator.save_validation_issue(
-        pattern, resolution, body.get("source") or "api")
-    if not result.get("ok"):
-        return error(result.get("message") or "沉淀失败"), 500
-    return success({"pattern": pattern[:60]}, "经验已沉淀")
-
-
-@pipelines_bp.post("/validation-issues/polish")
-def polish_validation_issues_route():
-    """LLM 研读润色 + 去重验证经验（^demo.ValidationIssue → 结构化知识）。
-
-    供宿主导出到 Obsidian 知识库使用；LLM 失败返回明确错误（不静默回退原文）。
-    """
-    body = request.get_json(silent=True) or {}
-    limit = min(max(int(body.get("limit") or 500), 1), 1000)
-    items = pipeline_validator.load_validation_issues(limit)
-    try:
-        polished = llm_client.polish_validation_issues(items)
-    except llm_client.AgentError as exc:
-        return error(f"知识润色 Agent（LLM）失败: {exc}"), 500
-    except Exception as exc:  # noqa: BLE001
-        logger.error("知识润色失败: %s", exc)
-        return error(f"知识润色失败: {exc}"), 500
-    return success({"items": polished, "count": len(polished),
-                    "raw_count": len(items)}, "知识润色完成")
-
-
-@pipelines_bp.get("/validation-issues")
-def list_validation_issues():
-    """验证-修复 Agent 积累的经验（^demo.ValidationIssue）。
-
-    供审计/导出知识库用（外部脚本可据此转为 IRIS-Dev-Vault 的 04-Pitfalls 笔记）。
-    """
-    limit = request.args.get("limit", 100, type=int)
-    limit = min(max(limit, 1), 500)
-    items = pipeline_validator.load_validation_issues(limit)
-    return success({"items": items, "count": len(items)})
-
-
-def _mock_patients(count: int) -> list[dict]:
-    """生成 count 条模拟 Patient（lastUpdated > 增量游标，触发增量同步）。"""
-    families = ["张", "李", "王", "刘", "陈", "杨", "赵", "黄", "周", "吴"]
-    givens = ["伟", "芳", "娜", "敏", "静", "磊", "军", "洋", "勇", "艳", "杰", "娟", "涛", "明", "超"]
-    cities = ["北京", "上海", "广州", "深圳", "成都", "杭州"]
-    now_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    patients = []
-    stamp = int(time.time() * 1000) % 100000
-    for i in range(count):
-        pid = f"M{stamp}{i}"
-        city = random.choice(cities)
-        patients.append({
-            "resourceType": "Patient",
-            "id": pid,
-            "meta": {"lastUpdated": now_ts},
-            "name": [{"family": random.choice(families), "given": [random.choice(givens)]}],
-            "gender": "male" if i % 2 == 0 else "female",
-            "birthDate": f"{random.randint(1970, 2000)}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}",
-            "telecom": [{"system": "phone", "value": f"13{random.randint(0, 9)}{random.randint(10000000, 99999999)}"}],
-            "address": [{"line": [f"{city}演示街道{random.randint(1, 99)}号"], "city": city}],
-        })
-    return patients
-
-
-@pipelines_bp.post("/generate-mock")
 def generate_mock():
     """演示：按需生成模拟 Patient 数据写入 FHIR（lastUpdated > 增量游标）。"""
     count = request.args.get("count", 3, type=int)
