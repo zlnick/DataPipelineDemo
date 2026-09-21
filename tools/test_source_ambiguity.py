@@ -153,12 +153,14 @@ def _src(rel):
 
 
 mp_src, ai_src, pl_src = (_src("backend/routes/mappings.py"), _src("backend/routes/ai.py"),
-                          _src("backend/routes/pipelines.py"))
+                          (_src("backend/routes/pipelines.py") or "")
+                          + (_src("backend/services/pipeline_generate.py") or ""))
 check('"source_ambiguous"' in mp_src, "E1 /api/mappings 响应透出 source_ambiguous")
 check('"source_ambiguous"' in ai_src, "E2 /api/recommend 响应透出 source_ambiguous")
-check(pl_src.count("_missing_patient_root_hint") == 2,
-      "E3 缺主表提示的**唯一调用点**（多管道路径；Step 3 合并后单管道走同一处）出现 %d 次"
-      % pl_src.count("_missing_patient_root_hint"))
+_pg_src = _src("backend/services/pipeline_generate.py") or ""
+check(_pg_src.count("missing_patient_root_hint") == 2,
+      "E3 缺主表提示的**唯一调用点**（Step 4 后位于 pipeline_generate.py：定义 1 + 调用 1）"
+      "出现 %d 次" % _pg_src.count("missing_patient_root_hint"))
 check("放弃猜测" in mp_src and "放弃猜测" in ai_src, "E4 日志明说『放弃猜测』（可观测）")
 
 print("\n==== 结果: %d PASS / %d FAIL ====" % (PASS, FAIL))

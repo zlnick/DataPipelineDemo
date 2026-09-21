@@ -180,7 +180,10 @@ def check_file(rel, cond, msg):
     check(cond(text), msg)
 
 
-_pl = _src("backend/routes/pipelines.py") or ""
+# 「生成编排 + 拓扑构建」已在 Step 4 迁到 services/pipeline_generate.py：
+# 正文断言在 routes + 新模块两处查找（入口/路由结构断言仍只看 routes 段）
+_pl = ((_src("backend/routes/pipelines.py") or "")
+       + (_src("backend/services/pipeline_generate.py") or ""))
 _pi = _src("backend/services/pipeline_instances.py") or ""
 check("_dedup_groups_by_identity" in _pl and "PIPELINE_IDENTITY_MISSING" in _pl,
       "E1 多管道：身份校验 + 去重接线在位")
@@ -199,7 +202,7 @@ check("_converge_component_enabled" in _pl and "停用(调度)" in _pl,
 check("_force_regen" in _pl, "E5 force 逃生开关（强制全量重生成）在位")
 check('_g["_sig_in"] = _sig_in' in _pl and "必须**在此刻**固定签名" in _pl,
       "E5b 多管道在 Agent B 分支 pop 运行契约**之前**固定签名（否则入库签名与比较签名不一致）")
-check("_auto_join_existing_pipelines(" in _pl and "P1b" in _pl,
+check("auto_join_existing_pipelines(" in _pl and "P1b" in _pl,
       "E5c P1b：未提交的既有管道自动并入（只提交变更组也不会清掉别的管道）")
 check("reused=bool(_g.get(\"_unchanged\"))" in _pl, "E5d 复用组不虚增生成次数")
 check("所有数据管道均已存在且未变更" in _pl, "E5e 未变更时给出明确消息（不营造『已生成』假象）")
@@ -244,10 +247,11 @@ _patched = STORE.get("M1") or {}
 check(_patched.get("source_id") == "DS1",
       "F3 映射修正写回**保留** `source_id`（合并写，不整条覆盖）")
 check(len(_patched.get("field_mappings") or []) == 2, "F4 修正内容确实生效（字段数 2）")
-_pl_text = _src("backend/routes/pipelines.py") or ""
-check(_pl_text.count("_write_mapping_patch(_m)") >= 3
+_pl_text = ((_src("backend/routes/pipelines.py") or "")
+            + (_src("backend/services/pipeline_generate.py") or ""))
+check(_pl_text.count("write_mapping_patch(_m)") >= 3
       and 'set_json("^demo.Mapping", _m["id"]' not in _pl_text,
-      "F5 所有映射写回点都走合并写（Step 3 后仅剩多管道 3 处，无整条覆盖）")
+      "F5 所有映射写回点都走合并写（Step 4 后在 pipeline_generate.py，无整条覆盖）")
 check("extra=\"allow\"" in (_src("backend/schemas/models.py") or ""),
       "F6 `MappingItem` 已加 extra=allow（有损 DTO 修复在位）")
 

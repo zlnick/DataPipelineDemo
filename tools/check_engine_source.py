@@ -147,7 +147,9 @@ _tv = _read("backend/services/transformation_validator.py")
 check("coded_text_gap" in _tv and "_coded_text_issues" in _tv,
       "F5 C1 新增「明文落 coding」检查（coded_text_gap）")
 check("_field_terms_index" in _tv, "F6 C1 用资产 field_terms 事实（缺失即 fail-open）")
-_pl = _read("backend/routes/pipelines.py")
+# 生成编排/拓扑构建已按职责分层（Step 4）：正文断言在 routes + pipeline_generate 两处查找
+_pl = ((_read("backend/routes/pipelines.py") or "")
+       + (_read("backend/services/pipeline_generate.py") or ""))
 check("fhir_schema_facts" in _pl and "_fsf.apply_facts" in _pl,
       "F7 生成期注入组装事实（fhir_schema_facts.apply_facts）")
 check("mappings=[m for _g in groups" in _pl and 'source_id=next((_g.get("source_id")' in _pl,
@@ -172,7 +174,9 @@ check(bool(_need) and not _missing_api,
       "G1 PARENT_API 中属于父类的 %d 项都在 %s 里有定义（缺: %s）" % (len(_need), CLS.name, _missing_api))
 
 print("\n==== H. 增量生成（P0–P4）接线事实（宿主可见）====")
-_inc = [_read(r) for r in ("backend/services/pipeline_instances.py", "backend/routes/pipelines.py")]
+_inc = [_read(r) for r in ("backend/services/pipeline_instances.py",)]
+_inc.append((_read("backend/routes/pipelines.py") or "")
+            + (_read("backend/services/pipeline_generate.py") or ""))
 check("def input_signature" in _inc[0] and "def component_signature" in _inc[0]
       and "def is_unchanged" in _inc[0],
       "H1 服务层：input_signature / component_signature / is_unchanged")
@@ -201,13 +205,13 @@ check("forceRegen" in _read("frontend/src/i18n/locales/zh.js")
 _pl_src = _inc[1]
 check('_g["_sig_in"] = _sig_in' in _pl_src and "必须**在此刻**固定签名" in _pl_src,
       "H9 多管道在 pop 运行契约前固定签名（否则入库签名 ≠ 比较签名 → 永远判『变更』）")
-check("_auto_join_existing_pipelines(" in _pl_src and "P1b" in _pl_src,
+check("auto_join_existing_pipelines(" in _pl_src and "P1b" in _pl_src,
       "H10 P1b：未提交的既有管道按存储定义自动并入（只提交变更组也不会清掉别的管道）")
 check("_generate_multi_pipelines([{" in _pl_src.split("def generate():")[-1]
       and "def _inc_input_signature" not in _pl_src,
       "H11 单管道与多管道走同一条链路（Step 3 合并：签名/校验只有一份实现）")
 check("extra=\"allow\"" in _read("backend/schemas/models.py")
-      and _pl_src.count("_write_mapping_patch(_m)") >= 3,
+      and _pl_src.count("write_mapping_patch(_m)") >= 3,
       "H12 有损 DTO 修复 + 映射修正合并写回（不丢 source_id、不派生重复映射）")
 
 print("\n==== 结果: %d PASS / %d FAIL ====" % (PASS, FAIL))
