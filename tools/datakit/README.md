@@ -93,6 +93,17 @@ curl -s http://localhost:5001/api/datasources                            # 已�
 curl -s "http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/Patient?_summary=count" -u superuser:SYS
 ```
 
+**值传导验证**（比"看行数 / 看消息状态"更硬：改源值 → 重扫 → 按**新增资源 id 差集**核对目标字段）：
+
+```bash
+./run.sh verify_fhir_value_flow.py --ns CLINIC --table Patient --id P001 --col FamilyName \
+    --repo fhirserver --type Patient --field 'name[0].family' --rescan
+```
+
+> 判据刻意避开三个已踩的坑：① 中文 `family` 查询在该服务器是**慢查询**（会假"未命中"）；
+> ② 按**固定 id** 读（写入可能是 create 语义 → 固定 id 永远是旧值）；③ 靠"最新 lastUpdated"排序（同秒多条顺序不定）。
+> 退出码 0 = 传导与还原均 PASS。
+
 ---
 
 ## 三、运维操作（重置 / 重扫 / 许可 / LLM）

@@ -36,7 +36,8 @@ list_scripts() {
     "verify_pipeline_instances.py" "验证管道实体：重复生成不新增 + 类别 + 整条启停 + 许可守卫" \
     "e2e_multi_pipeline_isolation.py" "★e2e 验证「一条管道一个 BP」：建登记+造数+两条管道+消息分流（--reuse 只跑生成）" \
     "e2e_diag.py"                "查管道状态 + 最近消息（结果写 /tmp/diag2.log）" \
-    "check_engine_source.py"     "★父类聚合引擎静态守卫（宿主直读 iris/src/demo/TransformProcess.cls；tSC 初始化/回执校验/uuid 小写等 17 项）"
+    "check_engine_source.py"     "★父类聚合引擎静态守卫（宿主直读 iris/src/demo/TransformProcess.cls；tSC 初始化/回执校验/uuid 小写等 17 项）" \
+    "verify_fhir_value_flow.py"  "★验证 FHIR 值传导（改源值→重扫→按**新增资源 id 差集**核对；避开中文 family 慢查询/固定 id/同秒取 max 三坑）"
   echo
   echo "== container/：dataflow-backend 容器内执行（backend 包 / IRIS :1972）=="
   printf '   %-28s %s\n' \
