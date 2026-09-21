@@ -181,6 +181,30 @@ check(_route_count >= 19,
       "把 generate() 之后、generate_mock() 之前的 12 条路由一起删掉 → 重启后 404" % _route_count)
 check("def generate_mock" in (_pu or "") and "def _mock_patients" in (_pu or ""),
       "J2 generate_mock / _mock_patients 未被误删")
+# J3 = 本轮事故的**通用防护**：本次只发生在 /api/pipelines，但"行区间替换 / 迁移误删路由"对任何
+# routes 模块都成立 → 用**只增不减**快照守住（新增路由时请同步更新下表数字）。
+# 另做**精确配对检查**：每个路由装饰器之后（跳过空行/注释）必须紧跟 `def` 或另一个装饰器
+# —— 防"函数体被误删、装饰器孤悬"（用一个函数挂多个路由装饰器是合法写法，故不做"装饰器≤def"比较）。
+_ROUTE_SNAPSHOT = {"agents": 2, "ai": 4, "datasources": 10, "domain_models": 17,
+                   "mapping": 3, "mappings": 2, "pipelines": 19, "targets": 12}
+_route_bad = []
+for _mod, _base in _ROUTE_SNAPSHOT.items():
+    _txt = _read("backend/routes/%s.py" % _mod) or ""
+    _dec = len(re.findall(r"@[a-z_]+\.(?:get|post|delete|put)\(", _txt))
+    if _dec < _base:
+        _route_bad.append("%s: %d<%d（疑似被误删）" % (_mod, _dec, _base))
+    _lines = _txt.split("\n")
+    for _i, _ln in enumerate(_lines):
+        if not re.match(r"@[a-z_]+\.(?:get|post|delete|put)\(", _ln):
+            continue
+        _j = _i + 1
+        while _j < len(_lines) and (not _lines[_j].strip() or _lines[_j].lstrip().startswith("#")):
+            _j += 1
+        if _j >= len(_lines) or not _lines[_j].startswith(("def ", "@")):
+            _route_bad.append("%s 行 %d：装饰器后不是 def（函数体可能被误删）" % (_mod, _i + 1))
+check(not _route_bad,
+      "J3 全部 blueprint 路由完整性（8 模块快照合计 %d；异常: %s）"
+      % (sum(_ROUTE_SNAPSHOT.values()), _route_bad or "无"))
 _inc = [_read(r) for r in ("backend/services/pipeline_instances.py",)]
 _inc.append((_read("backend/routes/pipelines.py") or "")
             + (_read("backend/services/pipeline_generate.py") or ""))

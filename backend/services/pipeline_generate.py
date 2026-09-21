@@ -795,7 +795,8 @@ def config_subs(native, *path: str) -> list[str]:
 
 
 def prune_stale_bp_config(keep_bps: set[str], keep_srcs: set[str],
-                          dry_run: bool = False) -> dict:
+                          dry_run: bool = False,
+                          only_prefix: str | None = None) -> dict:
     """生成成功后收敛清理 `^demo.Config` 里**陈旧键**（无对应组件 = 死配置）。
 
     覆盖三类：
@@ -818,6 +819,9 @@ def prune_stale_bp_config(keep_bps: set[str], keep_srcs: set[str],
         keep_bps: 本次生成的转换 BP 主机名集合。
         keep_srcs: 本次生成的源 BS 主机名集合。
         dry_run: True 时**只报告不删除**（供手动清理工具 `--check`/体检使用）。
+        only_prefix: 只处理**键名以该前缀开头**的键（默认 None = 处理全部，生产语义不变）。
+            用途 = **自测沙箱化**：测试只允许清理自己造的前缀键（`__dead_test_`），避免顺带清掉
+            环境里真实存在的同类死键（2026-09-21 实测：测试顺带删掉了 `bp[TransformProcess__sql2soap]`）。
 
     返回:
         {"removed": {"bp": [...], "bp_target": [{"key","value"}...], "layout": [...]},
@@ -837,12 +841,16 @@ def prune_stale_bp_config(keep_bps: set[str], keep_srcs: set[str],
     try:
         native = iris.createIRIS(conn)
         for key in config_subs(native, "bp"):
+            if only_prefix and not str(key).startswith(only_prefix):
+                continue
             if key in protected or key in keep_bps or key in comps:
                 continue
             if not dry_run:
                 native.kill("^demo.Config", "bp", key)
             removed["bp"].append(key)
         for key in config_subs(native, "bp_target"):
+            if only_prefix and not str(key).startswith(only_prefix):
+                continue
             val = str(native.get("^demo.Config", "bp_target", key) or "")
             if key in keep_srcs or (key in comps and val in comps):
                 continue
@@ -853,6 +861,8 @@ def prune_stale_bp_config(keep_bps: set[str], keep_srcs: set[str],
         # （运行期 `..%ConfigName` 查自己那份）→ 组件不在位 = 无读者，与 bp 同属死配置。
         # ⚠ 只清**带下标的实例键**，不动全局兜底键 `^demo.Config("sql2fhir","layout")`（历史兼容路径仍在读）。
         for key in config_subs(native, "sql2fhir", "layout"):
+            if only_prefix and not str(key).startswith(only_prefix):
+                continue
             if key in keep_bps or key in comps:
                 continue
             if not dry_run:

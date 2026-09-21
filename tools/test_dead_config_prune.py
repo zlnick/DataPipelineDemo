@@ -53,8 +53,9 @@ def main() -> int:
         native.set("__no_such_component__", "^demo.Config", "bp_target", FAKE["bp_target"])
         native.set("{}", "^demo.Config", "sql2fhir", "layout", FAKE["layout"])
 
-        # dry_run：只报不删
-        dry = prune_stale_bp_config(set(), set(), dry_run=True)["removed"]
+        # dry_run：只报不删（⚠ 沙箱化：only_prefix 限定只处理自造键，避免顺带清掉环境里的真实死键）
+        dry = prune_stale_bp_config(set(), set(), dry_run=True,
+                                    only_prefix="__dead_test_")["removed"]
         check("dry_run 报出 bp 死键", FAKE["bp"] in (dry.get("bp") or []), json.dumps(dry)[:200])
         check("dry_run 报出 bp_target 死键",
               FAKE["bp_target"] in [x.get("key") for x in (dry.get("bp_target") or [])])
@@ -66,8 +67,9 @@ def main() -> int:
               and not (set(dry.get("layout") or []) & live_ly)
               and not ({x.get("key") for x in (dry.get("bp_target") or [])} & live_bt))
 
-        # apply：只删死键
-        res = prune_stale_bp_config(set(), set(), dry_run=False)["removed"]
+        # apply：只删死键（同样限定前缀 → **不改动环境里其它真实死键**，2026-09-21 沙箱化）
+        res = prune_stale_bp_config(set(), set(), dry_run=False,
+                                    only_prefix="__dead_test_")["removed"]
         check("apply 删掉 bp 死键", FAKE["bp"] not in _config_subs(native, "bp"))
         check("apply 删掉 bp_target 死键", FAKE["bp_target"] not in _config_subs(native, "bp_target"))
         check("apply 删掉 layout 死键", FAKE["layout"] not in _config_subs(native, "sql2fhir", "layout"))
@@ -78,7 +80,8 @@ def main() -> int:
               native.get("^demo.Config", "sql2fhir", "layout") == global_layout)
 
         # 幂等
-        again = prune_stale_bp_config(set(), set(), dry_run=False)["removed"]
+        again = prune_stale_bp_config(set(), set(), dry_run=False,
+                                      only_prefix="__dead_test_")["removed"]
         check("幂等：再跑无死键", not any(again.get(k) for k in ("bp", "bp_target", "layout")),
               json.dumps(again)[:200])
         print("  apply/again:", json.dumps({"apply": res, "again": again}, ensure_ascii=False)[:300])
