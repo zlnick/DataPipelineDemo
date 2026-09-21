@@ -187,7 +187,9 @@ def check_file(rel, cond, msg):
 
 
 cls = _src("iris/src/demo/TransformProcess.cls") or ""
-pipe = _src("backend/routes/pipelines.py") or ""
+# 「生成编排」已在 Step 4 迁到 services/pipeline_generate.py：正文断言查两文件合并文本
+pipe = ((_src("backend/routes/pipelines.py") or "")
+        + (_src("backend/services/pipeline_generate.py") or ""))
 tv = _src("backend/services/transformation_validator.py") or ""
 
 check_file("iris/src/demo/TransformProcess.cls",
@@ -195,9 +197,11 @@ check_file("iris/src/demo/TransformProcess.cls",
            "D1 引擎用 schema 声明的 system_from_row，且**不再**硬编码取源行 CodeSystem")
 check_file("iris/src/demo/TransformProcess.cls", lambda t: "tFromRow" in t,
            "D2 引擎实现里 tFromRow 变量在位")
-check("mappings=mappings_effective, source_id=source_id" in pipe
-      and pipe.count("fhir_schema_facts") >= 2, "D3 单/多管道生成都传 mappings+source_id")
-check("field_terms" in pipe and "_c1_assets" in pipe, "D4 C1 资产输入带 field_terms 事实")
+check('source_id=next((_g.get("source_id")' in pipe
+      and pipe.count("fhir_schema_facts") >= 2,
+      "D3 生成期 FHIR 事实注入传 mappings+source_id（唯一调用点 = 多管道路径）")
+check("field_terms" in pipe and "c1_assets" in pipe,
+      "D4 C1 资产输入带 field_terms 事实（c1_assets，Step 2 迁出后仍在链上）")
 check("coded_text_gap" in tv and "_text" in tv, "D5 C1 提示词含 coded_text_gap 修法（文本列）")
 for col in ("type_text", "reason_text", "route_text"):
     check(col in _src("backend/services/fhir_target_model.py"),
