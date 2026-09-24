@@ -31,15 +31,20 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -n "$ADD_NAME" ]; then
-  [ -f "$TOOLS/$ADD_NAME" ] || { echo "❌ tools/$ADD_NAME 不存在"; exit 2; }
+  if [ ! -f "$TOOLS/$ADD_NAME" ] && [ ! -f "$REPO/$ADD_NAME" ]; then
+    echo "❌ tools/$ADD_NAME 与仓库根 $ADD_NAME 都不存在"; exit 2
+  fi
   case "$ADD_TO" in host|container) ;; *) echo "❌ --to 必须是 host 或 container"; exit 2 ;; esac
-  cp -f "$TOOLS/$ADD_NAME" "$HERE/$ADD_TO/$ADD_NAME"
+  _src="$TOOLS/$ADD_NAME"
+  [ -f "$_src" ] || _src="$REPO/$ADD_NAME"
+  cp -f "$_src" "$HERE/$ADD_TO/$ADD_NAME"
   echo "✅ 已登记并复制：$ADD_NAME → tools/datakit/$ADD_TO/"
   exit 0
 fi
 
 updated=0; same=0; missing=0; orphan=0
-for src in "$TOOLS"/*.py; do
+# 权威脚本来源 = tools/ 下的全部 .py + **仓库根**的 .py（AGENTS.md 口径："权威版本在仓库 tools/（少数在仓库根）"）
+for src in "$TOOLS"/*.py "$REPO"/*.py; do
   [ -e "$src" ] || continue
   name="$(basename "$src")"
   found=""
@@ -64,7 +69,7 @@ for d in host container; do
   for dst in "$HERE/$d"/*.py; do
     [ -e "$dst" ] || continue
     name="$(basename "$dst")"
-    if [ ! -f "$TOOLS/$name" ]; then
+    if [ ! -f "$TOOLS/$name" ] && [ ! -f "$REPO/$name" ]; then
       orphan=$((orphan + 1))
       echo "  ⚠ 孤儿副本（tools/ 已无对应脚本）：$d/$name"
     fi
