@@ -16,6 +16,7 @@ fi
 
 echo "== 1/5 拉取 termsrv 子模块（术语服务器构建源；缺它 iris-terminology 构建失败）=="
 if [ -f termsrv/iris/Dockerfile ]; then echo "  已就绪"; else git submodule update --init --recursive; fi
+if [ -f tools/termsrv_apply_patches.sh ]; then bash tools/termsrv_apply_patches.sh; fi
 
 echo "== 2/5 准备 .env（LLM key 可选：不填也能起，AI 功能显式报错）=="
 if [ -f .env ]; then echo "  已存在"; else cp .env.example .env && echo "  已生成"; fi

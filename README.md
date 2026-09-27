@@ -177,6 +177,9 @@ Production 拓扑并交给 IRIS 编译启动。
 >      容器**重建后**重跑 `python3 tools/term_map_seed.py` 重新播种映射，
 >      或用 `bash tools/termsrv_load.sh` 把平台扩展类**热加载**进运行中的容器（不重建、不丢数据）；
 >      原始术语素材在 `data/terms-inbox/`（`nrdl.tsv` / `cbih.tsv` / `icd10_main.csv`）。
+>      另：成品**映射种子**（`data/seeds/term_map_seed.json`，81 条）由 `tools/setup.sh` 自动导入（`tools/term_map_sync.py import`）；
+>      术语服务器的平台扩展（`/mapping/*` 路由 + `CodeMap` 表）由 `termsrv-patches/` 覆盖进子模块（`tools/termsrv_apply_patches.sh`，幂等）——
+>      因此 clone 后术语转换即可用，不依赖子模块远端是否已含这两个文件。
 > 2. **JDBC 驱动 jar：一条命令搞定，无需去官网下载**。backend 的"数据源连通测试 / 选 schema·表 / 分析列 /
 >    DB 元数据发现"走 **JayDeBeApi + JPype**，需要 `intersystems-jdbc-*.jar`（InterSystems 专有件，**不入版本库**）；
 >    但 **IRIS 官方镜像自带该驱动**，故提供一键提取脚本：
