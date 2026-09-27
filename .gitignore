@@ -35,7 +35,12 @@ docs/
 
 # 个人知识库软链（不纳入版本库）
 knowledge
-data/embedding-model/
+data/embedding-model/*
+!data/embedding-model/.gitkeep
+
+# 术语服务器数据目录（IRIS 数据库本体不入库，仅保留目录占位）
+data/iris-terminology/*
+!data/iris-terminology/.gitkeep
 
 # RxNorm 向量化中间产物与日志（可随时重新生成，不纳入版本库）
 data/rxnorm_vec_*.jsonl

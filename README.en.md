@@ -205,7 +205,7 @@ Prerequisites: Docker + Docker Compose.
 >    **downloads it automatically from ModelScope** on first start (`Qwen/Qwen3-Embedding-0.6B`, needs network).
 
 ```bash
-cp .env.example .env   # then fill LLM_BASE_URL / LLM_API_KEY / LLM_MODEL
+bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + terminology-seed import + health check
 docker compose up -d   # first run builds images & initializes FHIR Server + target tables
 http://localhost       # Chinese UI (default)   |   http://localhost/en  # English UI
 ```

@@ -1,0 +1,1 @@
+# 占位：确保目录在 clone 后即存在（embedding 模型下载卷 bind-mount 目标）

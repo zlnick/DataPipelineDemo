@@ -191,7 +191,7 @@ Production 拓扑并交给 IRIS 编译启动。
 
 ```bash
 # 1. 配置 LLM（AI 推荐功能；不配则 AI 接口返回明确提示）
-cp .env.example .env
+bash tools/setup.sh        # 一条命令：子模块 + .env + data 目录 + 构建启动 + JDBC 提取 + 术语映射种子导入 + 健康检查
 # 编辑 .env：填写 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL（任意 OpenAI 兼容服务）
 
 # 2. 一键启动全部服务（首次会自动构建镜像、初始化 FHIR Server 与目标表）
