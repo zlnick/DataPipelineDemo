@@ -177,6 +177,9 @@ Prerequisites: Docker + Docker Compose.
 >    branch `demo-community`), and the `iris-terminology` container **is built from it**:
 >    - Clone with submodules: `git clone --recurse-submodules https://github.com/zlnick/DataPipelineDemo.git`
 >    - Already cloned without it? `git submodule update --init --recursive`
+>      ⚠ If it fails with Unable to find current revision in submodule path termsrv, the submodule repo
+>      (zlnick/iris-terminology-server, branch demo-community) is either not public yet, or that branch has not
+>      received the commit recorded here. Self-check: git ls-remote <submodule-url> refs/heads/demo-community
 >      (without the submodule the `iris-terminology` build fails; the main platform still runs, but
 >      terminology degrades to "keep source coding + `meta.tag=urn:cn-nhsa:term-map|unmapped`",
 >      and tools such as `term_map_build.py` are unavailable)

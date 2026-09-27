@@ -165,6 +165,9 @@ Production 拓扑并交给 IRIS 编译启动。
 >    `iris-terminology` 容器**就是由它构建**的：
 >    - 克隆时带上子模块：`git clone --recurse-submodules https://github.com/zlnick/DataPipelineDemo.git`
 >    - 已克隆但忘了：`git submodule update --init --recursive`
+>      ⚠ 若报 Unable to find current revision in submodule path termsrv，说明子模块仓库
+>      （zlnick/iris-terminology-server，分支 demo-community）要么尚未公开、要么该分支还没收到父仓库记录的提交。
+>      可自查：git ls-remote <子模块地址> refs/heads/demo-community
 >      （缺子模块时 `iris-terminology` **构建失败**；平台主体仍能跑，但术语能力降级为
 >      "保留源编码 + `meta.tag=urn:cn-nhsa:term-map|unmapped`"，`term_map_build.py` 等工具不可用）
 >    - **构建方式**：compose 里该服务为 `build: context: ./termsrv`（`termsrv/iris/Dockerfile`）→
