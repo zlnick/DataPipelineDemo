@@ -160,6 +160,14 @@ Production 拓扑并交给 IRIS 编译启动。
 
 > **新环境前置（克隆到其它机器时必看）**
 >
+> 0. **IRIS 镜像来自 InterSystems 容器仓库（需免费账号）**：`irishealth-community` 不托管在 Docker Hub，
+>    需先在 <https://containers.intersystems.com> 注册（免费）并登录：
+>    ```bash
+>    docker login containers.intersystems.com   # 用户名/密码 = 注册邮箱/密码
+>    ```
+>    未登录时 `docker compose up` 拉镜像会失败（镜像分发受 InterSystems 许可约束，本仓库不转存）。
+>    另请预留 **≈ 20 GB 磁盘**与耐心：**首次**构建/初始化约 **20–40 分钟**（含 embedding 首次下载安装 torch
+>    与本地向量模型；后续构建走缓存会快很多）。
 > 1. **子模块依赖：术语服务器是独立项目**。`termsrv` 以 **git submodule** 引入
 >    （[`zlnick/iris-terminology-server`](https://github.com/zlnick/iris-terminology-server)，分支 `demo-community`），
 >    `iris-terminology` 容器**就是由它构建**的：
@@ -173,9 +181,10 @@ Production 拓扑并交给 IRIS 编译启动。
 >    - **构建方式**：compose 里该服务为 `build: context: ./termsrv`（`termsrv/iris/Dockerfile`）→
 >      `docker compose up -d` 会**自动构建**；也可单独构建/重建：
 >      `docker compose build iris-terminology && docker compose up -d iris-terminology`
->    - **术语数据**放在**独立数据目录** `./data/iris-terminology`（与演示程序主体互不影响）：
->      容器**重建后**重跑 `python3 tools/term_map_seed.py` 重新播种映射，
->      或用 `bash tools/termsrv_load.sh` 把平台扩展类**热加载**进运行中的容器（不重建、不丢数据）；
+>    - **术语服务器的数据目录是 `./data/iris-terminology`，但映射（`/mapping/*`）实际存在容器内部 DB**：
+>      **容器一旦重建，映射即丢失**（重跑 `bash tools/term_map_import.sh`，等价 `python3 tools/term_map_sync.py import`；
+>      `setup.sh` 已含此步且幂等）。`tools/term_map_seed.py` 是 seed **生成器**，不是导入器。
+>      不重建、只想更新平台扩展类时，用 `bash tools/termsrv_load.sh` **热加载**（不丢数据）；
 >      原始术语素材（ICD-10 / NRDL / CBIH，版权敏感）**不随仓库分发**；成品映射种子见 data/seeds/。
 >      另：成品**映射种子**（`data/seeds/term_map_seed.json`，81 条）由 `tools/setup.sh` 自动导入（`tools/term_map_sync.py import`）；
 >      术语服务器的平台扩展（`/mapping/*` 路由 + `CodeMap` 表）由 `termsrv-patches/` 覆盖进子模块（`tools/termsrv_apply_patches.sh`，幂等）——
@@ -194,6 +203,8 @@ Production 拓扑并交给 IRIS 编译启动。
 >    （不填则 AI 功能**显式报错**、不静默降级；平台仍可启动）。
 > 4. `data/embedding-model`（本地向量模型）**无需手工准备**：embedding 容器首次启动会
 >    **自动从 ModelScope 下载**（`Qwen/Qwen3-Embedding-0.6B`，需网络）。
+> 5. **网络不稳可直接重跑** `bash tools/setup.sh`（**幂等**：子模块 / `.env` / data 目录 / 构建 / 种子
+>    都会跳过已完成项）；子模块因网络中断拉取失败时，重跑即可恢复。
 
 ```bash
 # 1. 配置 LLM（AI 推荐功能；不配则 AI 接口返回明确提示）

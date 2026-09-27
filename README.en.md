@@ -172,6 +172,17 @@ Prerequisites: Docker + Docker Compose.
 
 > **New-environment prerequisites (read this when cloning onto another machine)**
 >
+> 0. **The IRIS image comes from the InterSystems container registry (free account required).**
+>    `irishealth-community` is not hosted on Docker Hub; register (free) at
+>    <https://containers.intersystems.com> and log in first:
+>    ```bash
+>    docker login containers.intersystems.com   # username/password = the ones you registered
+>    ```
+>    Without login, `docker compose up` fails to pull the image (image distribution is bound by the
+>    InterSystems license; this repo does not redistribute it).
+>    Also allow **≈ 20 GB of disk** and some patience: the **first** build/init takes **20–40 minutes**
+>    (the embedding container downloads and installs torch plus the local model on first start; later builds
+>    hit the build cache).
 > 1. **Submodule dependency — the terminology server is a separate project.** `termsrv` is pulled in as a
 >    **git submodule** ([`zlnick/iris-terminology-server`](https://github.com/zlnick/iris-terminology-server),
 >    branch `demo-community`), and the `iris-terminology` container **is built from it**:
@@ -186,10 +197,13 @@ Prerequisites: Docker + Docker Compose.
 >    - **How it is built**: the compose service uses `build: context: ./termsrv` (`termsrv/iris/Dockerfile`),
 >      so `docker compose up -d` **builds it automatically**; to build/rebuild it alone:
 >      `docker compose build iris-terminology && docker compose up -d iris-terminology`
->    - **Terminology data** lives in its **own data directory** `./data/iris-terminology` (independent from the
->      demo platform): after a container rebuild, re-seed with `python3 tools/term_map_seed.py`, or hot-load the
->      platform extension classes into the running container with `bash tools/termsrv_load.sh` (no rebuild, no data
->      loss). Raw terminology material (ICD-10 / NRDL / CBIH, license-sensitive) is **not** shipped in this repo; a derived mapping seed ships in data/seeds/.
+>    - **The terminology server keeps its data directory at `./data/iris-terminology`, but the mappings
+>      (`/mapping/*`) actually live in a DB *inside* the container**: rebuilding the container **loses them** —
+>      re-import with `bash tools/term_map_import.sh` (same as `python3 tools/term_map_sync.py import`;
+>      `setup.sh` already does this, idempotently). `tools/term_map_seed.py` is the seed **generator**, not an
+>      importer. To only refresh the platform extension classes without a rebuild, hot-load with
+>      `bash tools/termsrv_load.sh` (no data loss). Raw terminology material (ICD-10 / NRDL / CBIH,
+>      license-sensitive) is **not** shipped in this repo; a derived mapping seed ships in data/seeds/.
 >      Also: a ready-made **mapping seed** (`data/seeds/term_map_seed.json`, 81 mappings) is imported
 >      automatically by `tools/setup.sh` (`tools/term_map_sync.py import`); the terminology server platform
 >      extensions (`/mapping/*` routes + `CodeMap`) are overlaid from `termsrv-patches/` (idempotent), so
@@ -210,6 +224,9 @@ Prerequisites: Docker + Docker Compose.
 >    (without it AI features fail **explicitly** rather than silently degrading; the platform still starts).
 > 4. `data/embedding-model` (local embedding model) needs **no manual step**: the embedding container
 >    **downloads it automatically from ModelScope** on first start (`Qwen/Qwen3-Embedding-0.6B`, needs network).
+> 5. **On a flaky network, just re-run** `bash tools/setup.sh` — it is **idempotent** (submodule / `.env` /
+>    data dirs / build / seed import all skip what is already done); if the submodule fetch was interrupted,
+>    re-running recovers it.
 
 ```bash
 bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + terminology-seed import + health check
