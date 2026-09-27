@@ -176,7 +176,7 @@ Production 拓扑并交给 IRIS 编译启动。
 >    - **术语数据**放在**独立数据目录** `./data/iris-terminology`（与演示程序主体互不影响）：
 >      容器**重建后**重跑 `python3 tools/term_map_seed.py` 重新播种映射，
 >      或用 `bash tools/termsrv_load.sh` 把平台扩展类**热加载**进运行中的容器（不重建、不丢数据）；
->      原始术语素材在 `data/terms-inbox/`（`nrdl.tsv` / `cbih.tsv` / `icd10_main.csv`）。
+>      原始术语素材（ICD-10 / NRDL / CBIH，版权敏感）**不随仓库分发**；成品映射种子见 data/seeds/。
 >      另：成品**映射种子**（`data/seeds/term_map_seed.json`，81 条）由 `tools/setup.sh` 自动导入（`tools/term_map_sync.py import`）；
 >      术语服务器的平台扩展（`/mapping/*` 路由 + `CodeMap` 表）由 `termsrv-patches/` 覆盖进子模块（`tools/termsrv_apply_patches.sh`，幂等）——
 >      因此 clone 后术语转换即可用，不依赖子模块远端是否已含这两个文件。
@@ -397,3 +397,7 @@ LLM_MODEL=deepseek-chat                        # 模型名
   `note.fields.provenance` 与 UI「运行契约」列可见；有了真实数据后下次分析会自动改用真实数据形态。
   造数仍可选（真实数据形态最准）：`bash tools/datakit/run.sh seed_fhir_demo.py`。
 - **注意：不要修改 IRIS 的 Web Application / Security 权限**（管理门户与 Ensemble 门户依赖，属外部环境）。
+
+## 许可
+
+Apache-2.0 —— 见 `LICENSE`；`NOTICE` 列明商标归属与**不随仓库分发**的组件（JDBC 驱动、原始术语数据、termsrv 子模块）。

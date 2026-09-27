@@ -189,7 +189,7 @@ Prerequisites: Docker + Docker Compose.
 >    - **Terminology data** lives in its **own data directory** `./data/iris-terminology` (independent from the
 >      demo platform): after a container rebuild, re-seed with `python3 tools/term_map_seed.py`, or hot-load the
 >      platform extension classes into the running container with `bash tools/termsrv_load.sh` (no rebuild, no data
->      loss). Raw terminology material ships in `data/terms-inbox/` (`nrdl.tsv` / `cbih.tsv` / `icd10_main.csv`).
+>      loss). Raw terminology material (ICD-10 / NRDL / CBIH, license-sensitive) is **not** shipped in this repo; a derived mapping seed ships in data/seeds/.
 >      Also: a ready-made **mapping seed** (`data/seeds/term_map_seed.json`, 81 mappings) is imported
 >      automatically by `tools/setup.sh` (`tools/term_map_sync.py import`); the terminology server platform
 >      extensions (`/mapping/*` routes + `CodeMap`) are overlaid from `termsrv-patches/` (idempotent), so
@@ -395,3 +395,7 @@ See [`tools/guard/README.md`](tools/guard/README.md) for the full design, verifi
   listed in `disabled_others`).
 - **Component fidelity self-check**: `python3 tools/check_component_fidelity.py`; toolbox index:
   `bash tools/datakit/run.sh list` (includes `test_incremental_pipeline.py` and data-generation scripts).
+
+## License
+
+Apache-2.0 - see `LICENSE`; `NOTICE` lists trademarks and the components that are **not** distributed (JDBC driver, raw terminology data, termsrv submodule).

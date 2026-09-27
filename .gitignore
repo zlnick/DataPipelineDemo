@@ -54,3 +54,17 @@ tools/datakit/container/
 # 后台进程 / 重定向日志（不纳入版本库）
 nohup.out
 *.out
+
+# ===== 暴露治理（2026-09-27）=====
+# 以下为开发/内部产物：不随公开仓库分发（本地保留，仅移出版本控制）
+AGENTS.md
+WORKLOG.md
+.clinerules/
+.vscode/
+export_validation_issues.py
+run_rxnorm_vec.sh
+
+# 版权敏感的原始术语数据（不随仓库分发；成品映射种子见 data/seeds/）
+data/terms-inbox/*
+!data/terms-inbox/.gitkeep
+data/testsets/

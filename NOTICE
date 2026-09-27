@@ -1,0 +1,13 @@
+DataPipelineDemo — AI-Driven Data Automation Demo
+Copyright 2026 zlnick
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository is a demonstration project; it is NOT an official InterSystems product.
+"InterSystems", "IRIS" and "IRIS for Health" are trademarks of InterSystems Corporation;
+this project references them for identification only and claims no trademark rights.
+
+Third-party / not distributed here:
+- termsrv/ (submodule) is a fork of iris-terminology-server: see that repo for its own license/attribution.
+- The InterSystems JDBC driver is not distributed (tools/fetch_jdbc_jar.sh extracts it from the official image).
+- Raw Chinese terminology material (ICD-10 / NRDL / CBIH) is not distributed; a derived mapping seed ships in data/seeds/.
