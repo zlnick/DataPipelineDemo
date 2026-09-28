@@ -199,9 +199,19 @@ else
   echo "  [!!] 门户仍未就绪：看 $httpd_logs/error.log 与 $data_dir/mgr/messages.log"
 fi
 
-# 7b. 生成物目录：平台把 Agent 生成的 BP 源码写到 $ISC_DATA_DIRECTORY/generated
-#     全新环境（尤其命名卷）默认没有这个目录 —— 显式建出来，避免 reset_ui_env 自检出现假红 ❌。
-mkdir -p "$data_dir/generated" 2>/dev/null && echo "  生成物目录就绪：$data_dir/generated"
+# 7b. 生成物目录：平台把 Agent 生成的 BP / Production 源码写到 **/dur/generated**
+#     （= compose 里 /dur 挂载（或命名卷）根下的 generated；平台侧是**硬编码**路径：
+#       iris/src/demo/PipelineGenerator.cls:71 `Set tDir = "/dur/generated"`、
+#       PipelineQuery.cls:352 `/dur/generated/<短名>.cls`、backend/services/generated_bp.py）
+#     ⚠ 不是 $ISC_DATA_DIRECTORY/generated！2026-09-28 全新实例端到端实测：
+#       只建 $ISC_DATA_DIRECTORY/generated（= /dur/irissys/generated）时，生成管道会报
+#         ERROR #5007: Directory name '/dur/generated/' is invalid  → BP 源码写不进去 → HTTP 500
+#       （随后补建 /dur/generated 并重试，生成即成功、Production 起来、FHIR 落地
+#         Patient=3/Encounter=4/Condition=7/MedicationRequest=7）
+#     属主必须是 irisowner：IRIS 以该用户运行，要能在该目录里创建 .cls 文件。
+mkdir -p /dur/generated 2>/dev/null
+chown irisowner:irisowner /dur/generated 2>/dev/null || true
+echo "  生成物目录就绪：/dur/generated"
 
 
 echo "=== [setup] IRIS 初始化完成 ==="
