@@ -371,6 +371,8 @@ LLM_MODEL=deepseek-chat                        # 模型名
 > **共享 BO**（`demo.TerminologyOperation`）实时查询——**没有本地缓存要预热**，重置后术语映射天然就位；
 > 若某个源编码服务器尚无映射，平台**默认降级**（保留源编码 + `meta.tag=unmapped`，不静默、不阻断），
 > 补录：`bash tools/datakit/run.sh term_map_build.py`（判定 Agent 产出候选并写回服务器，补录后**无需重新生成**）。
+> **CLINIC 演示数据**（界面「生成演示数据」按钮 / `tools/seed_clinic.py`）：**需先登记一个 SQL 数据源**
+> （演示默认 = `CLINIC` 命名空间，见 §B 第 1 步），否则脚本会给出明确指引（而不是抛 IndexError）。
 
 ### A. FHIR → DB（数据源 = FHIR 资源）
 1. **添加 FHIR 数据源**：「数据源管理」→ 端点**默认已填** `http://iris:52773/csp/healthshare/demofhir/fhir/r4/`（DemoFHIR = 默认 FHIR 源仓库）、认证 `superuser/SYS` → 注册 → **Profile 分析**（自动产出运行契约：版本/增量能力/健康）。

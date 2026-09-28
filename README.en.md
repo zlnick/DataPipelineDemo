@@ -338,6 +338,10 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
 ```
 ## Demo Walkthrough (start from a blank state)
 
+> **CLINIC demo data** (the UI "generate demo data" button / `tools/seed_clinic.py`): you must **register a SQL
+> data source first** (the demo default is the `CLINIC` namespace — see §B step 1). Without one the script now
+> prints a clear hint instead of failing with an `IndexError`.
+
 ### A. FHIR → DB
 1. **Add FHIR source** (Data Sources): the endpoint is **pre-filled** with
    `http://iris:52773/csp/healthshare/demofhir/fhir/r4/` (DemoFHIR = default FHIR source repository),
