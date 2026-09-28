@@ -250,6 +250,7 @@ docker compose down -v
 | 7 | **术语概念灌库** | ICD-10 **20,484** 条 + 药品 NRDL **3,919** / CBIH **19** 条 → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
 | 8 | **术语映射种子** | `data/seeds/term_map_seed.json` **81 条** → 术语服务器映射表（术语转换的事实源） |
 | 9 | 等待就绪 + 健康检查 | 有界等待 backend 200 → 打印 `backend / frontend / terminology` 三项 |
+| 10 | **私有 Web 服务器自愈**（`iris/setup.sh` 第 7 步） | 把 httpd 的 `PidFile` 指到容器内 `/tmp/httpd.pid`（绕开 Windows 绑定挂载上 `rename` 被拒的坑），必要时拉起 httpd 并核验门户 **52773** |
 
 **初始化后的状态（全新环境）**：4 个容器 Up；`http://localhost` 是**空白演示态**（无数据源/目标/映射/管道）；
 术语服务器已有**概念 + 映射**（供术语转换与造数用）；`/api/pipelines/status` 为 `running:false`（尚未生成管道）。
@@ -555,6 +556,15 @@ LLM_MODEL=deepseek-chat                        # 模型名
   **平台 FHIR 规范快照**（US Core 已建模 11 类）→ **AI 按 R4 规范补全**（其余类型）」，来源在运行契约
   `note.fields.provenance` 与 UI「运行契约」列可见；有了真实数据后下次分析会自动改用真实数据形态。
   造数仍可选（真实数据形态最准）：`bash tools/datakit/run.sh seed_fhir_demo.py`。
+- **管理门户 / FHIR 端点打不开（52773 无响应）—— Windows + Docker Desktop 已知坑，已自动兜住**：IRIS 的私有 Web 服务器
+  把 pid 文件写在 `$ISC_DATA_DIRECTORY`（即 `./data/iris` **绑定挂载**）里；Apache 建 pid 要做
+  `open(tmp) → write → rename`，而 Docker Desktop 的文件共享层在部分情形下对新建文件的 `rename`/`chmod`
+  返回 `EPERM`（`httpd/logs/error.log: AH10231 Failed creating pid file`）→ httpd 静默退出 ⇒
+  **门户与 FHIR 端点全部无响应**（`curl` 空响应 / exit 52），而容器健康检查（进程级）仍报 healthy —— 属静默失效。
+  `iris/setup.sh` 第 7 步已幂等修正（`PidFile /tmp/httpd.pid` + 必要时拉起 httpd + 核验 52773），
+  容器每次启动都自动生效；原因、规避原理与手工修法见该步骤注释。
+  ⚠ 另：**容器重启后** Docker Desktop 的宿主端口转发可能需数十秒才重建，期间宿主 `curl` 会短暂 000，
+  稍等再试即可（容器内是立即就绪的）。
 - **注意：不要修改 IRIS 的 Web Application / Security 权限**（管理门户与 Ensemble 门户依赖，属外部环境）。
 
 ## 许可

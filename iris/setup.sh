@@ -134,4 +134,62 @@ if found=0 { set c = ##class(%SQLConnection).%New() set c.Name = "CLINIC" set c.
 halt
 EOF
 
+# 7. 确保私有 Web 服务器（管理门户 / FHIR 端点，端口 52773）可用
+# 背景（Windows + Docker Desktop 实测，2026-09-28）：
+#   ISC_DATA_DIRECTORY 重定位后，IRIS 生成的 httpd 配置里 `PidFile` 指向
+#   $ISC_DATA_DIRECTORY/httpd/logs/httpd.pid —— 该路径落在 **Windows 绑定挂载**（./data/iris:/dur）上。
+#   Apache 建 pid 文件要 `open(tmp) → write → rename(tmp, httpd.pid)`，而 Docker Desktop 的文件共享层
+#   在部分情形下对**新建文件的 rename/chmod** 返回 EPERM（error.log：`AH10231: Failed creating pid file`）
+#   → httpd 直接退出 ⇒ 门户与 FHIR 端点全部无响应（curl 报空响应 / exit 52），
+#   而 IRIS 只在 messages.log 记一条 `Private web server has not started after 5 seconds.` ——
+#   容器的健康检查（ISCAgent/进程级）仍报 healthy，属**静默失效**，因此必须在这里显式兜住。
+#   实测：同一环境 09-27 17:53 能起来、09-28 09:35/09:43 起不来（挂载层行为不稳定）；
+#   且镜像内 /usr/irissys/httpd/logs 是 555（改指那里会 `AH00099 Permission denied`）
+#   ⇒ 唯一稳妥落点 = 容器内真实文件系统的 /tmp（1777，任何用户可写）。
+# 修法（幂等两步）：
+#   ① 把 conf 的 PidFile 改成 /tmp/httpd.pid（**就地写**，不能用 sed -i —— 它靠 rename，会在同一挂载上踩同样的坑）；
+#   ② 门户没在监听时，按 IRIS 自己的命令行把 httpd 拉起并等待就绪（首次启动即自愈；之后由 IRIS 自己启动）。
+# 说明：ErrorLog 仍留在 $ISC_DATA_DIRECTORY（追加写不受影响，门户里可查看该日志）。
+echo "=== [setup] 确保私有 Web 服务器（管理门户 52773）可用 ==="
+data_dir="${ISC_DATA_DIRECTORY:-/usr/irissys}"
+httpd_conf="$data_dir/httpd/conf/httpd.conf"
+httpd_logs="$data_dir/httpd/logs"
+
+# 门户存活探测：容器内无 curl，用 python3 做 TCP 探测（能连上即视为已监听）
+portal_ok() {
+  python3 -c "import socket;socket.create_connection(('127.0.0.1',52773),5).close()" 2>/dev/null
+}
+
+if [ -f "$httpd_conf" ] && ! grep -q '^PidFile /tmp/httpd.pid' "$httpd_conf"; then
+  if awk '{ if ($0 ~ /^PidFile[ \t]/) print "PidFile /tmp/httpd.pid"; else print $0 }' \
+        "$httpd_conf" > /tmp/httpd.conf.new; then
+    cat /tmp/httpd.conf.new > "$httpd_conf"     # 就地覆盖（不 rename，避开挂载层 EPERM）
+    rm -f /tmp/httpd.conf.new
+    echo "  已把 PidFile 指向 /tmp/httpd.pid（避开绑定挂载上 rename 被拒的问题）"
+  fi
+else
+  [ -f "$httpd_conf" ] && echo "  PidFile 已是 /tmp/httpd.pid（无需改动）"
+fi
+
+if portal_ok; then
+  echo "  门户已在监听（IRIS 已自行启动私有 Web 服务器）"
+else
+  echo "  门户未监听 → 拉起私有 Web 服务器（首次启动自愈路径）"
+  mkdir -p "$httpd_logs" 2>/dev/null || true
+  /usr/irissys/httpd/bin/httpd -f "$httpd_conf" -d /usr/irissys/httpd \
+      -c "Listen 52773" >>"$httpd_logs/httpderr" 2>&1 || true
+  i=0
+  while [ "$i" -lt 12 ] && ! portal_ok; do
+    sleep 5
+    i=$((i + 1))
+  done
+fi
+
+if portal_ok; then
+  echo "  ✓ 门户就绪：http://localhost:52773/csp/sys/UtilHome.csp（superuser / SYS）"
+else
+  echo "  [!!] 门户仍未就绪：看 $httpd_logs/error.log 与 $data_dir/mgr/messages.log"
+fi
+
+
 echo "=== [setup] IRIS 初始化完成 ==="

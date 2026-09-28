@@ -264,6 +264,7 @@ Stop: `docker compose down` (add `-v` to also wipe the IRIS data directory).
 | 7 | **Load terminology concepts** | ICD-10 **20,484** + drugs NRDL **3,919** / CBIH **19** → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
 | 8 | **Load the mapping seed** | `data/seeds/term_map_seed.json` **81 entries** → the terminology server's mapping table (source of truth) |
 | 9 | Wait for readiness + health check | Bounded wait for backend 200 → prints `backend / frontend / terminology` |
+| 10 | **Private web server self-healing** (`iris/setup.sh` step 7) | Points httpd's `PidFile` at `/tmp/httpd.pid` inside the container (avoiding `rename` being rejected on Windows bind mounts), starts httpd when needed, and verifies the portal on **52773** |
 
 **State after initialization (fresh environment)**: 4 containers up; `http://localhost` shows a **blank demo state**
 (no data sources / targets / mappings / pipelines); the terminology server already holds **concepts + mappings**;
@@ -575,6 +576,16 @@ See [`tools/guard/README.md`](tools/guard/README.md) for the full design, verifi
   pipelines cannot run at the same time — extra groups are generated as `suspended`; use the **enable / disable**
   buttons on the "Pipelines" card for one-click switching (units are freed by disabling other active pipelines,
   listed in `disabled_others`).
+- **Portal / FHIR endpoints unreachable (52773 does not respond) — known Windows + Docker Desktop pitfall, handled automatically**:
+  the IRIS private web server writes its pid file under `$ISC_DATA_DIRECTORY` (i.e. the `./data/iris` **bind mount**);
+  Apache creates it via `open(tmp) → write → rename`, and Docker Desktop's file-sharing layer can reject the
+  `rename`/`chmod` of a freshly created file with `EPERM` (`httpd/logs/error.log: AH10231 Failed creating pid file`)
+  → httpd exits silently, so **the portal and every FHIR endpoint stop responding** (`curl` empty reply / exit 52)
+  while the container health check (process-level) still reports healthy — a silent failure.
+  `iris/setup.sh` step 7 fixes it idempotently (`PidFile /tmp/httpd.pid`, start httpd if needed, verify 52773) and
+  applies on every container start; see that step's comments for the cause and the manual workaround.
+  ⚠ Also: **after a container restart** Docker Desktop may take tens of seconds to re-establish host port
+  forwarding — host `curl` can briefly return 000, just retry (inside the container it is ready immediately).
 - **Component fidelity self-check**: `python3 tools/check_component_fidelity.py`; toolbox index:
   `bash tools/datakit/run.sh list` (includes `test_incremental_pipeline.py` and data-generation scripts).
 
