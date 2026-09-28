@@ -281,11 +281,12 @@ mv data/iris data/iris.bak-$(date +%Y%m%d)  # then: docker compose up -d
 | 3 | Create `data/` subdirs | `data/iris`, `data/iris-terminology`, `data/terms-inbox`, `data/embedding-model` |
 | 4 | Build & start containers | **4 by default**: `iris`, `backend`, `frontend`, `iris-terminology` (add `--with-embedding` to include embedding) |
 | 4b | **Windows: use a named volume for the IRIS data dir** (`docker-compose.windows.yml`, enabled automatically by `setup.sh`) | On Windows/WSL `/dur` moves from the `./data/iris` bind mount to the named volume `dataflow-iris-dur` (created + chowned to irisowner). Reason: bind mounts through Docker Desktop's file-sharing layer make `chown`/`rename` unreliable, so IRIS's first-boot "move data directory" fails with `EPERM` → container exits (1); a named volume is real ext4 inside the VM and removes this whole class of problems |
+| 4c | **Wait for core services** (bounded) | Wait for IRIS/backend first (`--wait 300/180`) **before** the table/terminology loads below — a fresh instance's first FHIR initialization often exceeds 180s, which previously made `clinic_init` / `term_data_load` report a false `Access Denied` |
 | 5 | Extract the JDBC driver | One command copies `intersystems-jdbc-*.jar` out of the IRIS image into `./jdbc/` (no downloads) |
-| 6 | **Create CLINIC source tables** | `Patient/Encounter/Diagnosis/MedicationOrder` — **idempotent** (create-only-if-missing, never drops data); the first install waits for IRIS to become ready (~1–2 min) |
+| 6 | **Create CLINIC source tables** | `Patient/Encounter/Diagnosis/MedicationOrder` — **idempotent** (create-only-if-missing, never drops data; step 4c already waited for IRIS) |
 | 7 | **Load terminology concepts** | ICD-10 **20,484** + drugs NRDL **3,919** / CBIH **19** → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
 | 8 | **Load the mapping seed** | `data/seeds/term_map_seed.json` **81 entries** → the terminology server's mapping table (source of truth) |
-| 9 | Wait for readiness + health check | Bounded wait for backend 200 → prints `backend / frontend / terminology` |
+| 9 | Health check | Prints `backend / frontend / terminology` (best-effort probing, never a hard failure) |
 | 10 | **Private web server self-healing** (`iris/setup.sh` step 7) | Points httpd's `PidFile` at `/tmp/httpd.pid` inside the container (avoiding `rename` being rejected on Windows bind mounts), starts httpd when needed, and verifies the portal on **52773** |
 
 **State after initialization (fresh environment)**: 4 containers up; `http://localhost` shows a **blank demo state**
@@ -339,6 +340,8 @@ and `http://localhost:52774/csp/sys/UtilHome.csp` (management portal).
 1. **Runtime terminology conversion**: the shared BO `demo.TerminologyOperation` queries `/mapping/lookup` **live** —
    there is **no local cache to warm up**. If a mapping is missing the platform **degrades explicitly** (keeps the
    source code + `meta.tag=…|unmapped`): never silent, never blocking — back-fill below.
+   (This BO and its message classes `TermLookupRequest`/`TermLookupResponse` are part of `iris/setup.sh`'s compile
+   list, so a **fresh instance can generate pipelines right away** — no `<CLASS DOES NOT EXIST> … demo.TerminologyOperation`.)
 2. **CLINIC seeding** (the UI "generate demo data" button): reads the **concept tables** for Chinese names.
 3. **AI code mapping (C3 / C3-Dx)**: at generation / back-fill time: **vector recall Top-K** → LLM verdict → write back.
 

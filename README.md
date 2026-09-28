@@ -260,11 +260,12 @@ mv data/iris data/iris.bak-$(date +%Y%m%d)   # 之后 docker compose up -d
 | 3 | 建 `data/` 子目录 | `data/iris`、`data/iris-terminology`、`data/terms-inbox`、`data/embedding-model` |
 | 4 | 构建并启动容器 | 默认 **4 个**：`iris`、`backend`、`frontend`、`iris-terminology`（加 `--with-embedding` 才含 embedding） |
 | 4b | **Windows：IRIS 数据目录改用命名卷**（`docker-compose.windows.yml`，`setup.sh` 自动启用） | Windows/WSL 下把 `/dur` 从 `./data/iris` 绑定挂载换成命名卷 `dataflow-iris-dur`（建卷 + 卷根属主改 irisowner）。理由：绑定挂载经 Docker Desktop 文件共享层时 `chown`/`rename` 不可靠，会让 IRIS 首次「搬迁数据目录」`EPERM` → 容器 Exited(1)；命名卷是 VM 内真实 ext4，从根上消除该类问题 |
+| 4c | **等待核心服务就绪**（有界） | 先等 IRIS/backend 就绪（`--wait 300/180`）**再做**后续建表 / 灌库 —— 全新实例首次 FHIR 初始化常 >180s，先等可避免 `clinic_init` / `term_data_load` 误报 `Access Denied` |
 | 5 | 提取 JDBC 驱动 | 从 IRIS 镜像一条命令取 `intersystems-jdbc-*.jar` → `./jdbc/`（无需官网下载） |
-| 6 | **CLINIC 源库建表** | `Patient/Encounter/Diagnosis/MedicationOrder`——**幂等**（缺表才建、不动数据）；首次安装会等 IRIS 就绪（约 1~2 分钟） |
+| 6 | **CLINIC 源库建表** | `Patient/Encounter/Diagnosis/MedicationOrder`——**幂等**（缺表才建、不动数据；其前的 4c 已等 IRIS 就绪） |
 | 7 | **术语概念灌库** | ICD-10 **20,484** 条 + 药品 NRDL **3,919** / CBIH **19** 条 → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
 | 8 | **术语映射种子** | `data/seeds/term_map_seed.json` **81 条** → 术语服务器映射表（术语转换的事实源） |
-| 9 | 等待就绪 + 健康检查 | 有界等待 backend 200 → 打印 `backend / frontend / terminology` 三项 |
+| 9 | 健康检查 | 打印 `backend / frontend / terminology` 三项（尽力探测，不强制失败） |
 | 10 | **私有 Web 服务器自愈**（`iris/setup.sh` 第 7 步） | 把 httpd 的 `PidFile` 指到容器内 `/tmp/httpd.pid`（绕开 Windows 绑定挂载上 `rename` 被拒的坑），必要时拉起 httpd 并核验门户 **52773** |
 
 **初始化后的状态（全新环境）**：4 个容器 Up；`http://localhost` 是**空白演示态**（无数据源/目标/映射/管道）；
@@ -316,6 +317,8 @@ CLINIC 四表由 backend 启动时**自动兜底检查**（缺表补建，不删
 
 1. **运行期术语转换**：共享 BO `demo.TerminologyOperation` **实时**查 `/mapping/lookup` —— **没有本地缓存要预热**；
    服务器缺该映射时**默认降级**（保留源编码 + `meta.tag=…|unmapped`，不静默、不阻断）；补录见下。
+   （该 BO 及其消息类 `TermLookupRequest`/`TermLookupResponse` 已在 `iris/setup.sh` 的编译清单中
+   ⇒ **全新实例可直接生成管道**，不会出现 `<CLASS DOES NOT EXIST> … demo.TerminologyOperation`。）
 2. **CLINIC 造数**（界面「生成演示数据」）：读**概念表**取中文诊断/药品名。
 3. **AI 判码（C3 / C3-Dx）**：生成期或补录时经**向量召回 Top-K** → LLM 判定 → 写回映射（见下一章）。
 
