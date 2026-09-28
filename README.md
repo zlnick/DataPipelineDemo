@@ -156,7 +156,7 @@ Production 拓扑并交给 IRIS 编译启动。
 
 ## 快速启动
 
-前置条件：已安装 Docker 与 Docker Compose。
+前置条件：已安装 Docker 与 Docker Compose（Windows 建议 WSL2 + Docker Desktop；仓库统一 **LF** —— 见下方前置 7）。
 
 > **新环境前置（克隆到其它机器时必看）**
 >
@@ -192,12 +192,10 @@ Production 拓扑并交给 IRIS 编译启动。
 >      CLINIC 演示源库（SQL 源）四表 Patient/Encounter/Diagnosis/MedicationOrder 由
 >      `bash tools/clinic_init.sh` **幂等建表**（缺表才建、不动已有数据；`setup.sh` 已含此步，
 >      backend 启动时也会兜底检查）——缺表时 CLINIC 四表的 SQL 源 BS 会报错、「生成演示数据」也会失败。
-> 6. **术语向量化（可选，默认不做）**：`setup.sh` **不需要向量**（术语转换只用成品映射；默认**跳过 `embedding` 容器**，
->    省首次 ~1.1 GB 模型下载与构建时间）。想试验"向量化 / 语义检索 / AI 补录映射"的读者 →
->    见独立章节 **[术语向量化（可选，独立测试）](#术语向量化可选独立测试)**。
 >      另：成品**映射种子**（`data/seeds/term_map_seed.json`，81 条）由 `tools/setup.sh` 自动导入（`tools/term_map_sync.py import`）；
 >      术语服务器的平台扩展（`/mapping/*` 路由 + `CodeMap` 表）由 `termsrv-patches/` 覆盖进子模块（`tools/termsrv_apply_patches.sh`，幂等）——
 >      因此 clone 后术语转换即可用，不依赖子模块远端是否已含这两个文件。
+
 > 2. **JDBC 驱动 jar：一条命令搞定，无需去官网下载**。backend 的"数据源连通测试 / 选 schema·表 / 分析列 /
 >    DB 元数据发现"走 **JayDeBeApi + JPype**，需要 `intersystems-jdbc-*.jar`（InterSystems 专有件，**不入版本库**）；
 >    但 **IRIS 官方镜像自带该驱动**，故提供一键提取脚本：
@@ -214,6 +212,15 @@ Production 拓扑并交给 IRIS 编译启动。
 >    **自动从 ModelScope 下载**（`Qwen/Qwen3-Embedding-0.6B`，需网络）。
 > 5. **网络不稳可直接重跑** `bash tools/setup.sh`（**幂等**：子模块 / `.env` / data 目录 / 构建 / 种子
 >    都会跳过已完成项）；子模块因网络中断拉取失败时，重跑即可恢复。
+> 6. **术语向量化（可选，默认不做）**：`setup.sh` **不需要向量**（术语转换只用成品映射；默认**跳过 `embedding` 容器**，
+>    省首次 ~1.1 GB 模型下载与构建时间）。想试验"向量化 / 语义检索 / AI 补录映射"的读者 →
+>    见独立章节 **[术语向量化（可选，独立测试）](#术语向量化可选独立测试)**。
+> 7. **跨平台换行符（统一 LF）**：仓库根有 `.gitattributes`（`* text=auto eol=lf`；
+>    `*.sh/*.bash/*.cls/Dockerfile` 与 `*.csv/*.tsv` 显式 `eol=lf`；`*.jar/*.zip/图片/字体/xlsx/pdf` 按二进制），
+>    **所有文件都以 LF 存储并检出**。Windows（Git for Windows 默认 `core.autocrlf=true`）若检出成 CRLF，会出现：
+>    - 容器内脚本找不到：`sh: 1: /shared/setup.sh: not found`（IRIS）、`exec /app/entrypoint.sh: no such file or directory`（embedding）
+>    - 宿主 bash 立即失败：`set: pipefail: invalid option name`
+>    处理：`git config --global core.autocrlf false` 后**重新 clone**（或 `git checkout -- .` 让 `.gitattributes` 生效）。
 
 ```bash
 # 1. 配置 LLM（AI 推荐功能；不配则 AI 接口返回明确提示）

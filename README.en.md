@@ -168,7 +168,7 @@ design the Production topology and hand it to IRIS to compile and start.
 
 ## Quick Start
 
-Prerequisites: Docker + Docker Compose.
+Prerequisites: Docker + Docker Compose (Windows: WSL2 + Docker Desktop recommended; the repo enforces **LF** — see prerequisite 7 below).
 
 > **New-environment prerequisites (read this when cloning onto another machine)**
 >
@@ -212,14 +212,11 @@ Prerequisites: Docker + Docker Compose.
 >      **idempotently** by `bash tools/clinic_init.sh` (create-only-if-missing, never drops data;
 >      `setup.sh` runs it, and the backend also re-checks on startup) — without them the CLINIC SQL-source
 >      service errors out and the "generate demo data" button fails.
-> 6. **Terminology vectorization (optional, off by default).** `setup.sh` **needs no vectors** (conversion only
->    uses the prepared mappings; the `embedding` container is **skipped by default**, saving the ~1.1 GB
->    first-run model download). To try vectorization / semantic search / AI mapping back-fill yourself, see the
->    standalone section **[Terminology Vectorization (optional, standalone test)](#terminology-vectorization-optional-standalone-test)**.
 >      Also: a ready-made **mapping seed** (`data/seeds/term_map_seed.json`, 81 mappings) is imported
 >      automatically by `tools/setup.sh` (`tools/term_map_sync.py import`); the terminology server platform
 >      extensions (`/mapping/*` routes + `CodeMap`) are overlaid from `termsrv-patches/` (idempotent), so
 >      terminology conversion works right after cloning regardless of the submodule remote state.
+
 > 2. **JDBC driver jar — one command, no download.** The backend's "test connection / pick schema & tables /
 >    analyze columns / DB metadata discovery" uses **JayDeBeApi + JPype** and needs `intersystems-jdbc-*.jar`
 >    (a proprietary InterSystems artifact, **not committed to this repo**). The **official IRIS image already
@@ -239,6 +236,18 @@ Prerequisites: Docker + Docker Compose.
 > 5. **On a flaky network, just re-run** `bash tools/setup.sh` — it is **idempotent** (submodule / `.env` /
 >    data dirs / build / seed import all skip what is already done); if the submodule fetch was interrupted,
 >    re-running recovers it.
+> 6. **Terminology vectorization (optional, off by default).** `setup.sh` **needs no vectors** (conversion only
+>    uses the prepared mappings; the `embedding` container is **skipped by default**, saving the ~1.1 GB
+>    first-run model download). To try vectorization / semantic search / AI mapping back-fill yourself, see the
+>    standalone section **[Terminology Vectorization (optional, standalone test)](#terminology-vectorization-optional-standalone-test)**.
+> 7. **Cross-platform line endings (LF everywhere)**: `.gitattributes` at the repo root enforces
+>    `* text=auto eol=lf` (explicit `eol=lf` for `*.sh/*.bash/*.cls/Dockerfile` and `*.csv/*.tsv`;
+>    `*.jar/*.zip/images/fonts/xlsx/pdf` are treated as binary). Windows users (Git for Windows defaults to
+>    `core.autocrlf=true`) can end up with CRLF checkouts, which break things such as:
+>    - scripts inside containers: `sh: 1: /shared/setup.sh: not found` (IRIS),
+>      `exec /app/entrypoint.sh: no such file or directory` (embedding)
+>    - host bash: `set: pipefail: invalid option name`
+>    Fix: `git config --global core.autocrlf false` and **re-clone** (or `git checkout -- .` so `.gitattributes` applies).
 
 ```bash
 bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + CLINIC source-table init + terminology concept load + mapping-seed import + health check
