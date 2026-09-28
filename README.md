@@ -192,20 +192,9 @@ Production 拓扑并交给 IRIS 编译启动。
 >      CLINIC 演示源库（SQL 源）四表 Patient/Encounter/Diagnosis/MedicationOrder 由
 >      `bash tools/clinic_init.sh` **幂等建表**（缺表才建、不动已有数据；`setup.sh` 已含此步，
 >      backend 启动时也会兜底检查）——缺表时 CLINIC 四表的 SQL 源 BS 会报错、「生成演示数据」也会失败。
-> 6. **术语向量化（可选，默认不做）**：演示的术语转换只用**成品映射**（`data/seeds/term_map_seed.json`，
->    `setup.sh` 自动导入），**不需要向量**；因此 `setup.sh` 默认**跳过 `embedding` 容器**
->    （省首次 ~1.1 GB 模型下载与构建时间）。想试验"术语向量化 / 语义检索 / AI 补录映射"的读者：
->    ```bash
->    docker compose up -d embedding            # ① 本地向量服务（Qwen3-Embedding-0.6B，首次自动下载）
->    bash tools/termsrv_vector_init.sh        # ② 查看向量能力状态（表开箱就绪；缺表会自动补建）
->    python3 tools/dx_vectorize.py --zh        # ③ 例：中文 ICD-10 全量向量化（~2 万条；也可用 tools/term_embed.py）
->    curl -u superuser:SYS 'http://localhost:52774/terminology/vector/search?q=阿司匹林'   # ④ 语义检索验证
->    ```
->    （实测：向量表 `Terminology_Vector.TermEmbedding` 与 `/terminology/vector/search` **开箱可用**，
->    默认只是没有数据；写入向量后即可语义检索 —— 此前"向量模块被关闭"的初判不成立，已按实测更正。）
->    完整链路（向量召回 → LLM 判码 → 写回映射）：`python3 tools/term_map_build.py`；
->    RxNorm 全量向量化运维脚本：`run_rxnorm_vec.sh`（需自备 RxNorm 原始数据）。
->    说明：向量数据约 **200 MB+**，不适合入库，请按需自行生成。
+> 6. **术语向量化（可选，默认不做）**：`setup.sh` **不需要向量**（术语转换只用成品映射；默认**跳过 `embedding` 容器**，
+>    省首次 ~1.1 GB 模型下载与构建时间）。想试验"向量化 / 语义检索 / AI 补录映射"的读者 →
+>    见独立章节 **[术语向量化（可选，独立测试）](#术语向量化可选独立测试)**。
 >      另：成品**映射种子**（`data/seeds/term_map_seed.json`，81 条）由 `tools/setup.sh` 自动导入（`tools/term_map_sync.py import`）；
 >      术语服务器的平台扩展（`/mapping/*` 路由 + `CodeMap` 表）由 `termsrv-patches/` 覆盖进子模块（`tools/termsrv_apply_patches.sh`，幂等）——
 >      因此 clone 后术语转换即可用，不依赖子模块远端是否已含这两个文件。
@@ -245,6 +234,139 @@ docker compose down
 # 如需同时清除 IRIS 数据目录（含 FHIR 数据与目标表）：
 docker compose down -v
 ```
+
+## 演示环境初始化（`bash tools/setup.sh` 做了什么）
+
+> 目标：**一条命令**把「从零 clone」变成「可演示」。默认**不做**任何向量化（演示不需要，初始化更快）。
+
+| 步骤 | 动作 | 结果 / 说明 |
+|---|---|---|
+| 1 | 拉 `termsrv` 子模块 + 应用 `termsrv-patches/` overlay | 术语服务器构建源就位；overlay 幂等（`applied=0` = 已是新版） |
+| 2 | 准备 `.env`（缺则从 `.env.example` 复制） | **AI 功能需填 `LLM_*`**；不填则 AI 接口显式报错，平台仍可启动 |
+| 3 | 建 `data/` 子目录 | `data/iris`、`data/iris-terminology`、`data/terms-inbox`、`data/embedding-model` |
+| 4 | 构建并启动容器 | 默认 **4 个**：`iris`、`backend`、`frontend`、`iris-terminology`（加 `--with-embedding` 才含 embedding） |
+| 5 | 提取 JDBC 驱动 | 从 IRIS 镜像一条命令取 `intersystems-jdbc-*.jar` → `./jdbc/`（无需官网下载） |
+| 6 | **CLINIC 源库建表** | `Patient/Encounter/Diagnosis/MedicationOrder`——**幂等**（缺表才建、不动数据）；首次安装会等 IRIS 就绪（约 1~2 分钟） |
+| 7 | **术语概念灌库** | ICD-10 **20,484** 条 + 药品 NRDL **3,919** / CBIH **19** 条 → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
+| 8 | **术语映射种子** | `data/seeds/term_map_seed.json` **81 条** → 术语服务器映射表（术语转换的事实源） |
+| 9 | 等待就绪 + 健康检查 | 有界等待 backend 200 → 打印 `backend / frontend / terminology` 三项 |
+
+**初始化后的状态（全新环境）**：4 个容器 Up；`http://localhost` 是**空白演示态**（无数据源/目标/映射/管道）；
+术语服务器已有**概念 + 映射**（供术语转换与造数用）；`/api/pipelines/status` 为 `running:false`（尚未生成管道）。
+
+**常用参数**
+
+| 命令 | 作用 |
+|---|---|
+| `bash tools/setup.sh` | 全流程（**默认跳过 embedding**） |
+| `bash tools/setup.sh --with-embedding` | 一并构建/启动 embedding（做术语向量化试验时才需要） |
+| `bash tools/setup.sh --check` | **只读体检**：子模块 / `.env` / JDBC / docker |
+| `bash tools/setup.sh --help` | 用法 |
+
+**⚠ 容器重建后需要重灌**：术语**概念**与**映射**都存在于 `iris-terminology` **容器内部 DB**，容器重建即丢 →
+重跑 `bash tools/term_data_load.sh`（概念）+ `bash tools/term_map_import.sh`（映射），或直接重跑 `bash tools/setup.sh`（幂等，两步都含）。
+CLINIC 四表由 backend 启动时**自动兜底检查**（缺表补建，不删数据）。
+
+
+
+## 术语服务器（`iris-terminology`）——它做什么、平台怎么用它
+
+**定位**：独立容器（fork 自 `iris-terminology-server` 的裁剪版；宿主端口 **52774**→52773、**51774**→1972，凭据 `superuser / SYS`），做两件事：
+① **术语存储 + 检索/校验**（CodeSystem / ValueSet）；② **术语转换映射的事实源**（`/mapping/*`）。
+**转换/映射的判定**由平台 AI Skill（C3 药品 / C3-Dx 诊断）负责，不在术语服务器做。
+
+**网页入口**：`http://localhost:52774/terminology/` →「术语服务器 · 术语集」清单页（概念数 / 向量数 / 端点）；
+管理门户：`http://localhost:52774/csp/sys/UtilHome.csp`。
+
+**内置术语集**（`GET /terminology/systems`）
+
+| id | 内容 | 平台用途 |
+|---|---|---|
+| `chinese-icd10` | 国标 ICD-10（GB/T 14396-2016，中文） | CLINIC 造数取**中文诊断名** |
+| `chinese-drugs` | 中文药品目录（医保 NRDL + 商保 CBIH） | CLINIC 造数取**中文药品名** |
+| `rxnorm` | RxNorm（IN/SCD/BN） | 术语转换的**目标体系**（药品） |
+| `snomed-uscore` | SNOMED CT（US Core Condition 样本） | 术语转换的**目标体系**（诊断） |
+
+**REST 能力（节选）**
+
+| 类别 | 端点 |
+|---|---|
+| 术语检索 / 校验 | `/terminology/icd10/{search,lookup,validate-code}`、`/terminology/icd/{…}`、`/terminology/drug/{search,lookup,validate-code,codesystems}`、`/terminology/rxnorm/{search,lookup,validate-code,chinese-map}`、`/terminology/snomed/*`、`/terminology/loinc/*`、`/terminology/uscore-condition/*` |
+| **转换映射**（平台运行期使用） | `GET /terminology/mapping/lookup?sourceSystem=&targetSystem=&sourceCode=`、`GET /terminology/mapping/systems`（按体系对统计）、`POST /terminology/mapping/entries`（批量幂等 upsert） |
+| 向量 | `GET /terminology/vector/search?q=&systemUri=&limit=`、`/terminology/vector/crosswalk`（见下一章） |
+| FHIR 术语面 | `/terminology/fhir/r4`（`CodeSystem/$lookup`、`$validate-code`、`$subsumes`、`ValueSet/$expand`） |
+
+**平台在哪些环节用它**
+
+1. **运行期术语转换**：共享 BO `demo.TerminologyOperation` **实时**查 `/mapping/lookup` —— **没有本地缓存要预热**；
+   服务器缺该映射时**默认降级**（保留源编码 + `meta.tag=…|unmapped`，不静默、不阻断）；补录见下。
+2. **CLINIC 造数**（界面「生成演示数据」）：读**概念表**取中文诊断/药品名。
+3. **AI 判码（C3 / C3-Dx）**：生成期或补录时经**向量召回 Top-K** → LLM 判定 → 写回映射（见下一章）。
+
+**数据面（哪些自动、哪些要自己做）**
+
+| 表 | 内容 | 由谁灌入 |
+|---|---|---|
+| `Terminology_Icd10.Concept` / `Terminology_Drug.Code` | 术语概念 | **`setup.sh` 自动**（`tools/term_data_load.sh`） |
+| `Terminology_Mapping.CodeMap` | 转换映射（事实源） | **`setup.sh` 自动**（`tools/term_map_import.sh`，81 条种子） |
+| `Terminology_Vector.TermEmbedding` | 术语向量 | **需自行生成**（见下一章；演示不需要） |
+
+**常用运维命令**
+
+| 命令 | 作用 |
+|---|---|
+| `bash tools/term_data_load.sh` | 幂等灌术语概念（素材随仓库分发） |
+| `bash tools/term_map_import.sh` | 幂等灌映射种子（81 条） |
+| `bash tools/termsrv_vector_init.sh [--check]` | 查看**向量能力**状态（缺表自动补建）+ 打印向量化步骤 |
+| `bash tools/termsrv_apply_patches.sh` | 把平台扩展（`/mapping/*` + `CodeMap`）覆盖进子模块（幂等） |
+| `bash tools/termsrv_load.sh` | 不重建容器，热加载平台扩展类进运行中的容器 |
+| `python3 tools/term_map_build.py [--dry] [--limit N]` | AI 补录缺失映射（向量召回 → LLM 判码 → 写回服务器） |
+
+## 术语向量化（可选，**独立测试**；演示不需要）
+
+**它是干什么用的**：向量化服务于**术语映射的生产**，不是演示运行期。
+中文诊断/药品名与英文 SNOMED/RxNorm **没有直接码表**，AI 判码（C3 / C3-Dx）必须先用**语义相似**召回 Top-5~6 候选，
+再交 LLM 判定 → 写回术语服务器。本仓库已把**成品映射（81 条）**随仓库分发，因此**演示开箱即用，无需跑向量化**。
+
+**前置条件（三项已就绪）**
+
+| 条件 | 说明 |
+|---|---|
+| 术语服务器**向量表** | `Terminology_Vector.TermEmbedding` —— **开箱存在**（列 `ID/Code/Embedding/Lang/Model/ReleaseId/SystemUri/Text`），默认 **0 行**；若缺表，`termsrv_vector_init.sh` 会编译类自动补建 |
+| 本地 **embedding 服务** | `docker compose up -d embedding`（Qwen3-Embedding-0.6B，首次自动下载 ~1.1 GB）；术语服务器经 `^Config("Vector","EmbeddingHost")`（默认 `embedding:8000`）访问它 |
+| **概念数据**（向量的输入） | 中文 ICD-10 / 药品概念由 `setup.sh` 自动灌入 ✓ |
+
+**独立测试步骤（本项目实测通过）**
+
+```bash
+# ① 起本地向量服务（首次下载模型，需几分钟；可 `docker logs -f dataflow-embedding` 观察）
+docker compose up -d embedding
+
+# ② 检查向量能力：表存在性 / 行数 / 按体系分组（缺表会自动编译类补建）
+bash tools/termsrv_vector_init.sh
+
+# ③ 生成向量（任选其一）
+python3 tools/dx_vectorize.py --zh                  # 中文 ICD-10 全量（~2 万条；约 10~20 条/秒）
+python3 tools/term_embed.py --system <uri> --tsv <file.tsv>   # 任意术语集（TSV）
+bash run_rxnorm_vec.sh                              # RxNorm 全量（2.6 万条；**需自备 RxNorm 原始数据**，含 OOM/过热自愈 + 断点续传）
+
+# ④ 语义检索验证（应返回带 score 的候选）
+curl -u superuser:SYS 'http://localhost:52774/terminology/vector/search?q=阿司匹林&limit=3'
+
+# ⑤ 完整链路：向量召回 → LLM 判码 → 写回映射（需配好 .env 的 LLM key）
+python3 tools/term_map_build.py --dry        # 先看缺哪些映射（不调 LLM、不写入）
+python3 tools/term_map_build.py --limit 5    # 补录 5 条
+```
+
+**实测参考（2026-09-27）**：embedding 维度 **1024**；写入 2 条后
+`vector/search?q=阿司匹林` → 命中 `阿司匹林 score 1.0024`、`复方硼砂 score 0.5708` ✓
+
+**注意事项**
+
+- **数据量级**：ICD-10 全量 ≈ **1.9 万向量**、RxNorm SCD/SBD/IN ≈ **3 万向量**（合计 **200 MB+**）⇒ **不宜入库**，请按需自行生成。
+- **资源**：embedding 与 IRIS 同跑可能 OOM / 宿主过热 → 建议限核（~8 核）并分批（`run_rxnorm_vec.sh` 已内置续传与自愈）。
+- **不想要时可随时停**：`docker compose stop embedding` —— 平台与演示**完全不受影响**（没有任何服务依赖它）。
+- 演示只读**成品映射**：`data/seeds/term_map_seed.json`（`setup.sh` 自动导入）。
 
 ## AI 操作边界（2026-09-14：保留限制，简化机制）
 
@@ -373,6 +495,10 @@ LLM_MODEL=deepseek-chat                        # 模型名
 > 补录：`bash tools/datakit/run.sh term_map_build.py`（判定 Agent 产出候选并写回服务器，补录后**无需重新生成**）。
 > **CLINIC 演示数据**（界面「生成演示数据」按钮 / `tools/seed_clinic.py`）：**需先登记一个 SQL 数据源**
 > （演示默认 = `CLINIC` 命名空间，见 §B 第 1 步），否则脚本会给出明确指引（而不是抛 IndexError）。
+
+**最短端到端路径**（约 10 分钟）：① 登记 SQL 数据源（演示默认 `CLINIC` 命名空间）→ ② 点「**生成演示数据**」→
+③ 登记 DB 目标（`jdbc:IRIS://iris:1972/USER`，写 `Patient`/`Observation`）→ ④「**AI 智能匹配**」确认字段映射 →
+⑤「管道监控」**生成管道** → ⑥ 目标数据下拉查看**落库行 / 消息 Completed**。
 
 ### A. FHIR → DB（数据源 = FHIR 资源）
 1. **添加 FHIR 数据源**：「数据源管理」→ 端点**默认已填** `http://iris:52773/csp/healthshare/demofhir/fhir/r4/`（DemoFHIR = 默认 FHIR 源仓库）、认证 `superuser/SYS` → 注册 → **Profile 分析**（自动产出运行契约：版本/增量能力/健康）。

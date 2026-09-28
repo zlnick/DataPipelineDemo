@@ -212,22 +212,10 @@ Prerequisites: Docker + Docker Compose.
 >      **idempotently** by `bash tools/clinic_init.sh` (create-only-if-missing, never drops data;
 >      `setup.sh` runs it, and the backend also re-checks on startup) — without them the CLINIC SQL-source
 >      service errors out and the "generate demo data" button fails.
-> 6. **Terminology vectorization (optional, off by default).** The demo's terminology conversion uses only the
->    **prepared mappings** (`data/seeds/term_map_seed.json`, imported by `setup.sh`) and **needs no vectors**;
->    therefore `setup.sh` **skips the `embedding` container** by default (saving the ~1.1 GB first-run model
->    download and its build time). If you want to try vectorization / semantic search / AI mapping back-fill:
->    ```bash
->    docker compose up -d embedding            # 1) local embedding service (Qwen3-Embedding-0.6B, auto-downloaded)
->    bash tools/termsrv_vector_init.sh        # 2) check the vector capability (table ships ready; auto-creates if missing)
->    python3 tools/dx_vectorize.py --zh        # 3) e.g. vectorize the Chinese ICD-10 set (~20k rows)
->    curl -u superuser:SYS 'http://localhost:52774/terminology/vector/search?q=阿司匹林'   # 4) semantic search
->    ```
->    (Measured: the vector table `Terminology_Vector.TermEmbedding` and `/terminology/vector/search` **work
->    out of the box** — only the data is absent by default; insert vectors and semantic search works. An earlier
->    "the vector module is disabled" reading was wrong and has been corrected.)
->    Full chain (vector recall → LLM verdict → mapping write-back): `python3 tools/term_map_build.py`;
->    RxNorm full vectorization ops script: `run_rxnorm_vec.sh` (needs your own RxNorm source data).
->    Note: vectors are **200 MB+**, not suitable for the repo — generate them on demand.
+> 6. **Terminology vectorization (optional, off by default).** `setup.sh` **needs no vectors** (conversion only
+>    uses the prepared mappings; the `embedding` container is **skipped by default**, saving the ~1.1 GB
+>    first-run model download). To try vectorization / semantic search / AI mapping back-fill yourself, see the
+>    standalone section **[Terminology Vectorization (optional, standalone test)](#terminology-vectorization-optional-standalone-test)**.
 >      Also: a ready-made **mapping seed** (`data/seeds/term_map_seed.json`, 81 mappings) is imported
 >      automatically by `tools/setup.sh` (`tools/term_map_sync.py import`); the terminology server platform
 >      extensions (`/mapping/*` routes + `CodeMap`) are overlaid from `termsrv-patches/` (idempotent), so
@@ -259,6 +247,150 @@ http://localhost       # Chinese UI (default)   |   http://localhost/en  # Engli
 ```
 
 Stop: `docker compose down` (add `-v` to also wipe the IRIS data directory).
+
+## Demo Environment Initialization (what `bash tools/setup.sh` does)
+
+> Goal: turn a **fresh clone** into a **runnable demo with one command**. No vectorization is done by default
+> (the demo does not need it, and initialization stays fast).
+
+| Step | Action | Result / notes |
+|---|---|---|
+| 1 | Fetch the `termsrv` submodule + apply the `termsrv-patches/` overlay | Build source for the terminology server; the overlay is idempotent (`applied=0` = already current) |
+| 2 | Prepare `.env` (copied from `.env.example` if missing) | **AI features need `LLM_*`**; without it AI endpoints fail explicitly while the platform still runs |
+| 3 | Create `data/` subdirs | `data/iris`, `data/iris-terminology`, `data/terms-inbox`, `data/embedding-model` |
+| 4 | Build & start containers | **4 by default**: `iris`, `backend`, `frontend`, `iris-terminology` (add `--with-embedding` to include embedding) |
+| 5 | Extract the JDBC driver | One command copies `intersystems-jdbc-*.jar` out of the IRIS image into `./jdbc/` (no downloads) |
+| 6 | **Create CLINIC source tables** | `Patient/Encounter/Diagnosis/MedicationOrder` — **idempotent** (create-only-if-missing, never drops data); the first install waits for IRIS to become ready (~1–2 min) |
+| 7 | **Load terminology concepts** | ICD-10 **20,484** + drugs NRDL **3,919** / CBIH **19** → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
+| 8 | **Load the mapping seed** | `data/seeds/term_map_seed.json` **81 entries** → the terminology server's mapping table (source of truth) |
+| 9 | Wait for readiness + health check | Bounded wait for backend 200 → prints `backend / frontend / terminology` |
+
+**State after initialization (fresh environment)**: 4 containers up; `http://localhost` shows a **blank demo state**
+(no data sources / targets / mappings / pipelines); the terminology server already holds **concepts + mappings**;
+`/api/pipelines/status` reports `running:false` (no pipeline generated yet).
+
+**Options**
+
+| Command | Effect |
+|---|---|
+| `bash tools/setup.sh` | Full flow (**skips embedding by default**) |
+| `bash tools/setup.sh --with-embedding` | Also build/start embedding (only needed for vectorization experiments) |
+| `bash tools/setup.sh --check` | **Read-only check**: submodule / `.env` / JDBC / docker |
+| `bash tools/setup.sh --help` | Usage |
+
+**⚠ After a container rebuild you must reload**: terminology **concepts** and **mappings** live in a DB **inside**
+the `iris-terminology` container, so a rebuild loses them → re-run `bash tools/term_data_load.sh` (concepts) +
+`bash tools/term_map_import.sh` (mappings), or simply re-run `bash tools/setup.sh` (idempotent; both steps included).
+The CLINIC tables are re-checked automatically when the backend starts (create-only-if-missing).
+
+## Terminology Server (`iris-terminology`) — what it does, how the platform uses it
+
+**Role**: an independent container (a trimmed fork of `iris-terminology-server`; host ports **52774**→52773,
+**51774**→1972; credentials `superuser / SYS`). It does two things: ① **terminology storage + search/validation**
+(CodeSystem / ValueSet); ② **source of truth for conversion mappings** (`/mapping/*`). The actual **mapping
+decisions** are made by the platform's AI skills (C3 for drugs, C3-Dx for diagnoses) — not here.
+
+**Web entry points**: `http://localhost:52774/terminology/` (catalog page: concepts / vectors / endpoints per code system)
+and `http://localhost:52774/csp/sys/UtilHome.csp` (management portal).
+
+**Built-in code systems** (`GET /terminology/systems`)
+
+| id | Content | Used by the platform for |
+|---|---|---|
+| `chinese-icd10` | GB/T 14396-2016 ICD-10 (Chinese) | Chinese **diagnosis names** in CLINIC seeding |
+| `chinese-drugs` | Chinese drug catalogue (NRDL + CBIH) | Chinese **drug names** in CLINIC seeding |
+| `rxnorm` | RxNorm (IN/SCD/BN) | **target** system for drug mappings |
+| `snomed-uscore` | SNOMED CT (US Core Condition sample) | **target** system for diagnosis mappings |
+
+**REST capabilities (selection)**
+
+| Area | Endpoints |
+|---|---|
+| Search / validate | `/terminology/icd10/{search,lookup,validate-code}`, `/terminology/icd/{…}`, `/terminology/drug/{search,lookup,validate-code,codesystems}`, `/terminology/rxnorm/{search,lookup,validate-code,chinese-map}`, `/terminology/snomed/*`, `/terminology/loinc/*`, `/terminology/uscore-condition/*` |
+| **Mappings** (used at runtime) | `GET /terminology/mapping/lookup?sourceSystem=&targetSystem=&sourceCode=`, `GET /terminology/mapping/systems`, `POST /terminology/mapping/entries` (idempotent bulk upsert) |
+| Vectors | `GET /terminology/vector/search?q=&systemUri=&limit=`, `/terminology/vector/crosswalk` (next section) |
+| FHIR terminology | `/terminology/fhir/r4` (`CodeSystem/$lookup`, `$validate-code`, `$subsumes`, `ValueSet/$expand`) |
+
+**Where the platform uses it**
+
+1. **Runtime terminology conversion**: the shared BO `demo.TerminologyOperation` queries `/mapping/lookup` **live** —
+   there is **no local cache to warm up**. If a mapping is missing the platform **degrades explicitly** (keeps the
+   source code + `meta.tag=…|unmapped`): never silent, never blocking — back-fill below.
+2. **CLINIC seeding** (the UI "generate demo data" button): reads the **concept tables** for Chinese names.
+3. **AI code mapping (C3 / C3-Dx)**: at generation / back-fill time: **vector recall Top-K** → LLM verdict → write back.
+
+**Data (what is automatic vs. what you generate yourself)**
+
+| Table | Content | Loaded by |
+|---|---|---|
+| `Terminology_Icd10.Concept` / `Terminology_Drug.Code` | terminology concepts | **`setup.sh` (automatic)** via `tools/term_data_load.sh` |
+| `Terminology_Mapping.CodeMap` | conversion mappings (source of truth) | **`setup.sh` (automatic)** via `tools/term_map_import.sh` (81-entry seed) |
+| `Terminology_Vector.TermEmbedding` | term vectors | **generate yourself** (next section; not needed by the demo) |
+
+**Operations cheat-sheet**
+
+| Command | Effect |
+|---|---|
+| `bash tools/term_data_load.sh` | idempotent concept load (the material ships with the repo) |
+| `bash tools/term_map_import.sh` | idempotent mapping-seed load (81 entries) |
+| `bash tools/termsrv_vector_init.sh [--check]` | vector-capability status (auto-creates the table if missing) + steps |
+| `bash tools/termsrv_apply_patches.sh` | overlay the platform extensions (`/mapping/*` + `CodeMap`) into the submodule (idempotent) |
+| `bash tools/termsrv_load.sh` | hot-load the extension classes into the running container (no rebuild) |
+| `python3 tools/term_map_build.py [--dry] [--limit N]` | AI back-fill of missing mappings (vector recall → LLM verdict → write back) |
+
+## Terminology Vectorization (optional, **standalone test**; the demo does not need it)
+
+**What it is for**: vectorization serves the **production of terminology mappings**, not the demo runtime.
+Chinese diagnosis/drug names have **no direct code mapping** to English SNOMED/RxNorm, so the AI code-mapping
+skills (C3 / C3-Dx) first need a **semantic recall of Top-5~6 candidates**, which the LLM then judges → written
+back to the terminology server. This repo ships the **prepared mappings (81 entries)**, so the demo works
+out of the box **without** running any vectorization.
+
+**Prerequisites (all three are ready)**
+
+| Requirement | Note |
+|---|---|
+| Terminology server **vector table** | `Terminology_Vector.TermEmbedding` — **exists out of the box** (columns `ID/Code/Embedding/Lang/Model/ReleaseId/SystemUri/Text`), **0 rows** by default; if it is missing, `termsrv_vector_init.sh` compiles the class to create it |
+| Local **embedding service** | `docker compose up -d embedding` (Qwen3-Embedding-0.6B, ~1.1 GB model auto-downloaded on first start); the terminology server reaches it via `^Config("Vector","EmbeddingHost")` (default `embedding:8000`) |
+| **Concept data** (the input) | Chinese ICD-10 / drug concepts, loaded automatically by `setup.sh` ✓ |
+
+**Standalone test procedure (verified in this project)**
+
+```bash
+# 1) start the local embedding service (first run downloads the model; watch with
+#    docker logs -f dataflow-embedding)
+docker compose up -d embedding
+
+# 2) inspect the vector capability: table / row count / per-system counts
+#    (auto-creates the table if missing)
+bash tools/termsrv_vector_init.sh
+
+# 3) generate vectors (pick one)
+python3 tools/dx_vectorize.py --zh                  # full Chinese ICD-10 (~20k rows; ~10-20 rows/s)
+python3 tools/term_embed.py --system <uri> --tsv <file.tsv>   # any code system from a TSV
+bash run_rxnorm_vec.sh                              # full RxNorm (26k rows; needs YOUR OWN RxNorm data;
+                                                    # built-in OOM/overheat self-healing + resume)
+
+# 4) semantic search check (returns candidates with scores)
+curl -u superuser:SYS 'http://localhost:52774/terminology/vector/search?q=阿司匹林&limit=3'
+
+# 5) full chain: vector recall -> LLM verdict -> write back the mapping (needs LLM_* in .env)
+python3 tools/term_map_build.py --dry        # list missing mappings (no LLM calls, no writes)
+python3 tools/term_map_build.py --limit 5    # back-fill 5 entries
+```
+
+**Measured reference (2026-09-27)**: embedding dimension **1024**; after inserting 2 rows,
+`vector/search?q=阿司匹林` returned `阿司匹林 score 1.0024` and `复方硼砂 score 0.5708` ✓
+
+**Notes**
+
+- **Data size**: full ICD-10 ≈ **19k vectors**, RxNorm SCD/SBD/IN ≈ **30k vectors** (**200 MB+** in total) ⇒
+  **not suitable for the repo** — generate them on demand.
+- **Resources**: embedding + IRIS together can OOM / overheat the host → cap the CPU (~8 cores) and run in batches
+  (`run_rxnorm_vec.sh` already does resume + self-healing).
+- **You can stop it anytime**: `docker compose stop embedding` — the platform and the demo are **unaffected**
+  (nothing depends on it).
+- The demo only reads the **prepared mappings**: `data/seeds/term_map_seed.json` (imported by `setup.sh`).
 
 ## Default Endpoints
 
@@ -341,6 +473,11 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
 > **CLINIC demo data** (the UI "generate demo data" button / `tools/seed_clinic.py`): you must **register a SQL
 > data source first** (the demo default is the `CLINIC` namespace — see §B step 1). Without one the script now
 > prints a clear hint instead of failing with an `IndexError`.
+
+**Shortest end-to-end path** (~10 minutes): ① register the SQL source (demo default = the `CLINIC` namespace) →
+② click **"generate demo data"** → ③ register the DB target (`jdbc:IRIS://iris:1972/USER`, tables
+`Patient`/`Observation`) → ④ confirm field mappings via **"AI matching"** → ⑤ **generate the pipeline** in
+"Pipeline Monitor" → ⑥ inspect **landed rows / Completed messages** in the target-data dropdown.
 
 ### A. FHIR → DB
 1. **Add FHIR source** (Data Sources): the endpoint is **pre-filled** with
