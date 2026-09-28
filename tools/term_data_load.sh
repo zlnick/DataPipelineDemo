@@ -24,7 +24,10 @@ echo "== 术语概念导入（ICD-10 诊断 + NRDL/CBIH 药品）=="
 docker compose up -d iris-terminology "$BE" >/dev/null 2>&1 || true
 
 # 素材送进容器：逐文件 cat 注入（比 docker cp 更稳，且不受守卫路径判定影响）
-docker exec -i "$BE" sh -c 'mkdir -p /tmp/terms-inbox'
+# ⚠ 不带 -i 的 exec 不吃 stdin；下面的 `cat > ... < 文件` 自带重定向。
+#   （曾因一句 `docker exec -i ... 'mkdir -p ...'` 没有重定向 stdin，在「后台运行 setup」时无限挂住
+#     —— 2026-09-28 全新实例复验发现，见该日知识库笔记）
+docker exec "$BE" mkdir -p /tmp/terms-inbox
 for f in $FILES; do
   docker exec -i "$BE" sh -c "cat > /tmp/terms-inbox/$f" < "$SRC/$f"
 done
