@@ -231,8 +231,10 @@ http://localhost
 
 ```bash
 docker compose down
-# 如需同时清除 IRIS 数据目录（含 FHIR 数据与目标表）：
-docker compose down -v
+# ⚠ 想清空数据（FHIR 数据 / 目标表 / 数据源·映射·管道登记）**不能用 `down -v`**：
+#   本项目所有卷都是**绑定挂载**（./data/iris 等），`-v` 只删"命名卷"，对数据无效。
+#   正确做法＝删或改名数据目录（建议改名，便于回滚）：
+mv data/iris data/iris.bak-$(date +%Y%m%d)   # 之后 docker compose up -d（首次启动会自动重建实例数据）
 ```
 
 ## 演示环境初始化（`bash tools/setup.sh` 做了什么）
@@ -245,6 +247,7 @@ docker compose down -v
 | 2 | 准备 `.env`（缺则从 `.env.example` 复制） | **AI 功能需填 `LLM_*`**；不填则 AI 接口显式报错，平台仍可启动 |
 | 3 | 建 `data/` 子目录 | `data/iris`、`data/iris-terminology`、`data/terms-inbox`、`data/embedding-model` |
 | 4 | 构建并启动容器 | 默认 **4 个**：`iris`、`backend`、`frontend`、`iris-terminology`（加 `--with-embedding` 才含 embedding） |
+| 4b | **首次启动前置：预建数据目录** | 仅当 `data/iris` 尚无实例时：先以 root 把 `data/iris` 属主改为 irisowner，再以 irisowner 预建 `irissys/` —— Windows/WSL 绑定挂载下 IRIS 首次「搬迁数据目录」要求 irisowner 属主，否则 `chown ... EPERM` → 容器 Exited(1) |
 | 5 | 提取 JDBC 驱动 | 从 IRIS 镜像一条命令取 `intersystems-jdbc-*.jar` → `./jdbc/`（无需官网下载） |
 | 6 | **CLINIC 源库建表** | `Patient/Encounter/Diagnosis/MedicationOrder`——**幂等**（缺表才建、不动数据）；首次安装会等 IRIS 就绪（约 1~2 分钟） |
 | 7 | **术语概念灌库** | ICD-10 **20,484** 条 + 药品 NRDL **3,919** / CBIH **19** 条 → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
@@ -556,6 +559,14 @@ LLM_MODEL=deepseek-chat                        # 模型名
   **平台 FHIR 规范快照**（US Core 已建模 11 类）→ **AI 按 R4 规范补全**（其余类型）」，来源在运行契约
   `note.fields.provenance` 与 UI「运行契约」列可见；有了真实数据后下次分析会自动改用真实数据形态。
   造数仍可选（真实数据形态最准）：`bash tools/datakit/run.sh seed_fhir_demo.py`。
+- **首次启动时 IRIS 起不来（容器 `Exited (1)`）—— Windows/WSL 绑定挂载坑，已自动兜住**：IRIS 以 `irisowner` 身份运行，
+  首次启动要把实例数据"搬迁"进 `$ISC_DATA_DIRECTORY`；而宿主新建的 `./data/iris`（以及容器早期启动创建的其下目录）
+  在容器内被呈现为 `root:root` → 搬迁那步 `chown irisowner:irisowner /dur/irissys/` 报 `EPERM`
+  （`Error while moving data directories ERROR #5001: ... Error:1:`）→ 容器退出、门户/FHIR 全无响应。
+  `tools/setup.sh` 第 4 步已**幂等预建** `data/iris/irissys`（属主 irisowner），使该 chown 退化为"chown 自己的目录"而成功。
+  ⚠ 若你绕过 `setup.sh` 直接 `docker compose up -d` 并在全新数据目录上遇到此错，手动跑这两条一次性命令即可：
+  `docker compose run --rm --no-deps -u 0:0 --entrypoint sh iris -c 'chown irisowner:irisowner /dur'` 与
+  `docker compose run --rm --no-deps -u irisowner --entrypoint sh iris -c 'mkdir -p /dur/irissys && chown irisowner:irisowner /dur/irissys'`。
 - **管理门户 / FHIR 端点打不开（52773 无响应）—— Windows + Docker Desktop 已知坑，已自动兜住**：IRIS 的私有 Web 服务器
   把 pid 文件写在 `$ISC_DATA_DIRECTORY`（即 `./data/iris` **绑定挂载**）里；Apache 建 pid 要做
   `open(tmp) → write → rename`，而 Docker Desktop 的文件共享层在部分情形下对新建文件的 `rename`/`chmod`
