@@ -5,7 +5,25 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source tools/guard/docker_guard.sh >/dev/null 2>&1 || true
 
-if [ "${1:-}" = "--check" ]; then
+# 参数：--check 只读体检；默认**不**构建/启动 embedding（演示不需要术语向量，初始化更快）
+CHECK_ONLY=0
+WITH_EMBEDDING=0
+for arg in "$@"; do
+  case "$arg" in
+    --check)          CHECK_ONLY=1 ;;
+    --with-embedding) WITH_EMBEDDING=1 ;;
+    --no-embedding)   WITH_EMBEDDING=0 ;;
+    -h|--help)
+      echo "用法: bash tools/setup.sh [--check] [--no-embedding|--with-embedding]"
+      echo "  --check           只读体检（不构建、不启动）"
+      echo "  --no-embedding    不构建/启动 embedding 容器（**默认**；演示不需要术语向量）"
+      echo "  --with-embedding  一并构建/启动 embedding（要做术语向量化试验时才需要）"
+      exit 0 ;;
+    *) echo "未知参数: $arg（支持 --check / --no-embedding / --with-embedding）" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$CHECK_ONLY" = "1" ]; then
   echo "== 只读体检 =="
   [ -f termsrv/iris/Dockerfile ] && echo "  ok  submodule" || echo "  !!  submodule 缺失"
   [ -f .env ] && echo "  ok  .env" || echo "  !!  .env 缺失"
@@ -24,10 +42,18 @@ if [ -f .env ]; then echo "  已存在"; else cp .env.example .env && echo "  �
 echo "== 3/5 补 data 子目录占位（卷挂载目标）=="
 mkdir -p data/iris data/iris-terminology data/terms-inbox data/embedding-model
 
-echo "== 4/5 构建并启动全部服务（首次需 InterSystems 容器仓库 IAM 账号拉 irishealth-community 镜像）=="
+echo "== 4/5 构建并启动服务（首次需 InterSystems 容器仓库 IAM 账号拉 irishealth-community 镜像）=="
 docker compose up -d --build iris
 compgen -G "jdbc/intersystems-jdbc-*.jar" >/dev/null 2>&1 && echo "  JDBC 驱动已在，跳过提取" || bash tools/fetch_jdbc_jar.sh
-docker compose up -d --build
+if [ "$WITH_EMBEDDING" = "1" ]; then
+  docker compose up -d --build
+else
+  docker compose up -d --build iris backend frontend iris-terminology
+  echo "  已跳过 embedding 容器（演示不需要术语向量化，初始化更快）"
+  echo "  需要术语向量化 / 语义检索（可选，读者自行试验）时："
+  echo "    ① docker compose up -d embedding          # 本地向量服务（首次自动下载模型，约 1.1GB）"
+  echo "    ② bash tools/termsrv_vector_init.sh       # 查看向量能力状态 + 向量化步骤（表已就绪）"
+fi
 
 echo "== 5/5 演示数据前置（CLINIC 源库表结构 + 术语服务器初始化）=="
 if [ -f tools/clinic_init.sh ]; then

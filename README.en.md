@@ -212,6 +212,22 @@ Prerequisites: Docker + Docker Compose.
 >      **idempotently** by `bash tools/clinic_init.sh` (create-only-if-missing, never drops data;
 >      `setup.sh` runs it, and the backend also re-checks on startup) — without them the CLINIC SQL-source
 >      service errors out and the "generate demo data" button fails.
+> 6. **Terminology vectorization (optional, off by default).** The demo's terminology conversion uses only the
+>    **prepared mappings** (`data/seeds/term_map_seed.json`, imported by `setup.sh`) and **needs no vectors**;
+>    therefore `setup.sh` **skips the `embedding` container** by default (saving the ~1.1 GB first-run model
+>    download and its build time). If you want to try vectorization / semantic search / AI mapping back-fill:
+>    ```bash
+>    docker compose up -d embedding            # 1) local embedding service (Qwen3-Embedding-0.6B, auto-downloaded)
+>    bash tools/termsrv_vector_init.sh        # 2) check the vector capability (table ships ready; auto-creates if missing)
+>    python3 tools/dx_vectorize.py --zh        # 3) e.g. vectorize the Chinese ICD-10 set (~20k rows)
+>    curl -u superuser:SYS 'http://localhost:52774/terminology/vector/search?q=阿司匹林'   # 4) semantic search
+>    ```
+>    (Measured: the vector table `Terminology_Vector.TermEmbedding` and `/terminology/vector/search` **work
+>    out of the box** — only the data is absent by default; insert vectors and semantic search works. An earlier
+>    "the vector module is disabled" reading was wrong and has been corrected.)
+>    Full chain (vector recall → LLM verdict → mapping write-back): `python3 tools/term_map_build.py`;
+>    RxNorm full vectorization ops script: `run_rxnorm_vec.sh` (needs your own RxNorm source data).
+>    Note: vectors are **200 MB+**, not suitable for the repo — generate them on demand.
 >      Also: a ready-made **mapping seed** (`data/seeds/term_map_seed.json`, 81 mappings) is imported
 >      automatically by `tools/setup.sh` (`tools/term_map_sync.py import`); the terminology server platform
 >      extensions (`/mapping/*` routes + `CodeMap`) are overlaid from `termsrv-patches/` (idempotent), so

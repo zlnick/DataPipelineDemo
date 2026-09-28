@@ -55,14 +55,13 @@ tools/datakit/container/
 nohup.out
 *.out
 
-# ===== 暴露治理（2026-09-27）=====
+# ===== 暴露治理（2026-09-27）===== (注：run_rxnorm_vec.sh 已于同日恢复纳入，见 A+B+C 提交)
 # 以下为开发/内部产物：不随公开仓库分发（本地保留，仅移出版本控制）
 AGENTS.md
 WORKLOG.md
 .clinerules/
 .vscode/
 export_validation_issues.py
-run_rxnorm_vec.sh
 
 # 术语素材：**随仓库分发**（2026-09-27 项目所有者决定纳入，用于术语服务器初始化与
 # CLINIC 演示数据生成；来源与条款见 NOTICE）。成品映射种子见 data/seeds/。

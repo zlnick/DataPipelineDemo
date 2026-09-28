@@ -192,6 +192,20 @@ Production 拓扑并交给 IRIS 编译启动。
 >      CLINIC 演示源库（SQL 源）四表 Patient/Encounter/Diagnosis/MedicationOrder 由
 >      `bash tools/clinic_init.sh` **幂等建表**（缺表才建、不动已有数据；`setup.sh` 已含此步，
 >      backend 启动时也会兜底检查）——缺表时 CLINIC 四表的 SQL 源 BS 会报错、「生成演示数据」也会失败。
+> 6. **术语向量化（可选，默认不做）**：演示的术语转换只用**成品映射**（`data/seeds/term_map_seed.json`，
+>    `setup.sh` 自动导入），**不需要向量**；因此 `setup.sh` 默认**跳过 `embedding` 容器**
+>    （省首次 ~1.1 GB 模型下载与构建时间）。想试验"术语向量化 / 语义检索 / AI 补录映射"的读者：
+>    ```bash
+>    docker compose up -d embedding            # ① 本地向量服务（Qwen3-Embedding-0.6B，首次自动下载）
+>    bash tools/termsrv_vector_init.sh        # ② 查看向量能力状态（表开箱就绪；缺表会自动补建）
+>    python3 tools/dx_vectorize.py --zh        # ③ 例：中文 ICD-10 全量向量化（~2 万条；也可用 tools/term_embed.py）
+>    curl -u superuser:SYS 'http://localhost:52774/terminology/vector/search?q=阿司匹林'   # ④ 语义检索验证
+>    ```
+>    （实测：向量表 `Terminology_Vector.TermEmbedding` 与 `/terminology/vector/search` **开箱可用**，
+>    默认只是没有数据；写入向量后即可语义检索 —— 此前"向量模块被关闭"的初判不成立，已按实测更正。）
+>    完整链路（向量召回 → LLM 判码 → 写回映射）：`python3 tools/term_map_build.py`；
+>    RxNorm 全量向量化运维脚本：`run_rxnorm_vec.sh`（需自备 RxNorm 原始数据）。
+>    说明：向量数据约 **200 MB+**，不适合入库，请按需自行生成。
 >      另：成品**映射种子**（`data/seeds/term_map_seed.json`，81 条）由 `tools/setup.sh` 自动导入（`tools/term_map_sync.py import`）；
 >      术语服务器的平台扩展（`/mapping/*` 路由 + `CodeMap` 表）由 `termsrv-patches/` 覆盖进子模块（`tools/termsrv_apply_patches.sh`，幂等）——
 >      因此 clone 后术语转换即可用，不依赖子模块远端是否已含这两个文件。
