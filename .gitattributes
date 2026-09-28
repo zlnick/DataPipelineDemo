@@ -1,0 +1,47 @@
+# =====================================================================
+# 换行符统一策略：仓库内所有文本文件 **LF 存储 + LF 检出**
+# ---------------------------------------------------------------------
+# 为什么必须有这个文件（2026-09-28 两次踩坑实录）：
+#   本仓库大量脚本/源码会被挂载或 COPY 进 Linux 容器执行，例如
+#     - ./iris/setup.sh、./iris/init-password.sh  -> /shared/*.sh（IRIS -a 启动后执行）
+#     - ./iris/src/*.cls、./iris/python/*.py      -> 容器内编译/运行
+#     - ./embedding/entrypoint.sh                 -> 镜像 ENTRYPOINT（构建期 COPY）
+#     - ./tools/*.sh（setup.sh / clinic_init.sh / term_data_load.sh …）-> 宿主 bash 执行
+#   Windows 上 core.autocrlf=true（Git for Windows 默认）会把这些文件检出成 CRLF，后果：
+#     ① 容器里 `#!/bin/sh\r` 找不到解释器：
+#        dataflow-iris      -> sh: 1: /shared/setup.sh: not found（退出码 1）
+#        dataflow-embedding -> exec /app/entrypoint.sh: no such file or directory（退出码 255）
+#     ② 宿主 bash 跑脚本立即失败：`set: pipefail: invalid option name`（\r 被当成选项一部分）
+#   2026-09-28 的教训：本文件若**未纳入版本控制**，一次 git checkout 就会把它清掉，
+#   随后变更过的文件会被重新检出成 CRLF —— 所以本文件必须入库（已提交）。
+# =====================================================================
+* text=auto eol=lf
+
+# 会被直接执行/编译的脚本与源码：任何平台检出都必须是 LF
+*.sh         text eol=lf
+*.bash       text eol=lf
+*.cls        text eol=lf
+*.mac        text eol=lf
+*.inc        text eol=lf
+*.int        text eol=lf
+Dockerfile   text eol=lf
+*.Dockerfile text eol=lf
+*.dockerfile text eol=lf
+
+# 随仓库分发的术语素材（ICD-10 / NRDL / CBIH / US Core 样本）：按文本 LF 处理，
+# 保证 backend（Python csv 读取）与术语服务器灌库结果稳定可复现
+*.csv text eol=lf
+*.tsv text eol=lf
+
+# 明确按二进制处理（不做换行转换）
+*.jar   binary
+*.zip   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.xlsx  binary
+*.pdf   binary
