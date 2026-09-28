@@ -156,7 +156,7 @@ Production 拓扑并交给 IRIS 编译启动。
 
 ## 快速启动
 
-前置条件：已安装 Docker 与 Docker Compose。
+前置条件：已安装 Docker 与 Docker Compose（Windows 建议 WSL2 + Docker Desktop；仓库统一 **LF** —— 见下方前置 7）。
 
 > **新环境前置（克隆到其它机器时必看）**
 >
@@ -214,6 +214,12 @@ Production 拓扑并交给 IRIS 编译启动。
 >    **自动从 ModelScope 下载**（`Qwen/Qwen3-Embedding-0.6B`，需网络）。
 > 5. **网络不稳可直接重跑** `bash tools/setup.sh`（**幂等**：子模块 / `.env` / data 目录 / 构建 / 种子
 >    都会跳过已完成项）；子模块因网络中断拉取失败时，重跑即可恢复。
+> 7. **跨平台换行符（统一 LF）**：仓库根有 `.gitattributes`（`* text=auto eol=lf`；
+>    `*.sh/*.bash/*.cls/Dockerfile` 与 `*.csv/*.tsv` 显式 `eol=lf`；`*.jar/*.zip/图片/字体/xlsx/pdf` 按二进制），
+>    **所有文件都以 LF 存储并检出**。Windows（Git for Windows 默认 `core.autocrlf=true`）若检出成 CRLF，会出现：
+>    - 容器内脚本找不到：`sh: 1: /shared/setup.sh: not found`（IRIS）、`exec /app/entrypoint.sh: no such file or directory`（embedding）
+>    - 宿主 bash 立即失败：`set: pipefail: invalid option name`
+>    处理：`git config --global core.autocrlf false` 后**重新 clone**（或 `git checkout -- .` 让 `.gitattributes` 生效）。
 
 ```bash
 # 1. 配置 LLM（AI 推荐功能；不配则 AI 接口返回明确提示）

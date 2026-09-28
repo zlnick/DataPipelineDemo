@@ -168,7 +168,7 @@ design the Production topology and hand it to IRIS to compile and start.
 
 ## Quick Start
 
-Prerequisites: Docker + Docker Compose.
+Prerequisites: Docker + Docker Compose (Windows: WSL2 + Docker Desktop recommended; the repo enforces **LF** — see prerequisite 7 below).
 
 > **New-environment prerequisites (read this when cloning onto another machine)**
 >
@@ -239,6 +239,14 @@ Prerequisites: Docker + Docker Compose.
 > 5. **On a flaky network, just re-run** `bash tools/setup.sh` — it is **idempotent** (submodule / `.env` /
 >    data dirs / build / seed import all skip what is already done); if the submodule fetch was interrupted,
 >    re-running recovers it.
+> 7. **Cross-platform line endings (LF everywhere)**: `.gitattributes` at the repo root enforces
+>    `* text=auto eol=lf` (explicit `eol=lf` for `*.sh/*.bash/*.cls/Dockerfile` and `*.csv/*.tsv`;
+>    `*.jar/*.zip/images/fonts/xlsx/pdf` are treated as binary). Windows users (Git for Windows defaults to
+>    `core.autocrlf=true`) can end up with CRLF checkouts, which break things such as:
+>    - scripts inside containers: `sh: 1: /shared/setup.sh: not found` (IRIS),
+>      `exec /app/entrypoint.sh: no such file or directory` (embedding)
+>    - host bash: `set: pipefail: invalid option name`
+>    Fix: `git config --global core.autocrlf false` and **re-clone** (or `git checkout -- .` so `.gitattributes` applies).
 
 ```bash
 bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + CLINIC source-table init + terminology concept load + mapping-seed import + health check
