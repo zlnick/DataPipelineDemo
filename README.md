@@ -2,16 +2,20 @@
 
 > **[English version → README.en.md](README.en.md)**
 
+> **TL;DR**：`bash tools/setup.sh`（一条命令起全栈）→ `python3 tools/e2e_ui_flow.py`（一键复刻完整演示）。
+> 前置三件套：**Docker + Compose**、**InterSystems 容器仓库免费账号**（用于拉 IRIS 镜像）、**自备 LLM key**（AI 功能必需）；Windows 建议 WSL2 + Docker Desktop。
+
 基于 **InterSystems IRIS for Health** 与 **AI** 的数据自动化转换演示平台。
 
-用户通过界面指定数据源（FHIR 接口），平台**自动分析端点 Profile** 并注册数据资产；指定转换目标（模拟远端数据库）；通过 **AI（OpenAI 兼容 LLM）** 推荐「资产 → 目标表」匹配与字段映射，经用户确认后**自动生成 IRIS 互操作性生产管道（Production）** 完成数据投放。
+**源 = 2 种**（FHIR 接口 / SQL 表）、**目标 = 3 种**（DB 表 / SOAP 服务 / FHIR 仓库），可任意组合（也支持同一 Production 内多管道并存）。
+平台**自动分析源/目标接口**（FHIR Profile / SQL 列结构 / WSDL 操作语义）并登记数据资产；由 **AI（OpenAI 兼容 LLM）** 推荐「资产 → 目标」匹配与字段映射，用户确认后**自动生成 IRIS 互操作性生产管道（Production）** 完成数据投放；中文诊断/药品经**术语服务器**做代码转换（术语映射的事实源）。
 
 ```
-FHIR 端点 → 自动分析 Profile → 注册数据源 → 发现数据资产(资源类型)
-      ↘                                                  ↙
-         AI 匹配「资产 → 目标表」 + 生成字段映射 → 用户确认
-      ↘                                                  ↙
-           UI 生成转换关系 → IRIS Production 管道 → 投放模拟远端数据库
+FHIR / SQL 源 → 接口分析(Profile / 列结构) → 登记数据资产
+                          ↘                          ↙
+              AI 匹配「资产 → 目标」+ 字段映射 → 用户确认
+                          ↘                          ↙
+     生成转换计划 → IRIS Production 管道 → DB 表 / SOAP 服务 / FHIR 仓库
 ```
 
 ## 功能清单
@@ -119,7 +123,7 @@ Production 拓扑并交给 IRIS 编译启动。
 | 后端 API | Flask + IRIS Native SDK（`intersystems-irispython`）+ OpenAI SDK |
 | 前端 | Vue 3 + Element Plus + Vite + nginx |
 | AI | OpenAI 兼容接口（`base_url` / `api_key` / `model` 可配） |
-| 编排部署 | Docker Compose（三容器） |
+| 编排部署 | Docker Compose（**5 个服务**：`iris` / `backend` / `frontend` / `iris-terminology` / `embedding`；**默认启动 4 个** —— 跳过 `embedding`，详见「演示环境初始化」） |
 
 **IRIS 多角色（单实例）**：
 - **FHIRSERVER namespace**：FHIR Server（实例自带）——**演示默认的 FHIR 目标仓库**（转换结果落这里），
@@ -149,6 +153,7 @@ Production 拓扑并交给 IRIS 编译启动。
 - FHIR 源：`FHIRSyncService`（`_lastUpdated` 增量游标）→ `FHIRQueue` → `FHIRService`（逐条独立会话）→ 本管道的转换 BP
 - SQL 源：`EnsLib.SQL.Service.GenericService`（JDBC 轮询，Query + KeyFieldName）→ 行 JSON → 本管道的转换 BP
 - 目标：`SQLOp_<表>`（JDBC UPSERT；**DSN 按目标登记 jdbc_url 的命名空间推导** —— 演示默认 SQL 目标 = `CLINIC` 命名空间 → DSN `CLINIC`，无 jdbc_url 才回落 `localTarget`）；`SOAPOp_<服务>`（WSDL 导入 BO + Adapter WebServiceURL 指向远端/mock）
+- 目标：**FHIR 仓库** `HTTPOperation`（`EnsLib.HTTP.GenericOperation`，通用 REST + **schema 驱动组装**：按 `^demo.Config("fhir","schema",<type>)` 的列元数据组装 `Patient / Encounter / Condition / MedicationRequest / …`，PUT + Basic Auth 写目标仓库）
 - 参数与路由：BP 读**自己的**配置 `^demo.Config("bp", <BP名>)`（mapping / target_type / service|table），
   源 BS 经 `TargetConfigNames`（或 `^demo.Config("bp_target", 源BS名)`）投递给本管道的 BP，
   再由 BP 按 target_type 分发到 `SQLOp_*` / `SOAPOp_*`；旧路由表 `^demo.Config("pipe", 源BS名)` 仅作历史兼容兜底
@@ -221,6 +226,17 @@ Production 拓扑并交给 IRIS 编译启动。
 >    - 容器内脚本找不到：`sh: 1: /shared/setup.sh: not found`（IRIS）、`exec /app/entrypoint.sh: no such file or directory`（embedding）
 >    - 宿主 bash 立即失败：`set: pipefail: invalid option name`
 >    处理：`git config --global core.autocrlf false` 后**重新 clone**（或 `git checkout -- .` 让 `.gitattributes` 生效）。
+
+### ⚡ 一条命令复刻完整演示（推荐先跑这个）
+
+```bash
+bash tools/setup.sh && python3 tools/e2e_ui_flow.py
+```
+
+它会依次完成：**登记 CLINIC SQL 源 → 连通测试 → 选表 → 生成演示数据 → 登记 FHIR 目标 → AI 智能匹配 → 保存映射 → 生成数据管道**，并打印结果。
+实测：`result: OK`、`validation ok: True`、FHIR 目标落地 **Patient 3 / Encounter 4 / Condition 7 / MedicationRequest 7**。
+
+> ⚠ 需先填好 `.env` 的 `LLM_*`（AI 匹配与生成必需）；映射由 AI 判定、造数含随机 ⇒ **链路与结构可复刻，具体字段/编码/数量会不同**。
 
 ```bash
 # 1. 配置 LLM（AI 推荐功能；不配则 AI 接口返回明确提示）
@@ -387,27 +403,6 @@ python3 tools/term_map_build.py --limit 5    # 补录 5 条
 - **不想要时可随时停**：`docker compose stop embedding` —— 平台与演示**完全不受影响**（没有任何服务依赖它）。
 - 演示只读**成品映射**：`data/seeds/term_map_seed.json`（`setup.sh` 自动导入）。
 
-## AI 操作边界（2026-09-14：保留限制，简化机制）
-
-> 背景：本项目曾发生一次 AI **越界删除其它项目容器**的事故（其它 3 个项目的 7 个容器及其网络被删，
-> 其中一个 IRIS 库不可恢复）。此后为"AI / 脚本的执行通道"立了边界规则。
-
-1. **规则（最根本）**：AI 只能写/删 **本仓库**、**本项目容器**（`dataflow-*` / `iris-terminology`）、**知识库**；
-   其它项目与宿主目录一律只读——只能在"枚举清单 → 用户显式确认 → 执行"之后动。
-   详见 [`AGENTS.md`](AGENTS.md) 顶部与 [`.clinerules/`](.clinerules/)。
-2. **CLI 守卫**：执行 docker 前 `source tools/guard/docker_guard.sh` —— 本项目之外的破坏性操作被拒（rc=77）；
-   路径校验用 `python3 tools/guard/scope_guard.py check <路径>...`。
-3. **文件沙箱（可选强化）**：`./tools/guard/ai-session.sh` 起的受限会话（macOS `sandbox-exec`）**写入**只允许
-   仓库 / 知识库 / `/tmp` / `~/Library/Caches`，其余内核拒绝。
-4. 需要全权操作其它项目：在普通终端执行（边界只约束 AI 会话与受守卫的脚本）。
-
-细节、实测数据与已知坑见 [`tools/guard/README.md`](tools/guard/README.md)。
-
-> ⚠ 2026-09-14：此前还上过一层「受限 Docker API 代理」（`DOCKER_HOST` → 中间代理，按 daemon 事实裁决
-> 破坏性请求）——**已回滚**：过度复杂，且 `docker cp` 的流式上传体被判不了归属而 fail-closed 误拒，
-> 反而打断日常操作。现在不再有代理层，docker 走本机真实 socket。
-
-
 ## 默认访问地址
 
 | 服务 | 地址 | 说明 |
@@ -515,6 +510,8 @@ LLM_MODEL=deepseek-chat                        # 模型名
 > **CLINIC 演示数据**（界面「生成演示数据」按钮 / `tools/seed_clinic.py`）：**需先登记一个 SQL 数据源**
 > （演示默认 = `CLINIC` 命名空间，见 §B 第 1 步），否则脚本会给出明确指引（而不是抛 IndexError）。
 
+> **想一键跑通？** `bash tools/setup.sh && python3 tools/e2e_ui_flow.py`（自动完成 ①~⑤ 与 AI 匹配；见「快速启动 · 一条命令复刻完整演示」）
+
 **最短端到端路径**（约 10 分钟）：① 登记 SQL 数据源（演示默认 `CLINIC` 命名空间）→ ② 点「**生成演示数据**」→
 ③ 登记 DB 目标（`jdbc:IRIS://iris:1972/USER`，写 `Patient`/`Observation`）→ ④「**AI 智能匹配**」确认字段映射 →
 ⑤「管道监控」**生成管道** → ⑥ 目标数据下拉查看**落库行 / 消息 Completed**。
@@ -558,6 +555,42 @@ LLM_MODEL=deepseek-chat                        # 模型名
 3. **需要复位某条管道**：打开页面 **「强制重新生成」** 开关后点生成（`force=true`），该组会重新设计组件（AI 重新决策）。
 4. **确认没有丢件**（可选）：`python3 tools/check_component_fidelity.py`
    —— 逐项比对"每个管道的存储定义 ⊆ Production 组件"，做三次审计（基线 / 复用提交 / 强制重建）并输出缺失清单。
+
+## AI 操作边界（2026-09-14：保留限制，简化机制）
+
+> 背景：本项目曾发生一次 AI **越界删除其它项目容器**的事故（其它 3 个项目的 7 个容器及其网络被删，
+> 其中一个 IRIS 库不可恢复）。此后为"AI / 脚本的执行通道"立了边界规则。
+
+1. **规则（最根本）**：AI 只能写/删 **本仓库**、**本项目容器**（`dataflow-*` / `iris-terminology`）、**知识库**；
+   其它项目与宿主目录一律只读——只能在"枚举清单 → 用户显式确认 → 执行"之后动。
+   详见 [`AGENTS.md`](AGENTS.md) 顶部与 [`.clinerules/`](.clinerules/)。
+2. **CLI 守卫**：执行 docker 前 `source tools/guard/docker_guard.sh` —— 本项目之外的破坏性操作被拒（rc=77）；
+   路径校验用 `python3 tools/guard/scope_guard.py check <路径>...`。
+3. **文件沙箱（可选强化）**：`./tools/guard/ai-session.sh` 起的受限会话（macOS `sandbox-exec`）**写入**只允许
+   仓库 / 知识库 / `/tmp` / `~/Library/Caches`，其余内核拒绝。
+4. 需要全权操作其它项目：在普通终端执行（边界只约束 AI 会话与受守卫的脚本）。
+
+细节、实测数据与已知坑见 [`tools/guard/README.md`](tools/guard/README.md)。
+
+> ⚠ 2026-09-14：此前还上过一层「受限 Docker API 代理」（`DOCKER_HOST` → 中间代理，按 daemon 事实裁决
+> 破坏性请求）——**已回滚**：过度复杂，且 `docker cp` 的流式上传体被判不了归属而 fail-closed 误拒，
+> 反而打断日常操作。现在不再有代理层，docker 走本机真实 socket。
+
+
+## 常见问题（排障）
+
+| # | 症状 | 处理 |
+|---|---|---|
+| 1 | 拉不到 IRIS 镜像 / 提示未认证 | 镜像来自 InterSystems 私有仓库：免费注册后 `docker login containers.intersystems.com`（见「新环境前置 0」） |
+| 2 | 容器内 `sh: 1: /shared/setup.sh: not found`；宿主 `set: pipefail: invalid option name` | Windows 把脚本检出成了 CRLF：`git config --global core.autocrlf false` 后**重新 clone**（见「新环境前置 7」） |
+| 3 | 首次启动很慢 / 停在「等待核心服务就绪」 | 正常：全新 IRIS 要建 FHIR 双仓库与目标表（约 1–5 分钟）；`setup.sh` 已做**有界等待**，之后才建表/灌库 |
+| 4 | 重建容器后术语转换失效，或 CLINIC 造数取不到中文诊断/药品 | 术语**概念与映射**在术语服务器**容器内部 DB**，重建即丢 → 重跑 `bash tools/term_data_load.sh` + `bash tools/term_map_import.sh`（或直接 `bash tools/setup.sh`，幂等） |
+| 5 | 生成管道 500：`<CLASS DOES NOT EXIST> … demo.TerminologyOperation` | `iris/setup.sh` 编译清单必须含 `demo.TerminologyOperation`/`TermLookupRequest`/`TermLookupResponse`（已修） |
+| 6 | 生成管道 500：`ERROR #5007: Directory name '/dur/generated/' is invalid` | 生成物目录必须是 **`/dur/generated`**（不是 `$ISC_DATA_DIRECTORY/generated`）；`iris/setup.sh` 第 7b 步已自动创建 + `chown irisowner`（已修） |
+| 7 | 只有 4 个容器、没有 `dataflow-embedding` | 演示**不需要**向量 ⇒ `setup.sh` 默认跳过；要试验术语向量化时 `docker compose up -d embedding`（见「术语向量化」） |
+| 8 | 想回到零起点 / 彻底清数据 | 重置登记：`bash tools/datakit/run.sh reset_ui_env.py`（26 项自检，`--check-only` 只查不改）；清库：Windows 命名卷 `docker volume rm dataflow-iris-dur`，macOS/Linux 删/改名 `data/iris` |
+| 9 | 能同时跑几条管道？ | 社区版许可 **8 个业务主机单元**（常驻 ≤7 个组件 + 1 个后端连接）；超出的管道**照旧生成但初始停用**，在「数据管道」卡片一键切换（自动让路其它管道） |
+| 10 | AI 接口报错 / 没有推荐结果 | `.env` 的 `LLM_*` 未填或不可达 ⇒ 平台**显式报错**（不静默降级）；用 `docker exec dataflow-backend python /tmp/test_llm.py` 自检（见「LLM 配置」） |
 
 ## 说明与限制
 

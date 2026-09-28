@@ -1,18 +1,27 @@
 # AI-Driven Data Automation Demo
 
+> **[中文版 → README.md](README.md)**
+
+> **TL;DR**: `bash tools/setup.sh` (one command to bring up the whole stack) → `python3 tools/e2e_ui_flow.py`
+> (one command to reproduce the full demo). Prerequisites: **Docker + Compose**, a **free InterSystems container
+> registry account** (to pull the IRIS image) and **your own LLM key** (required by the AI features); on Windows use
+> WSL2 + Docker Desktop.
+
 An **AI-driven data pipeline automation** demo built on **InterSystems IRIS for Health**.
 
-Through the UI you register a data source (FHIR / SQL), the platform **analyzes the endpoint** and registers data
-assets; you pick a conversion target (DB table or SOAP service); an **AI (OpenAI-compatible LLM)** recommends
-"asset → target" matching and field mappings; after confirmation the platform **automatically generates an IRIS
-interoperability Production** and delivers the data.
+**Sources (2)** = FHIR endpoints / SQL tables · **Targets (3)** = DB tables / SOAP services / FHIR repositories —
+any combination (several pipelines can coexist inside one Production). The platform **analyzes source/target
+interfaces** (FHIR Profile / SQL columns / WSDL operation semantics) and registers data assets; an **AI
+(OpenAI-compatible LLM)** recommends "asset → target" matching and field mappings; after confirmation it
+**generates an IRIS interoperability Production** and delivers the data. Chinese diagnoses/drugs are converted
+through the **terminology server** (the source of truth for terminology mappings).
 
 ```
-FHIR/SQL source → interface analysis → register assets
-                              ↘                    ↙
-              AI Matching (asset → target + field mappings) → user confirms
-                              ↘                    ↙
-                    Generate Transformation Plan → IRIS Production → deliver to target
+FHIR / SQL source → interface analysis (Profile / columns) → register assets
+                              ↘                                ↙
+             AI Matching (asset → target + field mappings) → user confirms
+                              ↘                                ↙
+      Transformation Plan → IRIS Production → DB table / SOAP service / FHIR repository
 ```
 
 > The demo ships a **bilingual UI**: Chinese (default) and English at **`/en`** (language switch in the top bar).
@@ -113,6 +122,9 @@ design the Production topology and hand it to IRIS to compile and start.
 - **SQL source**: JDBC wizard (test → schema → tables → analyze columns) auto-generates the polling Query; the
   selected tables become assets (columns = fields).
 - **DB target**: JDBC wizard discovers schema/tables/columns.
+- **FHIR target**: a generic REST operation (`EnsLib.HTTP.GenericOperation`) with **schema-driven resource assembly**
+  (builds `Patient / Encounter / Condition / MedicationRequest / …` from the column metadata in
+  `^demo.Config("fhir","schema",<type>)`, then PUT + Basic Auth to the target FHIR repository).
 - **SOAP target**: WSDL-import based — reading the WSDL auto-generates a Business Operation (BO) + entity analysis;
   the built-in sample is a **write-type AddPatient** (flat 3 fields) served by a Python mock
   (`backend/services/mock_soap.py`, persists to `PatientEntity` and returns an acknowledgment).
@@ -150,7 +162,7 @@ design the Production topology and hand it to IRIS to compile and start.
 | Backend API | Flask + IRIS Native SDK + OpenAI SDK |
 | Frontend | Vue 3 + Element Plus + Vite + nginx (bilingual zh/en) |
 | AI | OpenAI-compatible endpoint (`base_url` / `api_key` / `model`) |
-| Orchestration | Docker Compose (3 containers) |
+| Orchestration | Docker Compose (**5 services**: `iris`, `backend`, `frontend`, `iris-terminology`, `embedding`; **4 started by default** — `embedding` is skipped, see "Demo Environment Initialization") |
 
 **IRIS multi-role (single instance)**:
 - `FHIRSERVER` namespace = built-in FHIR Server — **default FHIR *target* repository** (conversion results land here)
@@ -248,6 +260,19 @@ Prerequisites: Docker + Docker Compose (Windows: WSL2 + Docker Desktop recommend
 >      `exec /app/entrypoint.sh: no such file or directory` (embedding)
 >    - host bash: `set: pipefail: invalid option name`
 >    Fix: `git config --global core.autocrlf false` and **re-clone** (or `git checkout -- .` so `.gitattributes` applies).
+
+### ⚡ Reproduce the whole demo with one command
+
+```bash
+bash tools/setup.sh && python3 tools/e2e_ui_flow.py
+```
+
+It performs: **register the CLINIC SQL source → test connection → pick tables → generate demo data → register a FHIR
+target → AI matching → save mappings → generate the pipeline**, then prints the result.
+Measured: `result: OK`, `validation ok: True`, FHIR landing **Patient 3 / Encounter 4 / Condition 7 / MedicationRequest 7**.
+
+> ⚠ Fill in `.env`'s `LLM_*` first (required by AI matching/generation); mappings are AI-judged and the generated data
+> is randomized ⇒ **the flow and structure are reproducible, the exact mappings/codes/counts are not.**
 
 ```bash
 bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + CLINIC source-table init + terminology concept load + mapping-seed import + health check
@@ -500,6 +525,8 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
 > data source first** (the demo default is the `CLINIC` namespace — see §B step 1). Without one the script now
 > prints a clear hint instead of failing with an `IndexError`.
 
+> **Want it in one command?** `bash tools/setup.sh && python3 tools/e2e_ui_flow.py` (does the steps below plus AI matching automatically — see "Quick Start · Reproduce the whole demo with one command")
+
 **Shortest end-to-end path** (~10 minutes): ① register the SQL source (demo default = the `CLINIC` namespace) →
 ② click **"generate demo data"** → ③ register the DB target (`jdbc:IRIS://iris:1972/USER`, tables
 `Patient`/`Observation`) → ④ confirm field mappings via **"AI matching"** → ⑤ **generate the pipeline** in
@@ -581,6 +608,21 @@ See [`tools/guard/README.md`](tools/guard/README.md) for the full design, verifi
 > streaming bodies (ownership could not be resolved from the streamed tar), which broke everyday work.
 > There is no proxy layer now — docker talks to the real local socket.
 
+
+## Troubleshooting / FAQ
+
+| # | Symptom | Fix |
+|---|---|---|
+| 1 | Cannot pull the IRIS image / unauthenticated | The image lives in the InterSystems private registry: register (free) then `docker login containers.intersystems.com` (see prerequisite 0) |
+| 2 | Inside containers `sh: 1: /shared/setup.sh: not found`; on host `set: pipefail: invalid option name` | Windows checked the scripts out as CRLF: `git config --global core.autocrlf false` and **re-clone** (prerequisite 7) |
+| 3 | First start looks slow / stuck at "wait for core services" | Normal: a fresh IRIS builds two FHIR repositories and the target tables (about 1–5 min); `setup.sh` waits with a bound before loading data |
+| 4 | Terminology conversion stopped working after a rebuild, or CLINIC seeding finds no Chinese names | Concepts and mappings live in a DB **inside the terminology container** and are lost on rebuild → re-run `bash tools/term_data_load.sh` + `bash tools/term_map_import.sh` (or just `bash tools/setup.sh`, idempotent) |
+| 5 | Pipeline generation 500: `<CLASS DOES NOT EXIST> … demo.TerminologyOperation` | `iris/setup.sh` must compile `demo.TerminologyOperation`/`TermLookupRequest`/`TermLookupResponse` (fixed) |
+| 6 | Pipeline generation 500: `ERROR #5007: Directory name '/dur/generated/' is invalid` | The generated-artifacts directory must be **`/dur/generated`** (not `$ISC_DATA_DIRECTORY/generated`); `iris/setup.sh` step 7b creates it and chowns it to `irisowner` (fixed) |
+| 7 | Only 4 containers, no `dataflow-embedding` | The demo needs no vectors, so `setup.sh` skips it by default; run `docker compose up -d embedding` for vectorization experiments (see "Terminology Vectorization") |
+| 8 | Reset to a blank state / wipe data | Reset registrations: `bash tools/datakit/run.sh reset_ui_env.py` (26 self-checks; `--check-only` to only inspect). Wipe data: Windows named volume `docker volume rm dataflow-iris-dur`; macOS/Linux delete/rename `data/iris` |
+| 9 | How many pipelines can run at once? | Community license = **8 business-host units** (≤7 components resident + 1 backend connection); extra pipelines are still generated but start **disabled** — flip them on the "Data Pipelines" card (it evicts others automatically) |
+| 10 | AI endpoints error out / no recommendations | `.env`'s `LLM_*` is missing or unreachable ⇒ the platform fails **explicitly** (no silent fallback); self-check with `docker exec dataflow-backend python /tmp/test_llm.py` (see "LLM Configuration") |
 
 ## Notes & Limitations
 
