@@ -66,3 +66,6 @@ export_validation_issues.py
 # 术语素材：**随仓库分发**（2026-09-27 项目所有者决定纳入，用于术语服务器初始化与
 # CLINIC 演示数据生成；来源与条款见 NOTICE）。成品映射种子见 data/seeds/。
 # 如需再次撤出：改回排除 data/terms-inbox/*（保留 .gitkeep）与 data/testsets/。
+
+# 发布素材（文章/图/二维码）：不纳入版本控制，仅本地发布工作区
+articles/
