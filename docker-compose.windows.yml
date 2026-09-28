@@ -1,0 +1,41 @@
+# =====================================================================
+# Windows / Docker Desktop（含 WSL2）覆盖文件
+#   —— 把 IRIS 数据目录 /dur 从 **Windows 绑定挂载** 换成 **Docker 命名卷**
+#
+# 为什么需要（2026-09-28 实测）：
+#   绑定挂载（./data/iris:/dur）经过 Docker Desktop 的文件共享层时，chown/rename 等 POSIX
+#   元数据操作不可靠，三种调用方式实测都不行：
+#     · docker compose run（内部反斜杠路径）→ 新建目录呈现为 root:root → chown EPERM
+#     · WSL 的 Linux docker CLI（/mnt/d/...）→ 呈现为 ubuntu(1000) → chown EPERM
+#     · Windows 侧 docker.exe + 正斜杠 D:/... → 属主正确，但 IRIS 搬迁时仍会被其它环节绊住
+#   后果：IRIS 首次启动的「搬迁数据目录」报
+#     Error while moving data directories ERROR #5001:
+#       Error executing chown irisowner:irisowner /dur/irissys/: Error:1:
+#   → 容器 Exited(1)，管理门户 52773 / FHIR 端点全部无响应。
+#   命名卷是 Docker 虚拟机内的**真实 ext4**，chown/rename 全部正常 ⇒ 从根上消除此类问题
+#   （顺带也让私有 Web 服务器的 pid 文件写入不再踩坑）。
+#
+# 用法：
+#   · 推荐：`bash tools/setup.sh`（在 WSL/Windows 下会**自动**带上本文件：设置 COMPOSE_FILE）
+#   · 手工等价写法：
+#       docker compose -f docker-compose.yml -f docker-compose.windows.yml up -d
+#
+# ⚠ 数据位置变化：IRIS 实例数据从 `./data/iris` 变为**命名卷** `dataflow-iris-dur`
+#   （`./data/iris` 不再被使用，可留作备份 / 自行删除）
+#   清空数据（等价于“删掉 data/iris”）：docker volume rm dataflow-iris-dur
+# =====================================================================
+services:
+  iris:
+    # !override：整份替换基础文件里的 volumes 列表（否则 compose 会**追加**，
+    # 导致 /dur 同时来自绑定挂载与命名卷 → duplicate mount point 报错）
+    volumes: !override
+      - ./iris/init-password.sh:/shared/init-password.sh:ro   # 凭据初始化脚本
+      - ./iris/setup.sh:/shared/setup.sh:ro                   # 统一初始化入口
+      - ./iris/src:/shared/src:ro                             # ObjectScript 源码（Production 组件）
+      - ./iris/python:/shared/python:ro                       # Embedded Python 业务逻辑
+      - ./iris/sql:/shared/sql:ro                             # SQL 初始化脚本
+      - dataflow-iris-dur:/dur                                # ← 命名卷（替代 ./data/iris:/dur）
+
+volumes:
+  dataflow-iris-dur:
+    name: dataflow-iris-dur     # 固定名字（不加项目前缀），便于 setup.sh 预检 / 手工清理

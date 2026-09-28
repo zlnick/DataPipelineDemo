@@ -5,6 +5,28 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source tools/guard/docker_guard.sh >/dev/null 2>&1 || true
 
+# ---------- Windows / Docker Desktop：IRIS 数据目录改用命名卷 ----------
+# 背景（2026-09-28 实测）：Windows 绑定挂载经过 Docker Desktop 文件共享层时，chown/rename 等 POSIX
+#   元数据操作不可靠 —— IRIS 首次启动的「搬迁数据目录」会报
+#     Error while moving data directories ERROR #5001:
+#       Error executing chown irisowner:irisowner /dur/irissys/: Error:1:
+#   → 容器 Exited(1)，管理门户 52773 / FHIR 端点全部无响应（三种调用方式实测都不通：compose run→root、
+#   WSL docker CLI→ubuntu(1000)、Windows docker.exe→属主虽对但搬迁仍被绊住）。
+#   命名卷是 Docker 虚拟机内的**真实 ext4**（chown/rename 全正常）⇒ 在 Windows/WSL 下自动带上
+#   docker-compose.windows.yml，把 /dur 从 ./data/iris 绑定挂载换成命名卷。
+#   ⚠ 此时实例数据在**命名卷**里（不在 ./data/iris，后者可留作备份）；
+#     清数据 = `docker volume rm dataflow-iris-dur`（等价于删 data/iris）。
+IS_WINDOWS=0
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;; esac
+case "$PWD" in /mnt/*) IS_WINDOWS=1 ;; esac
+IRIS_DUR_VOLUME=""
+if [ "$IS_WINDOWS" = "1" ] && [ -f docker-compose.windows.yml ]; then
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) _sep=";" ;; *) _sep=":" ;; esac
+  export COMPOSE_FILE="docker-compose.yml${_sep}docker-compose.windows.yml"
+  IRIS_DUR_VOLUME="dataflow-iris-dur"
+  echo "[env] Windows/Docker Desktop：IRIS 数据目录改用命名卷 ${IRIS_DUR_VOLUME}（规避绑定挂载 chown EPERM）"
+fi
+
 # 参数：--check 只读体检；默认**不**构建/启动 embedding（演示不需要术语向量，初始化更快）
 CHECK_ONLY=0
 WITH_EMBEDDING=0
@@ -58,7 +80,21 @@ echo "== 4/5 构建并启动服务（首次需 InterSystems 容器仓库 IAM 账
 #   ② irisowner：创建 /dur/irissys → chown（保证属主是 irisowner，IRIS 的那步 chown 才成功）
 #   ⚠ 标记文件用 `irissys/iris.cpf`（IRIS 搬迁后写在数据目录根）+ `irissys/mgr/messages.log`：
 #     只要任一存在就视为"已有实例"，**绝不删除**（2026-09-28 曾因标记写错为 mgr/iris.cpf 而误删运行中实例）
-if [ ! -f data/iris/irissys/iris.cpf ] && [ ! -f data/iris/irissys/mgr/messages.log ]; then
+if [ -n "$IRIS_DUR_VOLUME" ]; then
+  # 命名卷分支：建卷（幂等）+ root 一次性把**卷根**属主改成 irisowner（新卷默认 root:root，而 IRIS 以
+  # irisowner 运行）；之后 IRIS 自建 /dur/irissys 等目录时属主天然是 irisowner，搬迁里的 chown 变成
+  # "chown 自己的目录"（真实 ext4 允许）→ 通过。
+  docker volume create "$IRIS_DUR_VOLUME" >/dev/null 2>&1 || true
+  IRIS_IMAGE="$(docker inspect dataflow-iris --format '{{.Config.Image}}' 2>/dev/null || true)"
+  [ -n "$IRIS_IMAGE" ] || IRIS_IMAGE="$(awk '/irishealth-community/{print $2; exit}' docker-compose.yml 2>/dev/null)"
+  if docker run --rm --name dataflow-iris-preflight -u 0:0 -v "${IRIS_DUR_VOLUME}:/dur" --entrypoint sh "$IRIS_IMAGE" \
+        -c 'chown irisowner:irisowner /dur' >/tmp/iris-preflight.log 2>&1; then
+    echo "  命名卷 ${IRIS_DUR_VOLUME} 就绪（属主 irisowner）——IRIS 可直接搬迁/写入"
+  else
+    echo "  [!!] 命名卷初始化失败（非阻塞）：若 IRIS 起不来请看下面输出"
+    tail -5 /tmp/iris-preflight.log 2>/dev/null | sed 's/^/      /'
+  fi
+elif [ ! -f data/iris/irissys/iris.cpf ] && [ ! -f data/iris/irissys/mgr/messages.log ]; then
   # 取 iris 镜像名（本步骤要用一次性容器；不用 `docker compose run`：它在 Windows 上把挂载源
   # 传成反斜杠路径（D:\...），实测创建的目录会被呈现为 root:root → chown EPERM；
   # 而 `docker run -v "D:/...":/dur`（正斜杠）→ 目录属主正常、chown 成功）
@@ -179,3 +215,9 @@ host_ok 52774 /terminology/systems superuser:SYS && echo "  ok  terminology :527
 
 echo
 echo "== 完成：http://localhost（中文）/ http://localhost/en（英文）=="
+if [ -n "$IRIS_DUR_VOLUME" ]; then
+  echo "   提示：本次 IRIS 数据目录 = **命名卷 ${IRIS_DUR_VOLUME}**（Windows 覆盖文件 docker-compose.windows.yml）"
+  echo "         · 手工用 compose 时请带上覆盖文件，避免用错数据目录："
+  echo "           docker compose -f docker-compose.yml -f docker-compose.windows.yml ps"
+  echo "         · 清空数据：docker volume rm ${IRIS_DUR_VOLUME}"
+fi

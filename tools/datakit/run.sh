@@ -140,5 +140,15 @@ if [ "$MODE" = "container" ]; then
   docker exec -w /app "$CTR" python "/tmp/$BASE" "$@"
 else
   echo "[datakit] 宿主机执行: $SCRIPT $*"
-  ( cd "$REPO" && python3 "$SCRIPT" "$@" )
+  # 强制 UTF-8 输出：Windows 控制台默认 GBK，装不下脚本里的 ①②…⑪ 等字符
+  # （实测 `python tools/e2e_ui_flow.py` 在 ⑪ 抛 UnicodeEncodeError: 'gbk' codec）。
+  export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+  if [ -n "${WSL_DISTRO_NAME:-}" ] && command -v python.exe >/dev/null 2>&1; then
+    # WSL 里跑"宿主机脚本"：NAT 模式下 localhost 到不了 Windows 上发布的端口（实测 000），
+    # 且 Linux 的 python3 没有 Windows 侧依赖 ⇒ 优先用 **Windows 侧 python.exe**（路径转 Windows 形式）。
+    # `-X utf8` 显式打开 UTF-8 模式（比依赖 PYTHONUTF8 环境变量跨 WSL→Windows 传递更可靠）。
+    python.exe -X utf8 "$(wslpath -w "$SCRIPT" 2>/dev/null || echo "$SCRIPT")" "$@"
+  else
+    ( cd "$REPO" && python3 "$SCRIPT" "$@" )
+  fi
 fi

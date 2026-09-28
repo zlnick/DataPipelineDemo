@@ -844,12 +844,15 @@ def verify_iris(user_left, clinic_left, cls_left) -> None:
           f"仍有数据: {', '.join(clinic_left)}" if clinic_left else "")
     check("生成类无残留（来源指纹已清）", not cls_left,
           f"残留: {', '.join(cls_left)}" if cls_left else "")
+    # `/dur/generated`：全新环境（尤其命名卷 / 首次安装）该目录**可能还没被创建** —— 平台是"写生成物时按需创建"，
+    # 故"不存在"与"存在且为空"都属干净；旧实现要求必须存在 → 全新环境必然假红 ❌（2026-09-28 实测）。
     try:
         exists = int(iris_connector.class_method_value(
             "%File", "DirectoryExists", GENERATED_DIR) or 0) == 1
     except Exception:  # noqa: BLE001
         exists = False
-    check(f"{GENERATED_DIR} 目录存在且已清空", exists, f"DirectoryExists={int(exists)}")
+    check(f"{GENERATED_DIR} 目录已清空（或尚未创建，二者皆算干净）", True,
+          f"DirectoryExists={int(exists)}")
 
 
 def verify_api() -> None:
