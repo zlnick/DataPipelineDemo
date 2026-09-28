@@ -1,0 +1,53 @@
+﻿cn_code,cn_name,snomed_code,snomed_display,source,note,cn_candidates
+I10.x09,原发性高血压,59621000,Essential hypertension,filter,循环·高血压,1
+I20.900,心绞痛,194828000,Angina pectoris,filter,循环,14
+I21.900,急性心肌梗死,57054005,Acute myocardial infarction,filter,循环,10
+I25.200,陈旧性心肌梗死,1755008,Old myocardial infarction,sample,循环·v1复核,1
+I48.x01,心房颤动,49436004,Atrial fibrillation,filter,循环,4
+I50.900,心力衰竭,84114007,Heart failure,filter,循环,14
+J18.900,肺炎,233604007,Pneumonia,filter,呼吸,106
+J44.900,慢性阻塞性肺病,13645005,Chronic obstructive pulmonary disease,filter,呼吸,4
+J45.007,外源性支气管哮喘,195967001,Asthma,filter,呼吸,6
+J20.900,急性支气管炎,10509002,Acute bronchitis,filter,呼吸,10
+E11.900,2型糖尿病,44054006,Type 2 diabetes mellitus,filter,内分泌,34
+E10.900,1型糖尿病,46635009,Type 1 diabetes mellitus,filter,内分泌,33
+O24.900,妊娠期糖尿病,11687002,Gestational diabetes mellitus,filter,内分泌,1
+E05.904,甲状腺功能亢进性肌病,34486009,Hyperthyroidism,filter,内分泌,11
+E03.900,甲状腺功能减退症,40930008,Hypothyroidism,filter,内分泌,18
+M10.900,痛风,90560007,Gout,filter,内分泌,13
+E78.500,高脂血症,55822004,Hyperlipidemia,filter,内分泌,7
+K29.700,胃炎,4556007,Gastritis,filter,消化,22
+K25.901,残胃溃疡,397825006,Gastric ulcer,override,消化,12
+K21.001,反流性食管炎,717847008,Erosive gastro-esophageal reflux disease,filter,消化,1
+K74.100,肝硬化,19943007,Cirrhosis of liver,filter,消化,39
+K80.203,胆囊结石嵌顿,266568003,Cholelithiasis,override,消化,9
+K35.900,急性阑尾炎,85189001,Acute appendicitis,filter,消化,7
+K85.900,急性胰腺炎,197456007,Acute pancreatitis,filter,消化,8
+I63.900,脑梗死,432504007,Cerebral infarction,filter,神经,38
+I61.801,间脑出血,274100004,Cerebral hemorrhage,override,神经,10
+G45.900,短暂性大脑缺血性发作,266257000,Transient ischemic attack,override,神经,2
+G43.900,偏头痛,37796009,Migraine,filter,神经,13
+G40.900,癫痫,84757009,Epilepsy,filter,神经,66
+G20.x00,帕金森病,49049000,Parkinson's disease,filter,神经,3
+G30.900,阿尔茨海默病,26929004,Alzheimer's disease,filter,神经,7
+F51.000,非器质性失眠症,193462001,Insomnia,filter,精神,2
+F32.100,中度抑郁发作,832007,Moderate major depression,filter,精神·exclude双相,1
+F20.900,精神分裂症,58214004,Schizophrenia,filter,精神,18
+N10.x02,急性肾盂肾炎,3999002,Acute pyelitis without renal medullary necrosis,sample,泌尿·v1复核,1
+N25.802,肾小管酸中毒,1776003,Renal tubular acidosis,sample,肾·v1复核,5
+N20.000,肾结石,95570007,Calculus of kidney,override,泌尿,7
+N39.000,泌尿道感染,68566005,Urinary tract infection,override,泌尿,5
+N18.900,慢性肾衰竭,709044004,Chronic kidney disease,filter,肾,2
+S72.000,股骨颈骨折,1705000,Closed fracture of base of neck of femur,sample,骨科·v1复核,3
+S22.300,肋骨骨折,1261007,Fracture of multiple ribs,sample,创伤·v1复核,5
+M81.900,骨质疏松,64859006,Osteoporosis,filter,骨科,21
+M06.900,类风湿性关节炎,69896004,Rheumatoid arthritis,filter,风湿,17
+I12.900,高血压肾脏病不伴有肾衰竭,193003,Benign hypertensive renal disease,sample,肾,1
+D64.900,贫血,271737000,Anemia,filter,血液,147
+C34.900,支气管或肺恶性肿瘤,93880001,Primary malignant neoplasm of lung,filter,肿瘤·exclude个人史 exclude家族史,1
+C50.900,乳房恶性肿瘤,254837009,Malignant neoplasm of breast,filter,肿瘤,3
+C18.900,结肠恶性肿瘤,363406005,Malignant neoplasm of colon,filter,肿瘤,9
+C84.502,皮肤淋巴瘤,118600007,Malignant lymphoma,filter,肿瘤,97
+B18.107,慢性乙型病毒性肝炎,1116000,Chronic aggressive type B viral hepatitis,sample,感染·v1复核,3
+A16.201,肺结核瘤,154283005,Pulmonary tuberculosis,filter,感染,55
+B02.000,带状疱疹脑炎,4740000,Herpes zoster,filter,感染,19

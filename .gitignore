@@ -64,7 +64,6 @@ WORKLOG.md
 export_validation_issues.py
 run_rxnorm_vec.sh
 
-# 版权敏感的原始术语数据（不随仓库分发；成品映射种子见 data/seeds/）
-data/terms-inbox/*
-!data/terms-inbox/.gitkeep
-data/testsets/
+# 术语素材：**随仓库分发**（2026-09-27 项目所有者决定纳入，用于术语服务器初始化与
+# CLINIC 演示数据生成；来源与条款见 NOTICE）。成品映射种子见 data/seeds/。
+# 如需再次撤出：改回排除 data/terms-inbox/*（保留 .gitkeep）与 data/testsets/。

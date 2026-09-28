@@ -202,8 +202,12 @@ Prerequisites: Docker + Docker Compose.
 >      re-import with `bash tools/term_map_import.sh` (same as `python3 tools/term_map_sync.py import`;
 >      `setup.sh` already does this, idempotently). `tools/term_map_seed.py` is the seed **generator**, not an
 >      importer. To only refresh the platform extension classes without a rebuild, hot-load with
->      `bash tools/termsrv_load.sh` (no data loss). Raw terminology material (ICD-10 / NRDL / CBIH,
->      license-sensitive) is **not** shipped in this repo; a derived mapping seed ships in data/seeds/.
+>      `bash tools/termsrv_load.sh` (no data loss). Terminology material under `data/terms-inbox/`
+>      (GB/T 14396-2016 ICD-10 ~20k entries + NRDL/CBIH Chinese drug catalogues) **is shipped in this repo**
+>      and loaded into the terminology server concept tables (`Terminology_Icd10.Concept` /
+>      `Terminology_Drug.Code`) by `bash tools/term_data_load.sh` — idempotent, and invoked by `tools/setup.sh`.
+>      **The CLINIC demo-data generator depends on it** (diagnosis/drug Chinese names come from the terminology
+>      store); re-run it after a container rebuild. Provenance and terms: see `NOTICE`.
 >      Also: a ready-made **mapping seed** (`data/seeds/term_map_seed.json`, 81 mappings) is imported
 >      automatically by `tools/setup.sh` (`tools/term_map_sync.py import`); the terminology server platform
 >      extensions (`/mapping/*` routes + `CodeMap`) are overlaid from `termsrv-patches/` (idempotent), so
@@ -229,7 +233,7 @@ Prerequisites: Docker + Docker Compose.
 >    re-running recovers it.
 
 ```bash
-bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + terminology-seed import + health check
+bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + terminology concept load + mapping-seed import + health check
 docker compose up -d   # first run builds images & initializes FHIR Server + target tables
 http://localhost       # Chinese UI (default)   |   http://localhost/en  # English UI
 ```

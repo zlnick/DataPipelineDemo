@@ -29,11 +29,16 @@ docker compose up -d --build iris
 compgen -G "jdbc/intersystems-jdbc-*.jar" >/dev/null 2>&1 && echo "  JDBC 驱动已在，跳过提取" || bash tools/fetch_jdbc_jar.sh
 docker compose up -d --build
 
-echo "== 5/5 术语映射种子（可选：让术语转换立即可用）=="
-if [ -f data/seeds/term_map_seed.json ] && [ -f tools/term_map_import.sh ]; then
-  bash tools/term_map_import.sh --wait 120 || echo "  [!!] 导入失败，稍后手动: bash tools/term_map_import.sh"
+echo "== 5/5 术语服务器初始化（术语概念 + 转换映射种子）=="
+if [ -f data/terms-inbox/icd10_main.csv ] && [ -f tools/term_data_load.sh ]; then
+  bash tools/term_data_load.sh --wait 120 || echo "  [!!] 术语概念导入失败，稍后手动: bash tools/term_data_load.sh"
 else
-  echo "  种子未就绪：术语检索/校验可用，转换映射需另行灌库"
+  echo "  [!!] 术语素材缺失：跳过概念导入（CLINIC 演示数据生成会受影响）"
+fi
+if [ -f data/seeds/term_map_seed.json ] && [ -f tools/term_map_import.sh ]; then
+  bash tools/term_map_import.sh --wait 120 || echo "  [!!] 映射导入失败，稍后手动: bash tools/term_map_import.sh"
+else
+  echo "  映射种子未就绪：术语检索/校验可用，转换映射需另行灌库"
 fi
 
 echo "== 健康检查（尽力探测，不强制失败）=="

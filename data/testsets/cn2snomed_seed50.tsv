@@ -1,0 +1,53 @@
+cn_kw	code_override	filter	want	note
+原发性高血压	-	hypertension	Essential hypertension	循环·高血压
+心绞痛	-	angina	Angina pectoris	循环
+急性心肌梗死	-	infarction	Acute myocardial infarction	循环
+陈旧性心肌梗死	1755008	-	-	循环·v1复核
+心房颤动	-	atrial	Atrial fibrillation	循环
+心力衰竭	-	failure	Heart failure	循环
+肺炎	-	pneumonia	Pneumonia	呼吸
+慢性阻塞性肺病	-	obstructive	Chronic obstructive pulmonary disease	呼吸
+支气管哮喘	-	asthma	Asthma	呼吸
+急性支气管炎	-	bronchitis	Acute bronchitis	呼吸
+2型糖尿病	-	diabetes	Type 2 diabetes mellitus	内分泌
+1型糖尿病	-	diabetes	Type 1 diabetes mellitus	内分泌
+妊娠期糖尿病	-	diabetes	Gestational diabetes mellitus	内分泌
+甲状腺功能亢进	-	hyperthyroidism	Hyperthyroidism	内分泌
+甲状腺功能减退	-	hypothyroidism	Hypothyroidism	内分泌
+痛风	-	gout	Gout	内分泌
+高脂血症	-	hyperlipidemia	Hyperlipidemia	内分泌
+胃炎	-	gastritis	Gastritis	消化
+胃溃疡	397825006	-	Gastric ulcer	消化
+反流性食管炎	-	reflux	Gastro-esophageal reflux disease	消化
+肝硬化	-	cirrhosis	Cirrhosis of liver	消化
+胆囊结石	266568003	-	Cholelithiasis	消化
+急性阑尾炎	-	appendicitis	Acute appendicitis	消化
+急性胰腺炎	-	pancreatitis	Acute pancreatitis	消化
+脑梗死	-	infarction	Cerebral infarction	神经
+脑出血	274100004	-	Cerebral hemorrhage	神经
+短暂性大脑缺血性发作	266257000	-	Transient ischemic attack	神经
+偏头痛	-	migraine	Migraine	神经
+癫痫	-	epilepsy	Epilepsy	神经
+帕金森病	-	parkinson	Parkinson's disease	神经
+阿尔茨海默病	-	alzheimer	alzheimer	神经
+失眠	-	insomnia	Insomnia	精神
+中度抑郁发作	-	depression	Moderate major depression	精神·exclude双相
+精神分裂症	-	schizophrenia	Schizophrenia	精神
+急性肾盂肾炎	3999002	-	-	泌尿·v1复核
+肾小管酸中毒	1776003	-	-	肾·v1复核
+肾结石	95570007	-	Calculus of kidney	泌尿
+泌尿道感染	68566005	-	Urinary tract infection	泌尿
+慢性肾衰竭	-	chronic kidney	Chronic kidney disease	肾
+股骨颈骨折	1705000	-	-	骨科·v1复核
+肋骨骨折	1261007	-	-	创伤·v1复核
+骨质疏松	-	osteoporosis	Osteoporosis	骨科
+类风湿性关节炎	-	rheumatoid	Rheumatoid arthritis	风湿
+高血压肾脏病不伴有肾衰竭	193003	-	-	肾
+贫血	-	anemia	Anemia	血液
+肺恶性肿瘤	-	lung	malignant neoplasm of lung	肿瘤·exclude个人史 exclude家族史
+乳房恶性肿瘤	-	breast	malignant neoplasm of breast	肿瘤
+结肠恶性肿瘤	-	colon	malignant neoplasm of colon	肿瘤
+淋巴瘤	-	lymphoma	malignant lymphoma	肿瘤
+慢性乙型病毒性肝炎	1116000	-	-	感染·v1复核
+肺结核	-	tuberculosis	pulmonary tuberculosis	感染
+带状疱疹	-	herpes	Herpes zoster	感染
