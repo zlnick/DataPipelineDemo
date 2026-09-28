@@ -4,7 +4,7 @@ from backend.services import iris_connector as ic
 
 print("PatientEntity 总数:", ic.query("SELECT COUNT(*) FROM SQLUser.PatientEntity"))
 print("Patient 源行数:", ic.query("SELECT COUNT(*) FROM SQLUser.Patient"))
-print("P 开头（期望 P0001..P0004）:")
+print("P 开头（源 → SOAP 落库的全部行）:")
 for r in ic.query("SELECT PatientNo, FullName, Gender FROM SQLUser.PatientEntity "
                   "WHERE PatientNo LIKE 'P%' ORDER BY PatientNo"):
     print("   ", r)
