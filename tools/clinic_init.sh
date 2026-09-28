@@ -15,5 +15,6 @@ echo "== CLINIC 源库表结构初始化（Patient / Encounter / Diagnosis / Med
 docker compose up -d iris "$BE" >/dev/null 2>&1 || true
 
 # 工具送进容器执行（backend 容器内 /app 有 backend 包，可 import clinic_schema）
+# --wait 180：**首次安装**时 IRIS 仍在初始化，连接会失败；这里按其就绪重试，避免初始化流程误报失败。
 docker exec -i "$BE" sh -c 'cat > /tmp/clinic_tables.py' < tools/clinic_tables.py
-docker exec "$BE" python /tmp/clinic_tables.py --host iris "$@"
+docker exec "$BE" python /tmp/clinic_tables.py --host iris --wait 180 "$@"

@@ -62,7 +62,7 @@ else
   echo "  [!!] 缺 tools/clinic_init.sh：跳过 CLINIC 建表"
 fi
 if [ -f data/terms-inbox/icd10_main.csv ] && [ -f tools/term_data_load.sh ]; then
-  bash tools/term_data_load.sh --wait 120 || echo "  [!!] 术语概念导入失败，稍后手动: bash tools/term_data_load.sh"
+  bash tools/term_data_load.sh --wait 180 || echo "  [!!] 术语概念导入失败，稍后手动: bash tools/term_data_load.sh"
 else
   echo "  [!!] 术语素材缺失：跳过概念导入（CLINIC 演示数据生成会受影响）"
 fi
@@ -71,6 +71,16 @@ if [ -f data/seeds/term_map_seed.json ] && [ -f tools/term_map_import.sh ]; then
 else
   echo "  映射种子未就绪：术语检索/校验可用，转换映射需另行灌库"
 fi
+
+echo "== 等待核心服务就绪（**首次安装**时 IRIS / FHIR 仓库 / 目标表初始化需数分钟）=="
+for i in $(seq 1 60); do
+  if curl -fsS -m 5 -o /dev/null http://localhost:5001/api/pipelines/status 2>/dev/null; then
+    echo "  backend 就绪（约 $((i * 10))s）"
+    break
+  fi
+  [ "$i" = "60" ] && echo "  [!!] 等待 600s 仍未就绪，仍继续做健康检查（可稍后看日志）"
+  sleep 10
+done
 
 echo "== 健康检查（尽力探测，不强制失败）=="
 curl -fsS -m 5 -o /dev/null http://localhost:5001/api/pipelines/status 2>/dev/null && echo "  ok  backend :5001" || echo "  !!  backend :5001 未就绪"
