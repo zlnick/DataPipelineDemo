@@ -179,6 +179,13 @@ curl -s "http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/Patient?_summ
 | `run.sh` 判断依据 | 无上述依赖 | 命中 `iris.dbapi` / `from backend.` 等关键字 |
 
 > 这是本工具箱唯一"必须记住"的一点：容器里的 `localhost` 是容器自己，不是你的 Mac。
+>
+> ⚠ **Windows / WSL 补充**：`run.sh` 的宿主分支已自动处理两件事（2026-09-28 实测）——
+> ① **强制 UTF-8 输出**（Windows 控制台默认 GBK，装不下脚本里的 `①…⑪` 等字符：
+> `python tools/e2e_ui_flow.py` 曾在 ⑪ 抛 `UnicodeEncodeError: 'gbk' codec`，
+> 现在统一加 `-X utf8` / `PYTHONUTF8=1`）；
+> ② WSL 下**改用 Windows 侧 `python.exe`**（NAT 模式下 WSL 的 `localhost` 到不了 Windows 上发布的容器端口 —— 实测 `curl http://localhost:5001` → 000，
+> 而 `host/` 脚本写的都是 `http://localhost:5001`）。
 
 ---
 

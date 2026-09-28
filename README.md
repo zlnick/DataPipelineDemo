@@ -231,10 +231,12 @@ http://localhost
 
 ```bash
 docker compose down
-# ⚠ 想清空数据（FHIR 数据 / 目标表 / 数据源·映射·管道登记）**不能用 `down -v`**：
-#   本项目所有卷都是**绑定挂载**（./data/iris 等），`-v` 只删"命名卷"，对数据无效。
-#   正确做法＝删或改名数据目录（建议改名，便于回滚）：
-mv data/iris data/iris.bak-$(date +%Y%m%d)   # 之后 docker compose up -d（首次启动会自动重建实例数据）
+# ⚠ 想清空数据（FHIR 数据 / 目标表 / 数据源·映射·管道登记）**别指望 `down -v`**（`-v` 只删 compose 声明的命名卷，
+#   本项目 Windows 用命名卷、macOS/Linux 用绑定挂载，两种都要按下面方式清）：
+#   · Windows / Docker Desktop（/dur = 命名卷 dataflow-iris-dur）：
+docker volume rm dataflow-iris-dur      # 之后 bash tools/setup.sh（首次启动自动重建实例数据）
+#   · macOS / Linux（/dur = 绑定挂载 ./data/iris）：
+mv data/iris data/iris.bak-$(date +%Y%m%d)   # 之后 docker compose up -d
 ```
 
 ## 演示环境初始化（`bash tools/setup.sh` 做了什么）
@@ -247,7 +249,7 @@ mv data/iris data/iris.bak-$(date +%Y%m%d)   # 之后 docker compose up -d（首
 | 2 | 准备 `.env`（缺则从 `.env.example` 复制） | **AI 功能需填 `LLM_*`**；不填则 AI 接口显式报错，平台仍可启动 |
 | 3 | 建 `data/` 子目录 | `data/iris`、`data/iris-terminology`、`data/terms-inbox`、`data/embedding-model` |
 | 4 | 构建并启动容器 | 默认 **4 个**：`iris`、`backend`、`frontend`、`iris-terminology`（加 `--with-embedding` 才含 embedding） |
-| 4b | **首次启动前置：预建数据目录** | 仅当 `data/iris` 尚无实例时：先以 root 把 `data/iris` 属主改为 irisowner，再以 irisowner 预建 `irissys/` —— Windows/WSL 绑定挂载下 IRIS 首次「搬迁数据目录」要求 irisowner 属主，否则 `chown ... EPERM` → 容器 Exited(1) |
+| 4b | **Windows：IRIS 数据目录改用命名卷**（`docker-compose.windows.yml`，`setup.sh` 自动启用） | Windows/WSL 下把 `/dur` 从 `./data/iris` 绑定挂载换成命名卷 `dataflow-iris-dur`（建卷 + 卷根属主改 irisowner）。理由：绑定挂载经 Docker Desktop 文件共享层时 `chown`/`rename` 不可靠，会让 IRIS 首次「搬迁数据目录」`EPERM` → 容器 Exited(1)；命名卷是 VM 内真实 ext4，从根上消除该类问题 |
 | 5 | 提取 JDBC 驱动 | 从 IRIS 镜像一条命令取 `intersystems-jdbc-*.jar` → `./jdbc/`（无需官网下载） |
 | 6 | **CLINIC 源库建表** | `Patient/Encounter/Diagnosis/MedicationOrder`——**幂等**（缺表才建、不动数据）；首次安装会等 IRIS 就绪（约 1~2 分钟） |
 | 7 | **术语概念灌库** | ICD-10 **20,484** 条 + 药品 NRDL **3,919** / CBIH **19** 条 → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
@@ -559,23 +561,26 @@ LLM_MODEL=deepseek-chat                        # 模型名
   **平台 FHIR 规范快照**（US Core 已建模 11 类）→ **AI 按 R4 规范补全**（其余类型）」，来源在运行契约
   `note.fields.provenance` 与 UI「运行契约」列可见；有了真实数据后下次分析会自动改用真实数据形态。
   造数仍可选（真实数据形态最准）：`bash tools/datakit/run.sh seed_fhir_demo.py`。
-- **首次启动时 IRIS 起不来（容器 `Exited (1)`）—— Windows/WSL 绑定挂载坑，已自动兜住**：IRIS 以 `irisowner` 身份运行，
-  首次启动要把实例数据"搬迁"进 `$ISC_DATA_DIRECTORY`；而宿主新建的 `./data/iris`（以及容器早期启动创建的其下目录）
-  在容器内被呈现为 `root:root` → 搬迁那步 `chown irisowner:irisowner /dur/irissys/` 报 `EPERM`
-  （`Error while moving data directories ERROR #5001: ... Error:1:`）→ 容器退出、门户/FHIR 全无响应。
-  `tools/setup.sh` 第 4 步已**幂等预建** `data/iris/irissys`（属主 irisowner），使该 chown 退化为"chown 自己的目录"而成功。
-  ⚠ 若你绕过 `setup.sh` 直接 `docker compose up -d` 并在全新数据目录上遇到此错，手动跑这两条一次性命令即可：
-  `docker compose run --rm --no-deps -u 0:0 --entrypoint sh iris -c 'chown irisowner:irisowner /dur'` 与
-  `docker compose run --rm --no-deps -u irisowner --entrypoint sh iris -c 'mkdir -p /dur/irissys && chown irisowner:irisowner /dur/irissys'`。
-- **管理门户 / FHIR 端点打不开（52773 无响应）—— Windows + Docker Desktop 已知坑，已自动兜住**：IRIS 的私有 Web 服务器
-  把 pid 文件写在 `$ISC_DATA_DIRECTORY`（即 `./data/iris` **绑定挂载**）里；Apache 建 pid 要做
-  `open(tmp) → write → rename`，而 Docker Desktop 的文件共享层在部分情形下对新建文件的 `rename`/`chmod`
-  返回 `EPERM`（`httpd/logs/error.log: AH10231 Failed creating pid file`）→ httpd 静默退出 ⇒
-  **门户与 FHIR 端点全部无响应**（`curl` 空响应 / exit 52），而容器健康检查（进程级）仍报 healthy —— 属静默失效。
-  `iris/setup.sh` 第 7 步已幂等修正（`PidFile /tmp/httpd.pid` + 必要时拉起 httpd + 核验 52773），
-  容器每次启动都自动生效；原因、规避原理与手工修法见该步骤注释。
-  ⚠ 另：**容器重启后** Docker Desktop 的宿主端口转发可能需数十秒才重建，期间宿主 `curl` 会短暂 000，
-  稍等再试即可（容器内是立即就绪的）。
+- **Windows + Docker Desktop：IRIS「首次启动搬迁 / 门户 52773」两个坑（已自动规避）**：
+  ① **首次启动搬迁失败**：IRIS 以 `irisowner` 运行，首次启动要把实例数据"搬迁"进 `$ISC_DATA_DIRECTORY`；而
+  **Windows 绑定挂载**经 Docker Desktop 文件共享层时 `chown`/`rename` 等 POSIX 元数据操作不可靠（实测三种调用方式
+  分别把新建目录呈现为 `root` / `ubuntu(1000)` / 正确属主，chown 全部 `EPERM`）→
+  `Error while moving data directories ERROR #5001: Error executing chown irisowner:irisowner /dur/irissys/: Error:1:`
+  → 容器 `Exited (1)`；
+  ② **私有 Web 服务器 pid 文件写不进**：Apache 建 pid 要 `open(tmp) → write → rename`，同一限制会返回 `EPERM`
+  （`httpd/logs/error.log: AH10231 Failed creating pid file`）→ httpd 静默退出、**门户与 FHIR 端点全部无响应**
+  （`curl` 空响应 / exit 52），而容器健康检查（进程级）仍报 healthy —— 两个坑都是**静默失效**，只有真去连 HTTP 才暴露。
+  **已入库的修法**：
+  - `docker-compose.windows.yml`：把 `/dur` 从 `./data/iris` **绑定挂载**换成**命名卷** `dataflow-iris-dur`
+    （Docker 虚拟机内真实 ext4，`chown`/`rename` 全部正常）→ 一次消除 ① 与 ②；`tools/setup.sh` 在 Windows/WSL 下
+    **自动启用**（设置 `COMPOSE_FILE`）+ 建卷 + 把卷根属主改为 irisowner；
+  - `iris/setup.sh` 第 7 步：把私有 Web 服务器的 `PidFile` 指到容器内 `/tmp/httpd.pid`，必要时自动拉起 httpd 并核验门户
+    （对 macOS/Linux 或仍用绑定挂载的手工 compose 场景同样有效）。
+  - ⚠ **手工用 compose 时必须带上覆盖文件**，否则会退回绑定挂载、读写另一份数据目录：
+    `docker compose -f docker-compose.yml -f docker-compose.windows.yml ps`；
+    清数据 = `docker volume rm dataflow-iris-dur`。
+  - ⚠ **容器重启后** Docker Desktop 的宿主端口转发可能需数十秒才重建，期间宿主 `curl` 会短暂返回 000，稍等再试
+    （容器内是立即就绪的）。
 - **注意：不要修改 IRIS 的 Web Application / Security 权限**（管理门户与 Ensemble 门户依赖，属外部环境）。
 
 ## 许可

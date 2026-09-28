@@ -246,7 +246,14 @@ docker compose up -d   # first run builds images & initializes FHIR Server + tar
 http://localhost       # Chinese UI (default)   |   http://localhost/en  # English UI
 ```
 
-Stop: `docker compose down` (add `-v` to also wipe the IRIS data directory).
+Stop: `docker compose down`. ⚠ To **wipe data** (FHIR data / target tables / registrations) do not rely on `down -v`:
+
+```bash
+# Windows / Docker Desktop  (/dur = named volume dataflow-iris-dur):
+docker volume rm dataflow-iris-dur        # then: bash tools/setup.sh  (first boot rebuilds the instance data)
+# macOS / Linux            (/dur = bind mount ./data/iris):
+mv data/iris data/iris.bak-$(date +%Y%m%d)  # then: docker compose up -d
+```
 
 ## Demo Environment Initialization (what `bash tools/setup.sh` does)
 
@@ -259,7 +266,7 @@ Stop: `docker compose down` (add `-v` to also wipe the IRIS data directory).
 | 2 | Prepare `.env` (copied from `.env.example` if missing) | **AI features need `LLM_*`**; without it AI endpoints fail explicitly while the platform still runs |
 | 3 | Create `data/` subdirs | `data/iris`, `data/iris-terminology`, `data/terms-inbox`, `data/embedding-model` |
 | 4 | Build & start containers | **4 by default**: `iris`, `backend`, `frontend`, `iris-terminology` (add `--with-embedding` to include embedding) |
-| 4b | **Pre-first-boot: pre-create the data directory** | Only when `data/iris` has no instance yet: chown `data/iris` to irisowner (as root), then pre-create `irissys/` **as irisowner** — on Windows/WSL bind mounts IRIS's first-boot "move data directory" needs irisowner ownership, otherwise `chown ... EPERM` → container exits (1) |
+| 4b | **Windows: use a named volume for the IRIS data dir** (`docker-compose.windows.yml`, enabled automatically by `setup.sh`) | On Windows/WSL `/dur` moves from the `./data/iris` bind mount to the named volume `dataflow-iris-dur` (created + chowned to irisowner). Reason: bind mounts through Docker Desktop's file-sharing layer make `chown`/`rename` unreliable, so IRIS's first-boot "move data directory" fails with `EPERM` → container exits (1); a named volume is real ext4 inside the VM and removes this whole class of problems |
 | 5 | Extract the JDBC driver | One command copies `intersystems-jdbc-*.jar` out of the IRIS image into `./jdbc/` (no downloads) |
 | 6 | **Create CLINIC source tables** | `Patient/Encounter/Diagnosis/MedicationOrder` — **idempotent** (create-only-if-missing, never drops data); the first install waits for IRIS to become ready (~1–2 min) |
 | 7 | **Load terminology concepts** | ICD-10 **20,484** + drugs NRDL **3,919** / CBIH **19** → `Terminology_Icd10.Concept` / `Terminology_Drug.Code` |
@@ -577,26 +584,30 @@ See [`tools/guard/README.md`](tools/guard/README.md) for the full design, verifi
   pipelines cannot run at the same time — extra groups are generated as `suspended`; use the **enable / disable**
   buttons on the "Pipelines" card for one-click switching (units are freed by disabling other active pipelines,
   listed in `disabled_others`).
-- **IRIS fails to start on first boot (`Exited (1)`) — Windows/WSL bind-mount pitfall, handled automatically**:
-  IRIS runs as `irisowner` and on first boot *relocates* the instance data into `$ISC_DATA_DIRECTORY`; on Windows/WSL
-  bind mounts the freshly created host dir `./data/iris` (and dirs created by the container's early startup) appear as
-  `root:root`, so that relocation's `chown irisowner:irisowner /dur/irissys/` fails with `EPERM`
-  (`Error while moving data directories ERROR #5001: ... Error:1:`) and the container exits — portal and FHIR endpoints
-  then answer nothing. `tools/setup.sh` step 4 now idempotently pre-creates `data/iris/irissys` **as irisowner**, which
-  turns that chown into a no-op that succeeds. If you bypass `setup.sh` with a plain `docker compose up -d` and hit this
-  on a fresh data directory, run these two one-off commands once:
-  `docker compose run --rm --no-deps -u 0:0 --entrypoint sh iris -c 'chown irisowner:irisowner /dur'` and
-  `docker compose run --rm --no-deps -u irisowner --entrypoint sh iris -c 'mkdir -p /dur/irissys && chown irisowner:irisowner /dur/irissys'`.
-- **Portal / FHIR endpoints unreachable (52773 does not respond) — known Windows + Docker Desktop pitfall, handled automatically**:
-  the IRIS private web server writes its pid file under `$ISC_DATA_DIRECTORY` (i.e. the `./data/iris` **bind mount**);
-  Apache creates it via `open(tmp) → write → rename`, and Docker Desktop's file-sharing layer can reject the
-  `rename`/`chmod` of a freshly created file with `EPERM` (`httpd/logs/error.log: AH10231 Failed creating pid file`)
-  → httpd exits silently, so **the portal and every FHIR endpoint stop responding** (`curl` empty reply / exit 52)
-  while the container health check (process-level) still reports healthy — a silent failure.
-  `iris/setup.sh` step 7 fixes it idempotently (`PidFile /tmp/httpd.pid`, start httpd if needed, verify 52773) and
-  applies on every container start; see that step's comments for the cause and the manual workaround.
-  ⚠ Also: **after a container restart** Docker Desktop may take tens of seconds to re-establish host port
-  forwarding — host `curl` can briefly return 000, just retry (inside the container it is ready immediately).
+- **Windows + Docker Desktop: two IRIS pitfalls — first-boot relocation and the portal on 52773 (avoided automatically)**:
+  ① **First-boot relocation fails**: IRIS runs as `irisowner` and on first boot *relocates* the instance data into
+  `$ISC_DATA_DIRECTORY`; on a **Windows bind mount** the file-sharing layer makes `chown`/`rename` unreliable
+  (measured: freshly created dirs show up as `root` / `ubuntu(1000)` / the right owner depending on how the mount was
+  referenced — `chown` always ended in `EPERM`) →
+  `Error while moving data directories ERROR #5001: Error executing chown irisowner:irisowner /dur/irissys/: Error:1:`
+  → container `Exited (1)`;
+  ② **The private web server cannot write its pid file**: Apache creates it via `open(tmp) → write → rename`, the same
+  limitation returns `EPERM` (`httpd/logs/error.log: AH10231 Failed creating pid file`) → httpd exits silently and
+  **the portal plus every FHIR endpoint stop responding** (`curl` empty reply / exit 52) while the container health check
+  (process-level) still reports healthy — both pitfalls are **silent failures**.
+  **Fixes shipped in this repo**:
+  - `docker-compose.windows.yml`: `/dur` switches from the `./data/iris` **bind mount** to the **named volume**
+    `dataflow-iris-dur` (real ext4 inside the Docker VM — `chown`/`rename` work) → removes ① and ② at once;
+    `tools/setup.sh` **enables it automatically** on Windows/WSL (sets `COMPOSE_FILE`), creates the volume and chowns
+    its root to `irisowner`;
+  - `iris/setup.sh` step 7: points the private web server's `PidFile` at `/tmp/httpd.pid` inside the container and
+    starts/verifies httpd when needed (also helps macOS/Linux or hand-rolled `docker compose` setups that still use a
+    bind mount).
+  - ⚠ **When using compose by hand you must pass the override file**, otherwise you fall back to the bind mount and
+    read/write a different data directory: `docker compose -f docker-compose.yml -f docker-compose.windows.yml ps`;
+    to wipe data: `docker volume rm dataflow-iris-dur`.
+  - ⚠ **After a container restart** Docker Desktop may take tens of seconds to re-establish host port forwarding —
+    host `curl` can briefly return 000, just retry (inside the container it is ready immediately).
 - **Component fidelity self-check**: `python3 tools/check_component_fidelity.py`; toolbox index:
   `bash tools/datakit/run.sh list` (includes `test_incremental_pipeline.py` and data-generation scripts).
 
