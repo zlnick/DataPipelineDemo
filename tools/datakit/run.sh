@@ -22,7 +22,7 @@ CTR="dataflow-backend"
 list_scripts() {
   echo "== host/：宿主机执行（后端 API :5001 / FHIR :52773）=="
   printf '   %-28s %s\n' \
-    "gen_test_patient.py"        "★造 FHIR 测试数据：造源数据→触发同步→校验落地" \
+    "gen_test_patient.py"        "★造测试数据+校验落地（clinic→FHIR 落地；--source user→SQL 源表→SOAP/DB）" \
     "seed_clinic.py"             "★造 CLINIC 演示数据（等价界面「生成演示数据」按钮）" \
     "check_fhir.py"              "★查 FHIR 落地情况：各资源数量 + UUID 校验" \
     "check_new_patient.py"       "核实新患者 MRN-1003 整户资源及引用关联" \
@@ -44,7 +44,7 @@ list_scripts() {
     "clinic_tables.py"           "CLINIC 源库四表初始化（幂等）" \
     "clinic_seed_data.py"        "CLINIC 样例数据：10 患者 + 就诊/诊断/药嘱" \
     "add_one_patient.py"         "★追加 1 个患者（含就诊/诊断/药嘱），不清空现有数据" \
-    "generate_mock_data.py"      "生成 mock 数据（--fhir N --sql M）" \
+    "generate_mock_data.py"      "生成 mock 数据（--fhir N；--sql M 直接写目标表 PatientEntity，不是源表）" \
     "seed_target_tables.py"      "★往 USER 的 Patient/Observation 目标表造测试数据（--count N --obs M --clear）" \
     "seed_fhir_demo.py"          "手动灌 FHIR 演示样本（10 Patient+30 Obs；已移出启动链，仅需历史存量时跑）" \
     "rescan_sql_source.py"       "★SQL 源全量重扫（停 Production→清凭证→启→核验）" \

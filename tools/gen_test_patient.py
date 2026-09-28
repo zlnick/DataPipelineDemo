@@ -9,6 +9,20 @@
     python3 tools/gen_test_patient.py --force                # 停→清 SQL 源扫描凭证→启（全量重扫）
     python3 tools/gen_test_patient.py --no-verify            # 只造数，不等待校验
 
+SQL→SOAP / SQL→DB（`--source user`）：造 USER 库的 SQL **源表**，再等管道把结果写进**目标表**：
+
+    python3 tools/gen_test_patient.py --source user --count 3                          # 源表 SQLUser.Patient（默认）
+    python3 tools/gen_test_patient.py --source user --table PatientSource --count 3    # 源表换成 PatientSource
+    python3 tools/gen_test_patient.py --source user --verify-table Patient --count 3   # 校验 SQL→DB 写回的 Patient
+
+需求表（USER 命名空间）与脚本的对应关系：
+
+| 表 | 角色 | 谁写它 |
+|---|---|---|
+| `Patient` | SQL 源（结构 = ID/FamilyName/GivenName/Gender/BirthDate/Phone/Address/City） | 本脚本 `--table Patient`（默认） |
+| `PatientSource` | SQL 源（README「步骤 B」的业务库演示表，结构与 `Patient` 相同） | 本脚本 `--table PatientSource` |
+| `PatientEntity` | **SOAP 落库表（目标）**，由 mock `AddPatient` UPSERT | 管道运行结果（`--verify-table` 默认查它） |
+
 行为：①CLINIC 追加 N 位患者（含就诊/诊断/药嘱，引用完整）②等待源适配器增量投递（--force 则全量重扫）
 ③按 identifier 查回 FHIR（打印中文姓名）、统计子资源数量，并给出计数前后对比。
 """
@@ -46,7 +60,13 @@ def main_in_container():
     ap = argparse.ArgumentParser(description="生成 FHIR 测试患者数据")
     ap.add_argument("--source", choices=("clinic", "user"), default="clinic",
                     help="clinic=造 CLINIC 源并校验 FHIR 落地（默认）；"
-                         "user=造 USER 库 SQLUser.Patient 并校验 SOAP/DB 目标落库")
+                         "user=造 USER 库 SQL 源表并校验 SQL→SOAP / SQL→DB 目标落库")
+    ap.add_argument("--table", choices=("Patient", "PatientSource"), default="Patient",
+                    help="--source user 时的源表 SQLUser.<表>：Patient=SQL→SOAP 演示默认；"
+                         "PatientSource=README「步骤 B」的业务库演示表（同结构，避开与目标表同名造成回环）")
+    ap.add_argument("--verify-table", default="",
+                    help="--source user 时的落库校验表（USER 命名空间）；默认 PatientEntity"
+                         "（SOAP mock 落库表），SQL→DB 写回 Patient 时传 --verify-table Patient")
     ap.add_argument("--count", type=int, default=1)
     ap.add_argument("--family", default="")
     ap.add_argument("--given", default="")
@@ -224,10 +244,24 @@ def main_in_container():
               f"Condition={cond} MedicationRequest={med}")
 
 
-def _run_user_source(args):
-    """向 USER 库的 SQLUser.Patient 插 N 行（供 SQL→SOAP / SQL→DB 管道测试），并校验目标落库。
+# `--source user` 的落库校验口径：表 → (校验查询 SQL, 打印列名)；默认 PatientEntity（SOAP mock 落库表）。
+_VERIFY_QUERIES = {
+    "PatientEntity": ("SELECT PatientNo, FullName, Gender FROM SQLUser.PatientEntity WHERE PatientNo=?",
+                      ["PatientNo", "FullName", "Gender"]),
+    "PatientSource": ("SELECT ID, FamilyName, GivenName FROM SQLUser.PatientSource WHERE ID=?",
+                      ["ID", "FamilyName", "GivenName"]),
+    "Patient": ("SELECT ID, FamilyName, GivenName FROM SQLUser.Patient WHERE ID=?",
+                ["ID", "FamilyName", "GivenName"]),
+}
 
-    SOAP 目标（demo 内置 AddPatient mock）会把结果 UPSERT 到 SQLUser.PatientEntity（PatientNo/FullName/Gender）。
+
+def _run_user_source(args):
+    """向 USER 库的 SQL **源表**（默认 `SQLUser.Patient`）插 N 行，供 SQL→SOAP / SQL→DB 管道测试，并校验目标落库。
+
+    源表用 `--table` 选（`Patient` / `PatientSource`，两者结构相同：ID/FamilyName/GivenName/Gender/
+    BirthDate/Phone/Address/City），主键沿用 `P0001…`（按现有行数顺延，重复执行不互相覆盖）。
+    SOAP 目标（demo 内置 AddPatient mock）会把结果 UPSERT 到 `SQLUser.PatientEntity`
+    （PatientNo/FullName/Gender），即默认的校验口径；SQL→DB 写回 `Patient` 时用 `--verify-table Patient`。
     """
     import time
 
@@ -235,25 +269,38 @@ def _run_user_source(args):
 
     from backend.services import iris_connector as ic
 
+    table = getattr(args, "table", "Patient")
+    verify_table = getattr(args, "verify_table", "") or "PatientEntity"
+    verify_sql, verify_cols = _VERIFY_QUERIES.get(verify_table, _VERIFY_QUERIES["PatientEntity"])
+
     conn = iris.dbapi.connect(hostname="iris", port=1972, namespace="USER",
                               username="superuser", password="SYS")
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM SQLUser.Patient")
-    idx = int(cur.fetchone()[0])
+    cur.execute(f"SELECT COUNT(*) FROM SQLUser.{table}")
+    base = int(cur.fetchone()[0])
     created = []
-    for _ in range(max(1, args.count)):
-        idx += 1
-        pid = f"P{idx:04d}"
+    for n in range(1, max(1, args.count) + 1):
+        idx = base + n
         fam = args.family or "测试"
         giv = args.given or f"患者{idx}"
-        gender = "male" if idx % 3 else "female"
-        cur.execute("INSERT INTO SQLUser.Patient (ID,FamilyName,GivenName,Gender,BirthDate,"
+        created.append({"pid": f"P{idx:04d}", "fam": fam, "giv": giv, "name": f"{fam}{giv}",
+                        "gender": "male" if idx % 3 else "female"})
+
+    # 基线：校验表里**已存在**的同主键行 —— 这类行无法判别是否本次投递（否则会报假 ✓）。
+    # 必须在 INSERT 之前取（插入才会触发管道投递）。
+    stale = {c["pid"] for c in created if ic.query(verify_sql, [c["pid"]])}
+    if stale:
+        print(f"[造数] 提示：{verify_table} 中已存在同主键 " + ", ".join(sorted(stale))
+              + " —— 这些行不参与落库判别")
+
+    for c in created:
+        cur.execute(f"INSERT INTO SQLUser.{table} (ID,FamilyName,GivenName,Gender,BirthDate,"
                     "Phone,Address,City) VALUES (?,?,?,?,?,?,?,?)",
-                    [pid, fam, giv, gender, "1990-01-01", f"139{idx:08d}", "测试路1号", "测试市"])
-        created.append({"pid": pid, "name": f"{fam}{giv}", "gender": gender})
+                    [c["pid"], c["fam"], c["giv"], c["gender"], "1990-01-01",
+                     f"139{int(c['pid'][1:]):08d}", "测试路1号", "测试市"])
     conn.commit()
-    cur.execute("SELECT COUNT(*) FROM SQLUser.Patient")
-    print("[造数] USER SQLUser.Patient 行数:", cur.fetchone()[0])
+    cur.execute(f"SELECT COUNT(*) FROM SQLUser.{table}")
+    print(f"[造数] USER SQLUser.{table} 行数:", cur.fetchone()[0])
     cur.close()
     conn.close()
     for c in created:
@@ -263,26 +310,31 @@ def _run_user_source(args):
         print("[校验] 已跳过（--no-verify）")
         return
 
-    print(f"[校验] 等待 SOAP 目标落库（最长 {args.timeout}s，看 SQLUser.PatientEntity）…")
+    pending = [c for c in created if c["pid"] not in stale]
+    if not pending:
+        print(f"[校验] 本次 {len(created)} 位在 {verify_table} 里已有同主键，无法判别是否新投递"
+              f"（换一张主键不重叠的源表，或先清理 {verify_table}）")
+        return
+    print(f"[校验] 等待目标落库（最长 {args.timeout}s，看 SQLUser.{verify_table}）…")
     deadline = time.time() + args.timeout
     found = {}
     while time.time() < deadline:
-        for c in created:
+        for c in pending:
             if c["pid"] in found:
                 continue
-            rows = ic.query("SELECT PatientNo, FullName, Gender FROM SQLUser.PatientEntity "
-                            "WHERE PatientNo=?", [c["pid"]])
+            rows = ic.query(verify_sql, [c["pid"]])
             if rows:
                 found[c["pid"]] = rows[0]
-        if len(found) == len(created):
+        if len(found) == len(pending):
             break
         time.sleep(5)
-    for c in created:
+    for c in pending:
         r = found.get(c["pid"])
         if r:
-            print(f"[校验] ✓ PatientEntity: PatientNo={r[0]} FullName={r[1]} Gender={r[2]}")
+            detail = " ".join(f"{k}={v}" for k, v in zip(verify_cols, r))
+            print(f"[校验] ✓ {verify_table}: {detail}")
         else:
-            print(f"[校验] ✗ {c['pid']} 未落到 PatientEntity"
+            print(f"[校验] ✗ {c['pid']} 未落到 {verify_table}"
                   f"（查消息/错误日志与源扫描凭证，或加 --force 全量重扫）")
 
 

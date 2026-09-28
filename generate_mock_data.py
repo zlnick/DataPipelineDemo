@@ -7,8 +7,10 @@
 说明：
 - FHIR：向 FHIR **源**仓库事务写入几条 Patient（触发 FHIR 增量抓取链路）。
   地址取 `FHIRConfig.BASE_URL`，演示默认 = 第二个独立仓库 **DemoFHIR**（`/csp/healthshare/demofhir/fhir/r4`）。
-- SQL：向 SQLUser.PatientEntity（SQL 源演示表，三字段实体）插入几条行
-  （触发 SQL 源轮询 → SOAP 投递链路）。假设 SQL 源向导选择了 PatientEntity 表。
+- SQL：向 `SQLUser.PatientEntity`（**SOAP mock 的落库表**，三字段 PatientNo/FullName/Gender）插入几条行。
+  ⚠ 它是 SQL→SOAP 管道的**目标表**（由 mock `AddPatient` UPSERT），不是源表：
+  仅当你的 SQL 源向导选的正是 `PatientEntity` 时才对应管道；否则请用
+  `tools/gen_test_patient.py --source user [--table Patient|PatientSource]` 造**源表**数据。
 - 主键带时间戳后缀，重复执行不互相覆盖。
 """
 

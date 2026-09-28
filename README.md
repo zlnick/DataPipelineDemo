@@ -517,11 +517,22 @@ LLM_MODEL=deepseek-chat                        # 模型名
 5. **看效果**：往 FHIR 写新资源（或用「生成模拟数据」按钮）→ 增量抓取 → 消息 Completed → 落库。
 
 ### B. SQL → SOAP（数据源 = SQL 表，目标 = 第三方 SOAP 接口，Python mock 应答）
-1. **添加 SQL 数据源**：数据源向导 → JDBC 连接 → 选 schema → 选表 **`PatientSource`**（与 Patient 同结构的“业务库”演示表）→ 分析列 → 自动生成轮询 Query。
+1. **添加 SQL 数据源**：数据源向导 → JDBC 连接 → 选 schema → 选表 **`PatientSource`**（与 Patient 同结构的“业务库”演示表；选 **`Patient`** 也可以——造数脚本两张源表都支持）→ 分析列 → 自动生成轮询 Query。
 2. **添加 SOAP 目标**：转换目标 → SOAP → WSDL `/tmp/patient.wsdl`（内置**写入型 AddPatient**）→ 导入生成 BO + 实体分析（运行契约自动判定 `AddPatient → 写入型`、endpoint 可达）。
 3. **AI 智能匹配**：选 `PatientSource`（SQL 资产，列即字段）→ AI 推荐 → 确认（mapping 自动带 `target_type=SOAP`）。
 4. **生成管道**：SQLService 轮询 `PatientSource` → 转换 → `SOAPOp_PatientService` 调用 mock（WebServiceURL）→ mock 收到实体 → 落库 `PatientEntity` 表并回执。
 5. **看效果**：往 `PatientSource` 插几行患者 → SQLService 轮询投递 → Pipelines 消息 Completed + `PatientEntity` 可见（下拉动态含 `PatientEntity`/`PatientSource`）。
+   - **本场景可用脚本**（一步造数 + 自动校验落库；完整清单见 `tools/datakit/README.md` 「六.1 SQL → SOAP」）：
+     ```bash
+     # 源表 PatientSource（本节口径）
+     bash tools/datakit/run.sh gen_test_patient.py --source user --table PatientSource --count 3
+     # 源表 Patient（同一场景，换一张源表；也是脚本默认值）
+     bash tools/datakit/run.sh gen_test_patient.py --source user --count 3
+     # 复核：SOAP 落库 PatientEntity + 最近业务消息（不看脚本输出）
+     bash tools/datakit/run.sh check_pair_sink.py
+     ```
+   - 排错顺序：`diag_msgs.py`（消息头/扫描凭证）→ `diag_errors.py`（Ens 事件日志）→ `rescan_sql_source.py`（强制重扫 SQL 源）；
+     或在造数时加 `--force`（停 → 清扫描凭证 → 启，走全量重扫）。
 
 ### C. 多管道并存（单 Production 内 FHIR→DB 与 SQL→SOAP 同时跑）
 - 前端一次确认多组转换关系后，生成 body 走 `pipelines: [组1, 组2]`；

@@ -44,12 +44,12 @@ tools/datakit/
 
 | 脚本 | 用途 | 用法示例 |
 |---|---|---|
-| `host/gen_test_patient.py` ★ | **一键造测试数据并校验落地**（`--source` 决定造哪一侧）：`clinic`＝造 CLINIC 源 → 校验 FHIR 落地/中文/引用；**`user`＝造 USER 库 `SQLUser.Patient` → 校验 SQL→SOAP / SQL→DB 目标落库**（SOAP 口径看 `SQLUser.PatientEntity`） | `./run.sh gen_test_patient.py --source user --count 3`（FHIR 口径：`./run.sh gen_test_patient.py --count 2 --family 赵 --given 敏 --diagnosis 糖尿病 --drug 阿司匹林`） |
+| `host/gen_test_patient.py` ★ | **一键造测试数据并校验落地**（`--source` 决定造哪一侧）：`clinic`＝造 CLINIC 源 → 校验 FHIR 落地/中文/引用；**`user`＝造 USER 库 SQL **源表**（`--table Patient`（默认）/ `PatientSource`）→ 校验 SQL→SOAP / SQL→DB 目标落库**（默认校验 `SQLUser.PatientEntity`，`--verify-table` 可换） | `./run.sh gen_test_patient.py --source user --count 3`（FHIR 口径：`./run.sh gen_test_patient.py --count 2 --family 赵 --given 敏 --diagnosis 糖尿病 --drug 阿司匹林`） |
 | `host/seed_clinic.py` | 生成 CLINIC 演示数据（等价界面「生成演示数据」按钮） | `./run.sh seed_clinic.py` |
 | `container/clinic_tables.py` | CLINIC 源库**四表初始化**（幂等，患者/就诊/诊断/药嘱） | `./run.sh clinic_tables.py` |
 | `container/clinic_seed_data.py` | CLINIC 样例数据：10 患者 + 就诊/诊断/药嘱（术语只取中文术语集） | `./run.sh clinic_seed_data.py` |
 | `container/add_one_patient.py` | **追加 1 个患者**（含就诊/诊断/药嘱，引用完整），**不清空**现有数据 | `./run.sh add_one_patient.py` |
-| `container/generate_mock_data.py` | 生成 mock 数据（FHIR/SQL 两侧可分别指定条数） | `./run.sh generate_mock_data.py --fhir 5 --sql 3` |
+| `container/generate_mock_data.py` | 生成 mock 数据（FHIR/SQL 两侧可分别指定条数）。⚠ `--sql` 写的是 **SQL→SOAP 的目标表** `SQLUser.PatientEntity`（不是源表！要造**源数据**请用 `gen_test_patient.py --source user`） | `./run.sh generate_mock_data.py --fhir 5 --sql 3` |
 | `container/seed_target_tables.py` | ★**直接往 USER 目标表** `SQLUser.Patient` / `SQLUser.Observation` 造测试数据（不经过管道） | `./run.sh seed_target_tables.py --count 3`（`--obs 2`、`--family 赵`、`--clear`） |
 | `container/seed_fhir_demo.py` | **手动**灌 FHIR 演示样本（10 Patient + 30 Observation，PUT 幂等）。⚠ 已移出 backend 启动链（2026-09-16）：演示数据一律用时现造；只有需要"库里本就有历史存量"时才跑（跑完会把增量同步游标推进到当前时间） | `./run.sh seed_fhir_demo.py` |
 
@@ -57,7 +57,9 @@ tools/datakit/
 
 | 参数 | 说明 |
 |---|---|
-| `--source user` | **造 USER 库 `SQLUser.Patient`**（供 **SQL→SOAP / SQL→DB** 管道），并校验目标落库（SOAP 口径 = `SQLUser.PatientEntity`）；不传则默认 `clinic`（造 CLINIC 源、校验 FHIR 落地） |
+| `--source user` | **造 USER 库的 SQL 源表**（供 **SQL→SOAP / SQL→DB** 管道），并校验目标落库；不传则默认 `clinic`（造 CLINIC 源、校验 FHIR 落地） |
+| `--table PatientSource` | `--source user` 时换源表（默认 `Patient`）：`Patient`=SQL→SOAP 演示默认；`PatientSource`=README「步骤 B」的业务库演示表（结构相同，避开与目标表同名造成回环） |
+| `--verify-table Patient` | `--source user` 时的落库校验表（默认 `PatientEntity`=SOAP mock 落库）；**SQL→DB 写回 `Patient` 时用本参数**；⚠ 校验表里已有同主键行时脚本只提示、不判 ✓（避免假绿） |
 | `--family 赵` / `--given 敏` | 患者姓名（中文，用于校验编码是否正确落地；`--source user` 时默认「测试/患者N」） |
 | `--count 2` | 生成几位患者 |
 | `--diagnosis 糖尿病` / `--drug 阿司匹林` | 诊断/药品（走中文术语 → 判码链路） |
@@ -205,6 +207,51 @@ curl -s "http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/Patient?_summ
 | 看哪些组件启用 / 许可够不够 | `./run.sh list_prod_items.py` 或 `curl -s localhost:5001/api/pipelines/items` |
 | 怀疑有组件白占许可（谁知道它在给谁用） | `./run.sh diag_shared_components.py` → 见「使用者: 【无】」即零使用者；`POST /api/pipelines/items/toggle {"name":"…","enabled":false}` 释放 |
 | 重新生成管道 | `./run.sh regenerate_pipeline.py` |
+
+### 六.1 SQL → SOAP（SQL 表源 → SOAP 接口；目标 = mock 落库 `PatientEntity`）
+
+| 我想… | 命令 | 说明 |
+|---|---|---|
+| **造数并自动校验落库**（源表 `Patient`） | `./run.sh gen_test_patient.py --source user --count 3` | 插 `USER.SQLUser.Patient`（key=`ID`）→ 等管道写进 `PatientEntity`，逐行打印 ✓/✗ |
+| 造数（源表 `PatientSource`，README「步骤 B」口径） | `./run.sh gen_test_patient.py --source user --table PatientSource --count 3` | 主键口径同 `Patient`；校验表仍是 `PatientEntity` |
+| 带中文姓名（验全链路编码） | `./run.sh gen_test_patient.py --source user --count 2 --family 赵 --given 敏` | `姓名 = FamilyName + " " + GivenName`（映射里的 `concat`），落地后应为「赵 敏」而不是 `?` |
+| 复核（不依赖脚本输出） | `./run.sh check_pair_sink.py` | SOAP 落库 `PatientEntity` + 最近业务消息 |
+| 看目标数据（API） | `curl -s "localhost:5001/api/pipelines/target-data?table=PatientEntity&limit=5"` | 与 UI「数据管道」页下拉同源 |
+| 数据造了但管道没动 | `./run.sh diag_msgs.py` → `./run.sh diag_errors.py` → `./run.sh rescan_sql_source.py` | 依次看：消息头/扫描凭证 → Ens 事件日志 → 强制重扫 SQL 源（或造数时加 `--force`） |
+| 消息 Completed 但表里没有 | `docker logs --tail 50 dataflow-backend`（日志里搜 `mock SOAP`） | 有 `mock SOAP AddPatient 接收实体: …` = mock 收到了；没有 = SOAP 调用没到（看 `diag_errors.py`） |
+
+⚠ **落库判别的两条前提**：① 校验表里**不能已有同主键行**（否则脚本只提示「已存在同主键 P0005 … 这些行不参与落库判别」，不判 ✓，避免假绿）；
+② 源表要么空、要么主键顺延（脚本按 `COUNT(*)`+1 起编号，不会覆盖已有行）。
+
+### 六.2 SQL → FHIR（CLINIC 表源 → FHIR 目标）
+
+| 我想… | 命令 |
+|---|---|
+| 造数 + 等 FHIR 落地（含术语判码） | `./run.sh gen_test_patient.py --count 2 --diagnosis 糖尿病 --drug 阿司匹林` |
+| 等价界面「生成演示数据」按钮 | `./run.sh seed_clinic.py` |
+| 追加 1 位（不清空现有数据） | `./run.sh add_one_patient.py` |
+| 查数量 / 中文 / 引用完整性 | `./run.sh check_fhir.py`、`./run.sh check_name_encoding.py`、`./run.sh check_new_patient.py` |
+
+### 六.3 FHIR → DB 与 SQL → DB（写回 USER 目标表）
+
+| 我想… | 命令 | 说明 |
+|---|---|---|
+| 只造「目标表」观感（不经管道） | `./run.sh seed_target_tables.py --count 3 --obs 2` | **直写** `USER.Patient` / `Observation` |
+| SQL→DB 造源数据（源=`PatientSource`） | `./run.sh gen_test_patient.py --source user --table PatientSource --count 3 --verify-table Patient` | 源与目标不同名（避免回环），校验写回的 `Patient` |
+| SQL→DB 造源数据（源=`Patient`） | `./run.sh gen_test_patient.py --source user --count 3 --verify-table Patient` | ⚠ 源=目标同名表：主键天然重叠 → 插入正常，但落库判别会提示「不可判别」（别当失败） |
+| FHIR 侧存量（历史数据） | `./run.sh seed_fhir_demo.py` | 手动灌 10 Patient + 30 Observation（已移出启动链） |
+
+### 六.4 USER 命名空间「表 ↔ 角色 ↔ 谁写它」对照（排错必备）
+
+| 表 | 角色 | 谁写它 |
+|---|---|---|
+| `Patient` | SQL **源**（SQL→SOAP 演示默认源表）；结构 `ID/FamilyName/GivenName/Gender/BirthDate/Phone/Address/City` | `gen_test_patient.py --source user`（默认 `--table Patient`） |
+| `PatientSource` | SQL **源**（README「步骤 B」业务库演示表，结构与 `Patient` 相同） | `gen_test_patient.py --source user --table PatientSource` |
+| `PatientEntity` | SQL→SOAP 的 **目标**（mock `AddPatient` UPSERT：`PatientNo/FullName/Gender`） | 管道运行结果；另有 `generate_mock_data.py --sql N` 直写（无管道演示） |
+| `Patient` / `Observation`（USER） | FHIR→DB、SQL→DB 的 **目标** | 管道运行结果；`seed_target_tables.py` 直写（不经管道） |
+| `FHIRQueue` | FHIR→DB 排队表 | 管道 |
+
+> `Patient` 同时可能是 FHIR→DB 的目标与 SQL→SOAP 的源 → **别让同一条链的源/目标同名**（回环风险，见 README 演示步骤 C）。
 
 ---
 

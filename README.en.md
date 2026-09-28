@@ -508,13 +508,24 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
 5. **See the effect**: write new resources (or use **Generate Mock Data**) → messages Completed → data lands.
 
 ### B. SQL → SOAP (SQL table source → SOAP served by the Python mock)
-1. **Add SQL source**: JDBC wizard → schema → table **`PatientSource`** → analyze columns (polling Query generated).
+1. **Add SQL source**: JDBC wizard → schema → table **`PatientSource`** (**`Patient`** works too — the seeding script supports both source tables) → analyze columns (polling Query generated).
 2. **Add SOAP target**: SOAP with WSDL `/tmp/patient.wsdl` (write-type **AddPatient**) → import (BO + entities);
    the runtime contract marks `AddPatient → write`.
 3. **AI Matching**: select `PatientSource` → confirm (mapping carries `target_type=SOAP`).
 4. **Generate pipeline**: `SQLService` polls `PatientSource` → converts → `SOAPOp_PatientService` calls the mock →
    mock persists to `PatientEntity` and replies.
 5. **See the effect**: insert rows into `PatientSource` → polling delivers → Completed + `PatientEntity` rows appear.
+   - **Scripts for this scenario** (seed + auto-verify landing; full list in `tools/datakit/README.md` §6.1):
+     ```bash
+     # source table PatientSource (as described above)
+     bash tools/datakit/run.sh gen_test_patient.py --source user --table PatientSource --count 3
+     # source table Patient (same scenario, other source table; also the script default)
+     bash tools/datakit/run.sh gen_test_patient.py --source user --count 3
+     # independent check: SOAP landing (PatientEntity) + recent business messages
+     bash tools/datakit/run.sh check_pair_sink.py
+     ```
+   - Troubleshooting order: `diag_msgs.py` (message headers / scan credentials) → `diag_errors.py` (Ens event log) →
+     `rescan_sql_source.py` (force full rescan); or add `--force` to the seeding run.
 
 ### C. Multiple pipelines in one Production
 - Confirm several mapping groups and generate with `pipelines: [group1, group2]`; `TransformProcess` routes each
