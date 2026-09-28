@@ -16,6 +16,8 @@ from datetime import date, timedelta
 
 import iris.dbapi
 
+from backend.services.clinic_schema import ensure_tables
+
 logger = logging.getLogger(__name__)
 
 ICD_URI = "urn:cn-nhsa:icd10-gbt2016"
@@ -98,6 +100,15 @@ def generate_clinic_seed(n: int = 10) -> dict:
     conn = iris.dbapi.connect(hostname=CLINIC_HOST, port=IRIS_PORT, namespace="CLINIC",
                               username="superuser", password="SYS")
     cur = conn.cursor()
+    # 确保 CLINIC 四表存在（幂等、不删数据）：旧环境/新库缺表时自动补建，
+    # 避免「生成演示数据」因缺少源表直接失败；初始化已建表时此处为无操作。
+    try:
+        rows_ok, created = ensure_tables(cur)
+        conn.commit()
+        logger.info("CLINIC 表就绪：%s（本次新建：%s）",
+                    ", ".join("%s=%s" % r for r in rows_ok), ",".join(created) or "无")
+    except Exception as exc:  # noqa: BLE001 - 建表检查失败不阻断主流程
+        logger.warning("CLINIC 建表检查失败（仍尝试写入）：%s", exc)
     for t in ["MedicationOrder", "Diagnosis", "Encounter", "Patient"]:
         cur.execute(f"DELETE FROM {t}")
     conn.commit()

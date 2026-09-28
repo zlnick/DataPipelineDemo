@@ -124,6 +124,30 @@ def create_tables(conn) -> None:
         cursor.close()
 
 
+def ensure_clinic_tables() -> None:
+    """确保 CLINIC 演示源库四表存在（Patient/Encounter/Diagnosis/MedicationOrder，幂等）。
+
+    CLINIC 命名空间由 iris/setup.sh 创建；这里只做"缺表补建"，**不删已有数据**。
+    失败只告警不抛出：既不影响 USER 侧初始化，也不阻止 backend 启动
+    （例如容器刚起时 CLINIC 命名空间尚未建好）。
+    """
+    try:
+        from backend.services.clinic_schema import ensure_tables
+
+        conn = iris.dbapi.connect(hostname="iris", port=1972, namespace="CLINIC",
+                                  username="superuser", password="SYS")
+        try:
+            cur = conn.cursor()
+            rows, created = ensure_tables(cur)
+            conn.commit()
+            logger.info("CLINIC 源库四表就绪（本次新建：%s）：%s",
+                        ",".join(created) or "无", ", ".join("%s=%s" % r for r in rows))
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - CLINIC 未就绪时跳过
+        logger.warning("CLINIC 源库建表检查跳过/失败（由初始化脚本兜底）：%s", exc)
+
+
 def main() -> None:
     """初始化主流程。"""
     # 1. 等待 IRIS 就绪
@@ -136,6 +160,9 @@ def main() -> None:
         logger.info("IRIS 目标表初始化完成（表结构保留，数据待管道投放）")
     finally:
         conn.close()
+
+    # 3. 确保 CLINIC 演示源库四表存在（幂等；CLINIC 命名空间未就绪时自动跳过）
+    ensure_clinic_tables()
 
 
 if __name__ == "__main__":

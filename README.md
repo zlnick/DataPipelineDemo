@@ -189,6 +189,9 @@ Production 拓扑并交给 IRIS 编译启动。
 >      由 `tools/setup.sh` 调用 `bash tools/term_data_load.sh` **幂等灌入**术语服务器概念表
 >      （`Terminology_Icd10.Concept` / `Terminology_Drug.Code`）——**CLINIC「生成演示数据」依赖它**
 >      （诊断/药品的中文名取自术语库），容器重建后重跑即可恢复；来源与条款见 `NOTICE`。
+>      CLINIC 演示源库（SQL 源）四表 Patient/Encounter/Diagnosis/MedicationOrder 由
+>      `bash tools/clinic_init.sh` **幂等建表**（缺表才建、不动已有数据；`setup.sh` 已含此步，
+>      backend 启动时也会兜底检查）——缺表时 CLINIC 四表的 SQL 源 BS 会报错、「生成演示数据」也会失败。
 >      另：成品**映射种子**（`data/seeds/term_map_seed.json`，81 条）由 `tools/setup.sh` 自动导入（`tools/term_map_sync.py import`）；
 >      术语服务器的平台扩展（`/mapping/*` 路由 + `CodeMap` 表）由 `termsrv-patches/` 覆盖进子模块（`tools/termsrv_apply_patches.sh`，幂等）——
 >      因此 clone 后术语转换即可用，不依赖子模块远端是否已含这两个文件。
@@ -211,7 +214,7 @@ Production 拓扑并交给 IRIS 编译启动。
 
 ```bash
 # 1. 配置 LLM（AI 推荐功能；不配则 AI 接口返回明确提示）
-bash tools/setup.sh        # 一条命令：子模块 + .env + data 目录 + 构建启动 + JDBC 提取 + 术语概念导入 + 映射种子导入 + 健康检查
+bash tools/setup.sh        # 一条命令：子模块 + .env + data 目录 + 构建启动 + JDBC 提取 + CLINIC 源库建表 + 术语概念导入 + 映射种子导入 + 健康检查
 # 编辑 .env：填写 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL（任意 OpenAI 兼容服务）
 
 # 2. 一键启动全部服务（首次会自动构建镜像、初始化 FHIR Server 与目标表）

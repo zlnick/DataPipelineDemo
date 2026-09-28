@@ -208,6 +208,10 @@ Prerequisites: Docker + Docker Compose.
 >      `Terminology_Drug.Code`) by `bash tools/term_data_load.sh` — idempotent, and invoked by `tools/setup.sh`.
 >      **The CLINIC demo-data generator depends on it** (diagnosis/drug Chinese names come from the terminology
 >      store); re-run it after a container rebuild. Provenance and terms: see `NOTICE`.
+>      The CLINIC demo source tables (Patient/Encounter/Diagnosis/MedicationOrder) are created
+>      **idempotently** by `bash tools/clinic_init.sh` (create-only-if-missing, never drops data;
+>      `setup.sh` runs it, and the backend also re-checks on startup) — without them the CLINIC SQL-source
+>      service errors out and the "generate demo data" button fails.
 >      Also: a ready-made **mapping seed** (`data/seeds/term_map_seed.json`, 81 mappings) is imported
 >      automatically by `tools/setup.sh` (`tools/term_map_sync.py import`); the terminology server platform
 >      extensions (`/mapping/*` routes + `CodeMap`) are overlaid from `termsrv-patches/` (idempotent), so
@@ -233,7 +237,7 @@ Prerequisites: Docker + Docker Compose.
 >    re-running recovers it.
 
 ```bash
-bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + terminology concept load + mapping-seed import + health check
+bash tools/setup.sh        # ONE command: submodule + .env + data dirs + build & up + JDBC extract + CLINIC source-table init + terminology concept load + mapping-seed import + health check
 docker compose up -d   # first run builds images & initializes FHIR Server + target tables
 http://localhost       # Chinese UI (default)   |   http://localhost/en  # English UI
 ```

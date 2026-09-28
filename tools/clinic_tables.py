@@ -1,122 +1,53 @@
 # -*- coding: utf-8 -*-
-"""CLINIC 命名空间：患者/就诊/诊断/药嘱 四张源表初始化（幂等）。
+"""CLINIC 命名空间：源库四表初始化（Patient/Encounter/Diagnosis/MedicationOrder）。
 
-数据源表（面向后续「SQL 表 → FHIR(US Core)」转换演示）：
-  Patient        患者    → us-core-patient
-  Encounter      就诊    → us-core-encounter
-  Diagnosis      诊断    → us-core-condition-encounter-diagnosis
-  MedicationOrder 药嘱   → us-core-medicationrequest
-字段刻意保留与 FHIR 资源的可映射性（ID/外键/类目/状态/编码/文本）。
+表结构已收敛到单一事实源 ``backend/services/clinic_schema.py``
+（clinic_seed / init_data / 本工具共用同一份 DDL）。
 
-用法: python3 tools/clinic_tables.py
+用法（backend 容器内；宿主机用 tools/clinic_init.sh 包装调用）：
+    python3 tools/clinic_tables.py            # 默认：幂等 ensure —— 缺表才建，**已有表与数据不动**
+    python3 tools/clinic_tables.py --reset    # 重置：DROP 四表后重建（**会清空数据**，仅重置场景）
+    python3 tools/clinic_tables.py --host iris
 """
+import argparse
 import logging
+import os
 
 import iris.dbapi
+
+from backend.services.clinic_schema import CLINIC_TABLES, ensure_tables
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-HOST, PORT, NS, USER, PWD = "127.0.0.1", 1972, "CLINIC", "superuser", "SYS"
 
-DDL = [
-    # 患者（FHIR Patient）
-    """
-    CREATE TABLE Patient (
-        ID          VARCHAR(20) PRIMARY KEY,
-        MRN         VARCHAR(30),
-        FamilyName  VARCHAR(50),
-        GivenName   VARCHAR(50),
-        Gender      VARCHAR(10),
-        BirthDate   VARCHAR(20),
-        Phone       VARCHAR(30),
-        Address     VARCHAR(200),
-        City        VARCHAR(50)
-    )
-    """,
-    # 就诊（FHIR Encounter）
-    """
-    CREATE TABLE Encounter (
-        ID           VARCHAR(20) PRIMARY KEY,
-        PatientID    VARCHAR(20),
-        ClassCode    VARCHAR(20),
-        ClassDisplay VARCHAR(50),
-        Status       VARCHAR(20),
-        PeriodStart  VARCHAR(30),
-        PeriodEnd    VARCHAR(30),
-        ReasonCode   VARCHAR(20),
-        ReasonText   VARCHAR(200)
-    )
-    """,
-    # 诊断（FHIR Condition, encounter-diagnosis；Rank=主/次诊断；Code/Name/CodeSystem 取国标 ICD-10 中文术语）
-    """
-    CREATE TABLE Diagnosis (
-        ID             VARCHAR(20) PRIMARY KEY,
-        EncounterID    VARCHAR(20),
-        PatientID      VARCHAR(20),
-        Code           VARCHAR(20),
-        Name           VARCHAR(200),
-        CodeSystem     VARCHAR(60),
-        Rank           INTEGER DEFAULT 0,
-        OnsetDate      VARCHAR(20),
-        ClinicalStatus VARCHAR(20) DEFAULT 'active'
-    )
-    """,
-    # 药嘱（FHIR MedicationRequest；MedicationCode/Name/CodeSystem 取中文药品目录术语）
-    """
-    CREATE TABLE MedicationOrder (
-        ID            VARCHAR(20) PRIMARY KEY,
-        EncounterID   VARCHAR(20),
-        PatientID     VARCHAR(20),
-        MedicationCode VARCHAR(30),
-        MedicationName VARCHAR(200),
-        CodeSystem    VARCHAR(60),
-        DosageValue   VARCHAR(50),
-        DosageUnit    VARCHAR(20),
-        Route         VARCHAR(50),
-        Frequency     VARCHAR(50),
-        StartDate     VARCHAR(20),
-        Status        VARCHAR(20) DEFAULT 'active'
-    )
-    """,
-]
-
-# 关键列 CodeSystem 说明（供后续术语对照/LLM 使用）
-COLUMN_COMMENTS = [
-    ("SQLUser.Patient.ID", "患者主键"),
-    ("SQLUser.Patient.MRN", "病历号（映射 us-core-patient.identifier, 体系 http://hospital.example/mrn）"),
-    ("SQLUser.Patient.Gender", "FHIR administrative-gender：male|female|other"),
-    ("SQLUser.Encounter.ID", "就诊主键"),
-    ("SQLUser.Encounter.ClassCode", "v3 ActCode 就诊类别：IMP(住院)/AMB(门诊)/…"),
-    ("SQLUser.Encounter.ReasonCode", "就诊原因=主诊断，CodeSystem=urn:cn-nhsa:icd10-gbt2016（国标 ICD-10）"),
-    ("SQLUser.Encounter.ReasonText", "主诊断中文名（国标 ICD-10）"),
-    ("SQLUser.Diagnosis.Code", "国标 ICD-10 诊断码（GB/T 14396-2016，已剔除 Z 章）"),
-    ("SQLUser.Diagnosis.Name", "国标 ICD-10 诊断中文名"),
-    ("SQLUser.Diagnosis.CodeSystem", "术语集 URI=urn:cn-nhsa:icd10-gbt2016"),
-    ("SQLUser.MedicationOrder.MedicationCode", "中文药品目录编码（如 NRDL-xxxx / CB-xxxx）"),
-    ("SQLUser.MedicationOrder.MedicationName", "中文药品名（医保目录名称）"),
-    ("SQLUser.MedicationOrder.CodeSystem", "术语集 URI=urn:cn-nhsa:drug-nrdl(医保) / urn:cn-nhsa:drug-cbih(商保)"),
-]
-
-TABLES = ["Patient", "Encounter", "Diagnosis", "MedicationOrder"]
+def default_host() -> str:
+    """容器内（/app 存在）默认 iris；宿主机默认 127.0.0.1。"""
+    return os.getenv("CLINIC_IRIS_HOST") or ("iris" if os.path.isdir("/app") else "127.0.0.1")
 
 
-def main() -> None:
-    conn = iris.dbapi.connect(hostname=HOST, port=PORT, namespace=NS,
-                              username=USER, password=PWD)
-    cur = conn.cursor()
-    for t in TABLES:
-        cur.execute(f"DROP TABLE IF EXISTS {t}")
-    for sql in DDL:
-        cur.execute(sql)
-    conn.commit()
-    # 验证
-    for t in TABLES:
-        cur.execute(f"SELECT COUNT(*) FROM {t}")
-        logger.info("%s 表就绪（行数=%s）", t, cur.fetchone()[0])
-    conn.close()
-    logger.info("CLINIC 四表初始化完成")
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default=default_host(), help="IRIS 主机（默认按运行环境推断）")
+    ap.add_argument("--port", type=int, default=1972)
+    ap.add_argument("--namespace", default="CLINIC")
+    ap.add_argument("--reset", action="store_true", help="DROP 四表后重建（会清空数据）")
+    a = ap.parse_args()
+
+    conn = iris.dbapi.connect(hostname=a.host, port=a.port, namespace=a.namespace,
+                              username="superuser", password="SYS")
+    try:
+        cur = conn.cursor()
+        rows, created = ensure_tables(cur, reset=a.reset)
+        conn.commit()
+        logger.info("CLINIC 四表就绪（本次新建：%s）", ",".join(created) or "无")
+        for name, cnt in rows:
+            logger.info("  %s 行数=%s", name, cnt)
+        logger.info("表清单：%s", ", ".join(CLINIC_TABLES))
+    finally:
+        conn.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

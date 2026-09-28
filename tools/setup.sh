@@ -29,7 +29,12 @@ docker compose up -d --build iris
 compgen -G "jdbc/intersystems-jdbc-*.jar" >/dev/null 2>&1 && echo "  JDBC 驱动已在，跳过提取" || bash tools/fetch_jdbc_jar.sh
 docker compose up -d --build
 
-echo "== 5/5 术语服务器初始化（术语概念 + 转换映射种子）=="
+echo "== 5/5 演示数据前置（CLINIC 源库表结构 + 术语服务器初始化）=="
+if [ -f tools/clinic_init.sh ]; then
+  bash tools/clinic_init.sh || echo "  [!!] CLINIC 建表失败，稍后手动: bash tools/clinic_init.sh"
+else
+  echo "  [!!] 缺 tools/clinic_init.sh：跳过 CLINIC 建表"
+fi
 if [ -f data/terms-inbox/icd10_main.csv ] && [ -f tools/term_data_load.sh ]; then
   bash tools/term_data_load.sh --wait 120 || echo "  [!!] 术语概念导入失败，稍后手动: bash tools/term_data_load.sh"
 else
