@@ -304,7 +304,10 @@ CLINIC 四表由 backend 启动时**自动兜底检查**（缺表补建，不删
 
 ## 术语服务器（`iris-terminology`）——它做什么、平台怎么用它
 
-**定位**：独立容器（fork 自 `iris-terminology-server` 的裁剪版；宿主端口 **52774**→52773、**51774**→1972，凭据 `superuser / SYS`），做两件事：
+**定位**：独立容器（**fork 自开源项目 [`intersystems-ib/iris-terminology-server`](https://github.com/intersystems-ib/iris-terminology-server) 的裁剪版**
+——本仓库使用的 fork 为 [`zlnick/iris-terminology-server`](https://github.com/zlnick/iris-terminology-server)；
+**术语服务器本身的核心能力（存储 / `$lookup` / `$validate-code` / `$subsumes` / `$expand`）是上游作者的工作，功劳归他们，谨此致谢**；
+宿主端口 **52774**→52773、**51774**→1972，凭据 `superuser / SYS`），做两件事：
 ① **术语存储 + 检索/校验**（CodeSystem / ValueSet）；② **术语转换映射的事实源**（`/mapping/*`）。
 **转换/映射的判定**由平台 AI Skill（C3 药品 / C3-Dx 诊断）负责，不在术语服务器做。
 

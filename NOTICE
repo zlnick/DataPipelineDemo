@@ -8,7 +8,10 @@ This repository is a demonstration project; it is NOT an official InterSystems p
 this project references them for identification only and claims no trademark rights.
 
 Third-party / not distributed here:
-- termsrv/ (submodule) is a fork of iris-terminology-server: see that repo for its own license/attribution.
+- termsrv/ (submodule) is a trimmed fork of the open-source intersystems-ib/iris-terminology-server
+  (https://github.com/intersystems-ib/iris-terminology-server) — see that upstream repo and the fork
+  (https://github.com/zlnick/iris-terminology-server) for their own licenses/attribution. All credit for the
+  terminology server itself belongs to the upstream authors; thanks to them.
 - The InterSystems JDBC driver is not distributed (tools/fetch_jdbc_jar.sh extracts it from the official image).
 - Terminology material under data/terms-inbox/ (ICD-10 codes/names, NRDL & CBIH Chinese drug catalogues) is
   redistributed here for demo initialization; it originates from the respective public catalogues

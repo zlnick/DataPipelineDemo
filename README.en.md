@@ -334,8 +334,12 @@ The CLINIC tables are re-checked automatically when the backend starts (create-o
 
 ## Terminology Server (`iris-terminology`) — what it does, how the platform uses it
 
-**Role**: an independent container (a trimmed fork of `iris-terminology-server`; host ports **52774**→52773,
-**51774**→1972; credentials `superuser / SYS`). It does two things: ① **terminology storage + search/validation**
+**Role**: an independent container — a **trimmed fork of the open-source
+[`intersystems-ib/iris-terminology-server`](https://github.com/intersystems-ib/iris-terminology-server)** (the fork
+used here: [`zlnick/iris-terminology-server`](https://github.com/zlnick/iris-terminology-server)). **All credit for
+the server core (storage, `$lookup`, `$validate-code`, `$subsumes`, `$expand`) goes to the upstream authors — thank
+you.** Host ports **52774**→52773, **51774**→1972; credentials `superuser / SYS`.
+It does two things: ① **terminology storage + search/validation**
 (CodeSystem / ValueSet); ② **source of truth for conversion mappings** (`/mapping/*`). The actual **mapping
 decisions** are made by the platform's AI skills (C3 for drugs, C3-Dx for diagnoses) — not here.
 

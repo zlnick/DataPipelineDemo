@@ -91,7 +91,7 @@ services:
     networks:
       - dataflow-net
 
-  # ---------- 术语服务器（fork 裁剪版 iris-terminology-server） ----------
+  # ---------- 术语服务器（trimmed fork of intersystems-ib/iris-terminology-server — 上游作者功劳，致谢）----------
   # 仅用于术语「存储 + 检索/校验」（CodeSystem/$lookup $validate-code $subsumes、ValueSet/$expand）；
   # 术语转换/映射由本平台 AI 数据转换 Skill 负责（不在术语服务器做）。
   # 裁剪内容见子模块分支 demo-community：community 镜像 / 关闭 vector / 精简依赖。
