@@ -231,11 +231,14 @@ http://localhost
 
 ```bash
 docker compose down
-# ⚠ 想清空数据（FHIR 数据 / 目标表 / 数据源·映射·管道登记）**别指望 `down -v`**（`-v` 只删 compose 声明的命名卷，
-#   本项目 Windows 用命名卷、macOS/Linux 用绑定挂载，两种都要按下面方式清）：
+# 清空数据（FHIR 数据 / 目标表 / 数据源·映射·管道登记）—— 按平台的正确姿势：
 #   · Windows / Docker Desktop（/dur = 命名卷 dataflow-iris-dur）：
-docker volume rm dataflow-iris-dur      # 之后 bash tools/setup.sh（首次启动自动重建实例数据）
-#   · macOS / Linux（/dur = 绑定挂载 ./data/iris）：
+#     该卷由覆盖文件声明，**带上覆盖文件**时 `down -v` 就能一并删（不带则 -v 不会删它）：
+docker compose -f docker-compose.yml -f docker-compose.windows.yml down -v
+#     等价写法（只想删数据、容器已停）：
+docker volume rm dataflow-iris-dur
+#     之后：bash tools/setup.sh（首次启动自动重建实例数据）
+#   · macOS / Linux（/dur = 绑定挂载 ./data/iris）：`-v` 对绑定挂载**无效**，要删/改名目录：
 mv data/iris data/iris.bak-$(date +%Y%m%d)   # 之后 docker compose up -d
 ```
 

@@ -246,12 +246,17 @@ docker compose up -d   # first run builds images & initializes FHIR Server + tar
 http://localhost       # Chinese UI (default)   |   http://localhost/en  # English UI
 ```
 
-Stop: `docker compose down`. ⚠ To **wipe data** (FHIR data / target tables / registrations) do not rely on `down -v`:
+Stop: `docker compose down`. To **wipe data** (FHIR data / target tables / registrations):
 
 ```bash
-# Windows / Docker Desktop  (/dur = named volume dataflow-iris-dur):
-docker volume rm dataflow-iris-dur        # then: bash tools/setup.sh  (first boot rebuilds the instance data)
-# macOS / Linux            (/dur = bind mount ./data/iris):
+# Windows / Docker Desktop (/dur = named volume dataflow-iris-dur):
+#   the volume is declared in the override file, so `down -v` removes it **when the override is passed**
+#   (without the override, -v does NOT touch it):
+docker compose -f docker-compose.yml -f docker-compose.windows.yml down -v
+#   equivalent (containers already stopped):
+docker volume rm dataflow-iris-dur
+#   then: bash tools/setup.sh   (first boot rebuilds the instance data)
+# macOS / Linux (/dur = bind mount ./data/iris): `-v` does nothing for bind mounts — move the dir away:
 mv data/iris data/iris.bak-$(date +%Y%m%d)  # then: docker compose up -d
 ```
 
