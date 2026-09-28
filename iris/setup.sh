@@ -75,6 +75,11 @@ EOF
 /usr/irissys/bin/iris session "$instance" -U %SYS < /tmp/setup_demofhir.os
 
 # 3. 编译 Production 组件类（按依赖顺序逐个编译，避免 LoadDir 的编译顺序竞态）
+#    ⚠ **必须包含共享术语 BO**：demo.TermLookupRequest / demo.TermLookupResponse / demo.TerminologyOperation
+#      —— 管道拓扑会渲染该 BO（多管道全局 1 实例，运行期实时查术语服务器）；漏编译它的话，
+#      全新实例上点「生成数据管道」会报
+#        <CLASS DOES NOT EXIST>getProductionItems+51^Ens.Director.1 *demo.TerminologyOperation（HTTP 500）
+#      （2026-09-28 全新安装实测复现：原清单只编译 10 个类、漏了这 3 个；已补齐）
 echo "=== [setup] 编译 Production 组件类 ==="
 /usr/irissys/bin/iris session "$instance" -U USER <<'EOF'
 do $SYSTEM.OBJ.Load("/shared/src/demo/FHIRRequest.cls", "ck")
@@ -87,6 +92,9 @@ do $SYSTEM.OBJ.Load("/shared/src/demo/TargetOperation.cls", "ck")
 do $SYSTEM.OBJ.Load("/shared/src/demo/PipelineGenerator.cls", "ck")
 do $SYSTEM.OBJ.Load("/shared/src/demo/PipelineQuery.cls", "ck")
 do $SYSTEM.OBJ.Load("/shared/src/demo/WSDLImporter.cls", "ck")
+do $SYSTEM.OBJ.Load("/shared/src/demo/TermLookupRequest.cls", "ck")
+do $SYSTEM.OBJ.Load("/shared/src/demo/TermLookupResponse.cls", "ck")
+do $SYSTEM.OBJ.Load("/shared/src/demo/TerminologyOperation.cls", "ck")
 write "COMPILE_DONE", !
 halt
 EOF
@@ -190,6 +198,10 @@ if portal_ok; then
 else
   echo "  [!!] 门户仍未就绪：看 $httpd_logs/error.log 与 $data_dir/mgr/messages.log"
 fi
+
+# 7b. 生成物目录：平台把 Agent 生成的 BP 源码写到 $ISC_DATA_DIRECTORY/generated
+#     全新环境（尤其命名卷）默认没有这个目录 —— 显式建出来，避免 reset_ui_env 自检出现假红 ❌。
+mkdir -p "$data_dir/generated" 2>/dev/null && echo "  生成物目录就绪：$data_dir/generated"
 
 
 echo "=== [setup] IRIS 初始化完成 ==="
