@@ -63,7 +63,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, watchEffect } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 
@@ -84,6 +84,12 @@ const currentTitle = computed(() => {
   const base = route.name ? String(route.name).replace(/-en$/, '') : ''
   if (lang.value === '/en') return t(`app.menu.${base}`)
   return route.meta.title || t('app.title')
+})
+
+// 浏览器标签页标题 + <html lang> 随语言与页面切换（英文页不再出现中文标题）
+watchEffect(() => {
+  document.documentElement.lang = lang.value === '/en' ? 'en' : 'zh-CN'
+  document.title = `${t('app.title')} · ${currentTitle.value}`
 })
 </script>
 

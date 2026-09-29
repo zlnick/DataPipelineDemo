@@ -58,7 +58,7 @@
         type="error"
         :closable="false"
         show-icon
-        :title="t('recommend.sourceAmbiguousTitle', { names: ambiguousNames.join('、') })"
+        :title="t('recommend.sourceAmbiguousTitle', { names: ambiguousNames.join(t('common.listSep')) })"
         :description="ambiguousDesc"
       />
     </el-card>
@@ -161,7 +161,7 @@ const ambiguousNames = computed(() => Object.keys(sourceAmbiguous.value || {}))
 const ambiguousDesc = computed(() => {
   const rows = Object.entries(sourceAmbiguous.value || {})
     .map(([nm, ds]) => `${nm} → ${(ds || []).join(' / ')}`)
-    .join('；')
+    .join(t('common.semiSep'))
   return t('recommend.sourceAmbiguousDesc', { rows })
 })
 
@@ -331,7 +331,7 @@ async function handleRecommend() {
       ElMessage.warning(t('recommend.validationWarnMessage', { n: validation.value.error_count }))
     }
     if (ambiguousNames.value.length) {
-      ElMessage.warning(t('recommend.sourceAmbiguousTitle', { names: ambiguousNames.value.join('、') }))
+      ElMessage.warning(t('recommend.sourceAmbiguousTitle', { names: ambiguousNames.value.join(t('common.listSep')) }))
     }
   } finally {
     recommending.value = false
@@ -388,7 +388,7 @@ async function confirmAll() {
   // 保存入口同样会回报重名跨源（未猜测 source_id 的映射）→ 显式提示，避免"静默错归属"
   const amb = saved?.source_ambiguous || {}
   if (Object.keys(amb).length) {
-    ElMessage.warning(t('recommend.sourceAmbiguousTitle', { names: Object.keys(amb).join('、') }))
+    ElMessage.warning(t('recommend.sourceAmbiguousTitle', { names: Object.keys(amb).join(t('common.listSep')) }))
   }
   ElMessage.success(t('recommend.saved'))
   router.push('/mappings')

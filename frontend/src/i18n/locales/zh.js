@@ -7,6 +7,11 @@ export default {
     networkError: "网络错误",
     driverClass: "驱动类",
     openFhirNote: "开放 FHIR R4 类型（服务器支持、平台未建模）：映射 target 字段需你依 FHIR R4/US Core 规范自定",
+    // 分隔符统一走 i18n：英文页不得出现全角标点（、｜；（）：）
+    listSep: "、",
+    semiSep: "；",
+    barSep: "｜",
+    labelSep: "：",
   },
   app: {
     title: "AI 数据自动化转换",

@@ -74,7 +74,7 @@
             </el-tag>
             <span class="gray">
               {{ g.items.length }} × {{ t('pipelines.pipelineTag') }}
-              ｜ {{ g.enabled_count }}/{{ g.component_count }} {{ t('pipelines.licenseUsed') }}
+              {{ t('common.barSep') }} {{ g.enabled_count }}/{{ g.component_count }} {{ t('pipelines.licenseUsed') }}
             </span>
           </template>
           <el-table :data="g.items" border size="small">
@@ -364,7 +364,7 @@
           </div>
           <div v-if="aiInfo.supplemented && aiInfo.supplemented.length" class="mt8">
             <el-tag size="small" type="warning">{{ t('pipelines.aiSuppTag') }}</el-tag>
-            <span class="ml4">{{ aiInfo.supplemented.join('、') }}</span>
+            <span class="ml4">{{ aiInfo.supplemented.join(t('common.listSep')) }}</span>
           </div>
           <div v-else class="mt8 gray">{{ t('pipelines.aiPure') }}</div>
         </template>
@@ -459,7 +459,7 @@ const budgetTitle = computed(() => {
     parts.push(`${t('pipelines.budgetScheduled')}: ${b.scheduled.join(', ')}`)
   }
   if (b.over_capacity) parts.push(b.note || t('pipelines.budgetOver'))
-  return parts.join(' ｜ ')
+  return parts.join(t('common.barSep'))
 })
 
 // —— 术语映射盘点（术语服务器 = 事实源）：生成响应里的 term_catalog/term_summary/term_todo + 严格模式中止 ——

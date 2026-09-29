@@ -12,12 +12,12 @@
             <el-option
               v-for="opt in TARGET_TYPES"
               :key="opt.value"
-              :label="typeLabel(opt.value) + (opt.enabled ? '' : '（' + t('targets.reserved') + '）')"
+              :label="typeLabel(opt.value) + (opt.enabled ? '' : t('common.reservedShort'))"
               :value="opt.value"
               :disabled="!opt.enabled"
             >
-              <el-tooltip :content="opt.desc" placement="left" :disabled="opt.enabled">
-                <span>{{ typeLabel(opt.value) }}{{ opt.enabled ? '' : '（' + t('targets.reserved') + '）' }}</span>
+              <el-tooltip :content="optDesc(opt)" placement="left" :disabled="opt.enabled">
+                <span>{{ typeLabel(opt.value) }}{{ opt.enabled ? '' : t('common.reservedShort') }}</span>
               </el-tooltip>
             </el-option>
           </el-select>
@@ -225,9 +225,9 @@
 
       <div v-else>
         <el-alert :title="t('targets.savedNote')" type="success" :closable="false" />
-        <div v-for="t in savedResult" :key="t.table" class="mt12">
-          <b>{{ t.table }}：</b>
-          <el-tag v-for="c in t.columns" :key="c.name" size="small" class="mr6">{{ c.name }}</el-tag>
+        <div v-for="row in savedResult" :key="row.table" class="mt12">
+          <b>{{ row.table }}{{ t('common.labelSep') }}</b>
+          <el-tag v-for="c in row.columns" :key="c.name" size="small" class="mr6">{{ c.name }}</el-tag>
         </div>
         <div class="mt12"><el-button type="primary" @click="closeWizard">{{ t('targets.btnDone') }}</el-button></div>
       </div>
@@ -268,12 +268,16 @@ import { ElMessage } from 'element-plus'
 import { TARGET_TYPES } from '../api/constants'
 import { targetApi } from '../api/dataflow'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 // 类型显示名（value → 本地化 label）
 function typeLabel(v) {
   const map = { DB: t('targets.tDB'), SOAP: t('targets.tSOAP'), FHIR: t('targets.tFHIR'), REST: t('targets.tREST') }
   return map[v] || v
+}
+// 英文页用常量自带的 descEn（前端常量，非后端接口）——避免 /en 下 tooltip 显示中文
+function optDesc(o) {
+  return locale.value === 'en' && o.descEn ? o.descEn : o.desc
 }
 
 const infoTitle = computed(() => {

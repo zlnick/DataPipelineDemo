@@ -16,7 +16,7 @@
               :value="opt.value"
               :disabled="!opt.enabled"
             >
-              <el-tooltip :content="opt.desc" placement="left" :disabled="opt.enabled">
+              <el-tooltip :content="optDesc(opt)" placement="left" :disabled="opt.enabled">
                 <span>{{ dsTypeLabel(opt.value) }}{{ opt.enabled ? '' : t('datasources.reservedTip') }}</span>
               </el-tooltip>
             </el-option>
@@ -119,7 +119,7 @@
           <el-descriptions-item :label="t('datasources.status')">{{ analysis.status }}</el-descriptions-item>
           <el-descriptions-item :label="t('datasources.resourceCount')">{{ analysis.resource_count }}</el-descriptions-item>
           <el-descriptions-item :label="t('datasources.profileHint')" :span="3">
-            {{ (analysis.profile_hint || []).join('、') || t('datasources.standardFhir') }}
+            {{ (analysis.profile_hint || []).join(t('common.listSep')) || t('datasources.standardFhir') }}
           </el-descriptions-item>
         </el-descriptions>
         <div class="mt12">
@@ -195,7 +195,7 @@ import { DATA_SOURCE_TYPES } from '../api/constants'
 import { datasourceApi } from '../api/dataflow'
 
 const router = useRouter()
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const list = ref([])
 
 // 数据源类型显示名（value → 本地化 label）
@@ -207,6 +207,10 @@ function dsTypeLabel(v) {
     SOAP: t('datasources.typeSOAP'),
   }
   return map[v] || v
+}
+// 英文页用常量自带的 descEn（前端常量，非后端接口）——避免 /en 下 tooltip 显示中文
+function optDesc(o) {
+  return locale.value === 'en' && o.descEn ? o.descEn : o.desc
 }
 const loading = ref(false)
 const creating = ref(false)

@@ -112,7 +112,7 @@
             :closable="false"
             show-icon
             :title="t('mappings.termTodoTitle', { n: (termCatalog.gate.todo || termCatalog.gate.missing).length })"
-            :description="`${(termCatalog.gate.todo || termCatalog.gate.missing).join('、')}\n${termCatalog.hint}`"
+            :description="`${(termCatalog.gate.todo || termCatalog.gate.missing).join(t('common.listSep'))}\n${termCatalog.hint}`"
           />
         </div>
         <div v-if="(termCatalog.gate.unresolved || []).length">
@@ -122,7 +122,7 @@
             :closable="false"
             show-icon
             :title="t('mappings.termUnresolvedTitle')"
-            :description="termCatalog.gate.unresolved.join('、')"
+            :description="termCatalog.gate.unresolved.join(t('common.listSep'))"
           />
         </div>
         <div v-if="termCatalog.gate.error">

@@ -38,7 +38,7 @@
                 <el-tag type="primary" size="small">{{ t('agents.taxoSkill') }}</el-tag>
                 <el-tag v-if="a.status === 'ready'" type="success" size="small">{{ t('agents.ready') }}</el-tag>
               </div>
-              <p class="taxo-why">{{ t('agents.taxonomyWhy') }}：{{ a.__why }}</p>
+              <p class="taxo-why">{{ t('agents.taxonomyWhy') }}{{ t('common.labelSep') }}{{ a.__why }}</p>
               <p class="agent-role">{{ a.role }}</p>
               <p class="agent-purpose">{{ a.purpose }}</p>
               <el-descriptions :column="1" border size="small" class="mt12">
@@ -67,7 +67,7 @@
                 <el-tag type="warning" size="small">{{ t('agents.taxoAgent') }}</el-tag>
                 <el-tag v-if="a.status === 'ready'" type="success" size="small">{{ t('agents.ready') }}</el-tag>
               </div>
-              <p class="taxo-why">{{ t('agents.taxonomyWhy') }}：{{ a.__why }}</p>
+              <p class="taxo-why">{{ t('agents.taxonomyWhy') }}{{ t('common.labelSep') }}{{ a.__why }}</p>
               <p class="agent-role">{{ a.role }}</p>
               <p class="agent-purpose">{{ a.purpose }}</p>
               <el-descriptions :column="1" border size="small" class="mt12">
@@ -224,6 +224,26 @@ const EN_AGENTS = {
     trigger: 'export_validation_issues.py before writing knowledge/04-Pitfalls',
     capabilities: ['Semantic dedup', 'Restructure', 'Obsidian export'],
     engine: 'Single-shot LLM prompt (llm_client.polish_validation_issues); explicit error on failure',
+  },
+  'mapping-agent': {
+    name: 'Terminology Mapping Agent (C3)',
+    role: 'Chinese drug name ↔ RxNorm mapping expert',
+    purpose: 'Judges a Chinese drug name (NRDL / CBIH catalogue, possibly with dosage form) into an RxNorm concept: multi-path recall (deterministic chinese-map lexicon hit + second vector recall over IN/SCD/SBD/BN by English name + Chinese-term fallback), then a single-shot LLM picks the best RXCUI on that evidence (TTY stated explicitly) or declares "no mapping".',
+    input: 'Chinese drug name + optional context (source / dosage form / brand name)',
+    output: 'verdict (match/rxcui/tty/enName/reason/confidence/alias_based) + recall evidence',
+    trigger: 'POST /api/mapping/cn2rx (terminology interoperability / target-mapping stage of a data pipeline)',
+    capabilities: ['Multi-path recall merge', 'Transliteration & family confusion detection', 'Explicit refusal when unmapped', 'Auditable evidence'],
+    engine: 'Deterministic recall (lexicon/vector — recall, not decisions) + single-shot LLM verdict; empty recall or LLM failure is returned explicitly',
+  },
+  'mapping-agent-dx': {
+    name: 'Diagnosis Mapping Agent (C3-Dx)',
+    role: 'Chinese diagnosis (GB/T ICD-10) ↔ SNOMED CT mapping expert',
+    purpose: 'Judges a Chinese diagnosis into SNOMED CT (the US Core condition pool): a zh-map bilingual lexicon gates it first, then a second vector recall over the matched English term plus a Chinese-term fallback; the LLM picks the best SNOMED code on that evidence or declares "no mapping" (never impersonating a parent/sibling concept).',
+    input: 'Chinese diagnosis name + optional context',
+    output: 'verdict (match/code/display/reason/confidence/alias_based) + recall evidence',
+    trigger: 'POST /api/mapping/cn2snomed (Chinese diagnosis terminology interoperability demo)',
+    capabilities: ['Lexicon gate', 'Disease-family / parent-concept confusion detection', 'Explicit refusal when unmapped', 'Auditable evidence'],
+    engine: 'Deterministic recall (lexicon/vector — recall, not decisions) + single-shot LLM verdict; failures are returned explicitly',
   },
 }
 

@@ -7,6 +7,11 @@ export default {
     networkError: "Network error",
     driverClass: "Driver class",
     openFhirNote: "Open FHIR R4 resource types (server-supported, not modeled by the platform): define the target fields yourself per the FHIR R4 / US Core spec.",
+    // separators via i18n — the English UI must never show full-width CJK punctuation
+    listSep: ", ",
+    semiSep: "; ",
+    barSep: " | ",
+    labelSep: ": ",
   },
   app: {
     title: "AI Data Automation",
