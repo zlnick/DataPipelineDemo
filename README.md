@@ -594,7 +594,7 @@ LLM_MODEL=deepseek-chat                        # 模型名
 
 1. **规则（最根本）**：AI 只能写/删 **本仓库**、**本项目容器**（`dataflow-*` / `iris-terminology`）、**知识库**；
    其它项目与宿主目录一律只读——只能在"枚举清单 → 用户显式确认 → 执行"之后动。
-   详见 [`AGENTS.md`](AGENTS.md) 顶部与 [`.clinerules/`](.clinerules/)。
+   完整规则与三段式协议见 [`tools/guard/README.md`](tools/guard/README.md)（会话级规则文件本身为本地文件，不随仓库分发）。
 2. **CLI 守卫**：执行 docker 前 `source tools/guard/docker_guard.sh` —— 本项目之外的破坏性操作被拒（rc=77）；
    路径校验用 `python3 tools/guard/scope_guard.py check <路径>...`。
 3. **文件沙箱（可选强化）**：`./tools/guard/ai-session.sh` 起的受限会话（macOS `sandbox-exec`）**写入**只允许

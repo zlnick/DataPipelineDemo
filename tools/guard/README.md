@@ -13,6 +13,11 @@
 | L2 流程 | `.clinerules/01-destructive-op-protocol.md` 三段式（枚举→停下等确认→执行）+ 备份落 `./.trash/` | 流程约束 | 中 |
 | 可选强化 | `tools/guard/ai-sandbox.sb` + `ai-session.sh` / `ai-session-rc.sh` | macOS 文件沙箱（越界写入内核拒绝）+ CLI 守卫 | 文件层强（内核）；docker 层与 L1 同级 |
 
+> ⚠ `AGENTS.md`、`WORKLOG.md`、`.clinerules/`、`docs/`、`knowledge/` 均为**本地文件**（已在 `.gitignore` 中），
+> **不随仓库分发** —— 因此上面的 L0/L2 规则文件在克隆下来的仓库里不存在；仓库内的公开说明以本文件与
+> 根目录 `README.md` / `README.en.md` 为准。
+
+
 > ⚠ **2026-09-14 回滚**：曾上线过一层「受限 Docker API 代理」（compose 服务 `docker-proxy` +
 > `.vscode/settings.json` 把终端 `DOCKER_HOST` 指向它）——**已按用户要求回滚**：太复杂（要自己维护
 > 归属裁决 + HTTP 流式透传），且因 `docker cp` 上传是流式请求体被 fail-closed 误拒，反而打断了日常操作。

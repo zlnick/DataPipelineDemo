@@ -626,8 +626,9 @@ projects** (7 containers + their networks; one IRIS database was unrecoverable).
 
 1. **Rules (the core)**: an AI may write to / delete **this repo**, **this project's containers**
    (`dataflow-*` / `iris-terminology`) and **the knowledge vault** only; everything else is read-only and
-   may only be touched after "enumerate → user confirms → execute". See the top of [`AGENTS.md`](AGENTS.md)
-   and [`.clinerules/`](.clinerules/).
+   may only be touched after "enumerate → user confirms → execute". The full rules and the three-step protocol live in
+   [`tools/guard/README.md`](tools/guard/README.md) (the session-level rule files themselves are local and are not
+   distributed with this repository).
 2. **CLI guard**: `source tools/guard/docker_guard.sh` before running docker — destructive operations on
    objects outside this project are rejected (rc=77); validate paths with
    `python3 tools/guard/scope_guard.py check <path>...`.
