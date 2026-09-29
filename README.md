@@ -10,6 +10,8 @@
 **源 = 2 种**（FHIR 接口 / SQL 表）、**目标 = 3 种**（DB 表 / SOAP 服务 / FHIR 仓库），可任意组合（也支持同一 Production 内多管道并存）。
 平台**自动分析源/目标接口**（FHIR Profile / SQL 列结构 / WSDL 操作语义）并登记数据资产；由 **AI（OpenAI 兼容 LLM）** 推荐「资产 → 目标」匹配与字段映射，用户确认后**自动生成 IRIS 互操作性生产管道（Production）** 完成数据投放；中文诊断/药品经**术语服务器**做代码转换（术语映射的事实源）。
 
+> 界面**中英双语**：中文（默认，`/`）与英文（`/en`），顶部栏可切换语言；站内跳转保持当前语言。
+
 ```
 FHIR / SQL 源 → 接口分析(Profile / 列结构) → 登记数据资产
                           ↘                          ↙
@@ -410,7 +412,7 @@ python3 tools/term_map_build.py --limit 5    # 补录 5 条
 
 | 服务 | 地址 | 说明 |
 | ---- | ---- | ---- |
-| 前端应用 | http://localhost | Vue 3 + Element Plus（六模块） |
+| 前端应用 | http://localhost ｜ http://localhost/en | Vue 3 + Element Plus，**中英双语**（`/` 中文默认、`/en` 英文），顶部栏可切换 |
 | 后端 API | http://localhost:5001 | REST API（nginx 代理 http://localhost/api/*） |
 | IRIS 管理门户 | http://localhost:52773/csp/sys/UtilHome.csp | 账号 `superuser`，密码 `SYS` |
 | FHIR endpoint（实例自带 = 默认**目标**仓库） | http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/ | `/metadata` 匿名；资源读写需 Basic Auth；转换结果默认落这里 |
@@ -478,7 +480,8 @@ LLM_MODEL=deepseek-chat                        # 模型名
 ├── init_data.py              # 建目标表（模拟远端数据库）
 ├── tools/seed_fhir_demo.py   # （可选）手动灌 FHIR 演示样本；不在 backend 启动链
 ├── tools/check_component_fidelity.py # 组件保真审计（存储定义 ⊆ Production，防重建丢件）
-├── docs/PROJECT_PLAN.md      # 项目专用知识文档（目标/决策/数据模型/坑）
+├── LICENSE / NOTICE          # 许可与商标归属声明（termsrv 子模块等不随仓库分发的组件）
+├── docs/*.md                 # （本地）设计与计划文档，已 gitignore，不随仓库分发
 ├── backend/                  # Flask 后端
 │   ├── app.py                # 应用入口（注册全部路由蓝图）
 │   ├── config.py             # IRIS/FHIR/LLM 配置
@@ -488,16 +491,18 @@ LLM_MODEL=deepseek-chat                        # 模型名
 ├── frontend/                 # Vue 3 + Element Plus
 │   └── src/
 │       ├── api/              # axios 封装 + dataflow.js（API）+ constants.js（类型枚举预留）
-│       ├── views/            # Home/Datasources/Assets/Recommend/Mappings/Pipelines/Targets
+│       ├── views/            # Home/Datasources/Assets/Recommend/Mappings/Pipelines/Targets/Agents
 │       ├── components/       # TypeSelect（类型选择器，预留禁用）
+│       ├── i18n/             # zh.js + en.js（中英双语文案）+ path.js（按语言前缀跳转）
 │       └── router/
 ├── iris/                     # IRIS 侧代码
 │   ├── setup.sh              # 容器启动统一初始化（凭据/FHIR Server/编译）
 │   ├── init-password.sh      # superuser/SYS 凭据
 │   ├── src/demo/             # Production 组件类 + PipelineGenerator + PipelineQuery
 │   └── python/               # transform_handler.py（Embedded Python 转换逻辑）
-├── data/                     # IRIS 数据持久化
-└── knowledge -> 知识库软链接
+├── tools/                    # datakit 工具箱（`bash tools/datakit/run.sh list`）+ 校验/诊断脚本
+├── data/                     # IRIS 数据持久化（setup 时创建）
+└── knowledge -> 知识库软链接（可选，本地）
 ```
 
 ## 演示步骤（从零开始，页面选项随演示进度动态出现）
@@ -558,6 +563,29 @@ LLM_MODEL=deepseek-chat                        # 模型名
 3. **需要复位某条管道**：打开页面 **「强制重新生成」** 开关后点生成（`force=true`），该组会重新设计组件（AI 重新决策）。
 4. **确认没有丢件**（可选）：`python3 tools/check_component_fidelity.py`
    —— 逐项比对"每个管道的存储定义 ⊆ Production 组件"，做三次审计（基线 / 复用提交 / 强制重建）并输出缺失清单。
+
+### E. SQL → FHIR（患者事务：业务库 4 张表 → 4 类 FHIR 资源，含术语双编码）
+
+这是最能体现「AI 决策 + 术语转换」的一条链路：HIS 风格业务库的**患者主表 + 就诊 / 诊断 / 药嘱**
+经 AI 映射为 **Patient / Encounter / Condition / MedicationRequest**，中文诊断由术语服务器转成 SNOMED 双编码。
+
+1. **添加 SQL 数据源**：数据源向导 → JDBC `jdbc:IRIS://iris:1972/CLINIC` → 勾选
+   **`Patient`/`Encounter`/`Diagnosis`/`MedicationOrder`**（4 张一起）→ 分析列结构 → 自动生成轮询 Query。
+2. **点「生成演示数据」**（等价 `bash tools/datakit/run.sh seed_clinic.py`）：默认写入 **3 位患者 + 就诊 / 诊断 / 药嘱**
+   （中文诊断与药品名取自术语服务器的中文术语集，故可直接用）。
+3. **添加 FHIR 目标**：「转换目标」→ FHIR，端点默认 `…/csp/healthshare/fhirserver/fhir/r4/`
+   （`FHIRSERVER` = 默认**目标**仓库）→ 注册 → 刷新候选资源。
+4. **AI 智能匹配**：逐个资产确认（典型结果 `Patient`→Patient、`Encounter`→Encounter、`Diagnosis`→Condition、
+   `MedicationOrder`→MedicationRequest；诊断列由 AI 判为 `term_map:cn2snomed`）→ 保存映射。
+5. **生成管道**：一次提交这 4 组 → 生成时平台做**许可调度**（超出 8 个业务主机单元的分组**照旧生成但初始停用**，
+   在「数据管道」卡片一键切换）。
+6. **看效果**：`FHIRQueue` 落库、FHIR 仓库计数实测 **Patient 3 / Encounter 4 / Condition 7 / MedicationRequest 7**；
+   `Condition.code` 为**双 coding**（源 `urn:cn-nhsa:icd10-gbt2016` + SNOMED `http://snomed.info/sct`，
+   术语服务器无该映射时按「术语判定三态」降级，见「说明与限制」），
+   `Condition.subject` / `.encounter` 用 `urn:uuid:` 引用对应 Patient / Encounter。
+   - 造数 + 自动校验（造 CLINIC 源并校验 FHIR 落地 / 中文 / 引用）：
+     `bash tools/datakit/run.sh gen_test_patient.py --count 2 --family 赵 --given 敏 --diagnosis 糖尿病 --drug 阿司匹林`
+   - 查 FHIR 落地情况：`bash tools/datakit/run.sh check_fhir.py`（或 Pipelines 页「目标数据」下拉）
 
 ## AI 操作边界（2026-09-14：保留限制，简化机制）
 
@@ -641,6 +669,8 @@ LLM_MODEL=deepseek-chat                        # 模型名
     清数据 = `docker volume rm dataflow-iris-dur`。
   - ⚠ **容器重启后** Docker Desktop 的宿主端口转发可能需数十秒才重建，期间宿主 `curl` 会短暂返回 000，稍等再试
     （容器内是立即就绪的）。
+- **英文界面（`/en`）是界面壳**：与中文界面共用同一套组件与 API，文案来自 `zh.js` / `en.js`；由后端 / AI
+  产生的**动态内容**（资产语义、报错、日志、落库数据）保持其源语言，不做翻译。
 - **注意：不要修改 IRIS 的 Web Application / Security 权限**（管理门户与 Ensemble 门户依赖，属外部环境）。
 
 ## 许可

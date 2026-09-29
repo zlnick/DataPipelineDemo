@@ -453,7 +453,7 @@ python3 tools/term_map_build.py --limit 5    # back-fill 5 entries
 
 | Service | URL | Notes |
 | ---- | ---- | ---- |
-| Frontend | http://localhost | Vue3 (zh/en) |
+| Frontend | http://localhost ｜ http://localhost/en | Vue3 + Element Plus, **bilingual** (Chinese at `/` by default, English at `/en`), switchable in the top bar |
 | Backend API | http://localhost:5001 | REST (proxied at /api/*) |
 | IRIS Portal | http://localhost:52773/csp/sys/UtilHome.csp | `superuser` / `SYS` |
 | FHIR endpoint (built-in = default **target**) | http://localhost:52773/csp/healthshare/fhirserver/fhir/r4/ | `/metadata` anonymous; data needs Basic Auth; conversion results land here |
@@ -509,6 +509,7 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
 ├── generate_mock_data.py         # demo data (--fhir/--obs/--sql)
 ├── export_validation_issues.py   # validation experience → Obsidian knowledge
 ├── README.en.md                  # this file
+├── LICENSE / NOTICE              # license + trademark attribution (components not distributed with the repo, e.g. the termsrv submodule)
 ├── backend/
 │   ├── services/                 # repository / interface_analyzer / llm_client / connection_profiler /
 │   │                             # mock_soap / validate_agent / transformation_validator / pipeline_validator /
@@ -590,6 +591,34 @@ LLM_MODEL=deepseek-chat                     # a fast (-flash) model is recommend
 4. **Verify nothing was lost** (optional): `python3 tools/check_component_fidelity.py` audits
    "stored definition ⊆ Production components" three times (baseline / reuse submit / force rebuild).
 
+### E. SQL → FHIR (patient transaction: 4 business tables → 4 FHIR resources, with terminology dual coding)
+
+The flow that best shows "AI decides + terminology converts": the HIS-style **patient master table plus
+encounter / diagnosis / medication** are mapped by AI onto **Patient / Encounter / Condition / MedicationRequest**,
+with Chinese diagnoses converted to SNOMED dual coding by the terminology server.
+
+1. **Add SQL source**: JDBC wizard → `jdbc:IRIS://iris:1972/CLINIC` → pick
+   **`Patient`/`Encounter`/`Diagnosis`/`MedicationOrder`** (all four) → analyze columns (polling Query generated).
+2. **Click "generate demo data"** (equivalent: `bash tools/datakit/run.sh seed_clinic.py`): seeds
+   **3 patients + their encounters / diagnoses / medications** (Chinese diagnoses and drug names come from the
+   terminology server's Chinese sets, so they are usable as-is).
+3. **Add FHIR target**: Targets → FHIR, endpoint defaults to `…/csp/healthshare/fhirserver/fhir/r4/`
+   (`FHIRSERVER` = default **target** repository) → register → refresh candidate resources.
+4. **AI Matching**: confirm each asset (typical result: `Patient`→Patient, `Encounter`→Encounter,
+   `Diagnosis`→Condition, `MedicationOrder`→MedicationRequest; the AI judges the diagnosis column as
+   `term_map:cn2snomed`) → save the mappings.
+5. **Generate the pipeline**: submit all four groups together → generation applies **license scheduling**
+   (groups beyond the 8 business-host units are still generated but start **disabled**; flip them on the
+   "Data Pipelines" card).
+6. **See the effect**: `FHIRQueue` fills up and the FHIR repository counts **Patient 3 / Encounter 4 /
+   Condition 7 / MedicationRequest 7** (measured); `Condition.code` carries **dual codings** (source
+   `urn:cn-nhsa:icd10-gbt2016` + SNOMED `http://snomed.info/sct`; if the terminology server has no mapping,
+   the three-state semantics in "Notes & Limitations" apply), and `Condition.subject` / `.encounter` reference
+   the matching Patient / Encounter via `urn:uuid:`.
+   - Seed + auto-verify (creates CLINIC data and checks FHIR landing / Chinese text / references):
+     `bash tools/datakit/run.sh gen_test_patient.py --count 2 --family 赵 --given 敏 --diagnosis 糖尿病 --drug 阿司匹林`
+   - Inspect FHIR landing: `bash tools/datakit/run.sh check_fhir.py` (or the Pipelines target-data dropdown)
+
 ## AI Guardrails (limits kept, machinery simplified — 2026-09-14)
 
 This repository was hit by an incident where an AI assistant deleted containers **belonging to other
@@ -648,7 +677,8 @@ See [`tools/guard/README.md`](tools/guard/README.md) for the full design, verifi
   `runtime.note.fields.provenance` and in the UI "Runtime Contract" column; once real data exists, the next
   analyze switches back to the real data shape. Seeding stays optional:
   `bash tools/datakit/run.sh seed_fhir_demo.py`.
-- The English UI is an interface shell shared with the Chinese UI (`zh.js` / `en.js`); dynamic content produced by
+- The English UI (visit `/en`, or use the top-bar language switch — the language follows the route prefix) is an
+  interface shell shared with the Chinese UI (`zh.js` / `en.js`); dynamic content produced by
   the backend / AI (asset semantics, error messages, logs, landed data) stays in its source language.
 - **Do not modify IRIS Web Applications / Security permissions** (management & Ensemble portals depend on them).
 - **Terminology judgement has three outcomes** (queried live from the terminology server through the shared BO
