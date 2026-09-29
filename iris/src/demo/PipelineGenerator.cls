@@ -84,6 +84,10 @@ ClassMethod GenerateProduction() As %Status
     Set tStream = ##class(%Stream.FileCharacter).%New()
     Set tSC = tStream.LinkToFile(tFile)
     If $$$ISERR(tSC) Quit tSC
+    // 关键：.cls 必须写成 UTF-8。%Stream.FileCharacter 缺省按进程默认 I/O 转换表写
+    // （本容器实测为 GBK）→ 中文注释写成 GBK 字节，而 UDL 加载器按 UTF-8 解析，
+    // 会报 «#5559 ... 可能是由于{}或()字符不匹配» 并 #5030 编译失败（2026-09-29 实测定位）。
+    Set tStream.TranslateTable = "UTF8"
     Do tStream.Write(tBody)
     Set tSC = tStream.%Save()
     If $$$ISERR(tSC) Quit tSC

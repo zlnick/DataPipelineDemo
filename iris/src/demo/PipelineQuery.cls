@@ -356,6 +356,9 @@ ClassMethod AddGeneratedBpSource(pClassName As %String, pSource As %String) As %
             Set tMsg = "无法打开写入文件: " _ $system.Status.GetErrorText(tSC)
             Quit
         }
+        // 关键：必须写 UTF-8 —— 缺省转换表（本容器实测 GBK）会把中文写成 GBK 字节，
+        // UDL 加载器按 UTF-8 解析 → «#5559 {}或()字符不匹配» + #5030（2026-09-29 实测定位）
+        Set tFs.TranslateTable = "UTF8"
         Do tFs.Write(pSource)
         Set tSC = tFs.%Save()
         Do tFs.%Close()
@@ -393,6 +396,8 @@ ClassMethod GetGeneratedBpSource(pClassName As %String = "demo.SqlFhirPatientTxP
     Set tStream = ##class(%Stream.FileCharacter).%New()
     Set tSC = tStream.LinkToFile(tPath)
     If $$$ISERR(tSC) Quit ""
+    // 读回同样按 UTF-8（与写入端一致，否则中文会被按缺省转换表再解一次）
+    Set tStream.TranslateTable = "UTF8"
     Set tText = tStream.Read()
     Do tStream.%Close()
     Quit tText
