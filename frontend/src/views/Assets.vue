@@ -69,6 +69,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { datasourceApi } from '../api/dataflow'
+import { localePath } from '../i18n/path'
 
 const route = useRoute()
 const router = useRouter()
@@ -111,12 +112,12 @@ async function loadAssets() {
 }
 
 function selectForAI(row) {
-  router.push({ path: '/recommend', query: { asset: row.name } })
+  router.push({ path: localePath('/recommend'), query: { asset: row.name } })
   ElMessage.success(t('assets.selected', { name: row.name }))
 }
 
 function goRecommend() {
-  router.push('/recommend')
+  router.push(localePath('/recommend'))
 }
 
 watch(sourceId, loadAssets)

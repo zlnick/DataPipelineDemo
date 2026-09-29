@@ -139,6 +139,7 @@ import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { mappingApi } from '../api/dataflow'
+import { localePath } from '../i18n/path'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -181,7 +182,7 @@ async function loadTermCatalog() {
 }
 
 function goPipeline() {
-  router.push('/pipelines')
+  router.push(localePath('/pipelines'))
 }
 
 onMounted(() => {

@@ -140,6 +140,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { aiApi, datasourceApi, mappingApi, modelApi, targetApi } from '../api/dataflow'
+import { localePath } from '../i18n/path'
 
 const route = useRoute()
 const router = useRouter()
@@ -391,7 +392,7 @@ async function confirmAll() {
     ElMessage.warning(t('recommend.sourceAmbiguousTitle', { names: Object.keys(amb).join(t('common.listSep')) }))
   }
   ElMessage.success(t('recommend.saved'))
-  router.push('/mappings')
+  router.push(localePath('/mappings'))
 }
 
 onMounted(async () => {

@@ -193,6 +193,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { DATA_SOURCE_TYPES } from '../api/constants'
 import { datasourceApi } from '../api/dataflow'
+import { localePath } from '../i18n/path'
 
 const router = useRouter()
 const { t, locale } = useI18n()
@@ -349,7 +350,7 @@ async function handleAnalyze(row) {
 }
 
 function goAssets(id) {
-  router.push({ path: '/assets', query: { source_id: id } })
+  router.push({ path: localePath('/assets'), query: { source_id: id } })
 }
 
 // ---- SQL 源选表向导（连通 → schema → 表 → 分析列） ----
