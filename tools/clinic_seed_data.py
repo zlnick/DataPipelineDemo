@@ -7,15 +7,25 @@
 
 用法: python3 tools/clinic_seed_data.py
 """
+import os
 import random
 from datetime import date, timedelta
 
 import iris.dbapi
 
-TERM = dict(hostname="127.0.0.1", port=51774, namespace="TERMINOLOGY",
-            username="superuser", password="SYS")
-CLINIC = dict(hostname="127.0.0.1", port=1972, namespace="CLINIC",
-              username="superuser", password="SYS")
+# 连接目标：datakit 默认在 backend 容器内执行 → 用服务名；在宿主执行 → 回落 127.0.0.1 + 发布端口
+# （此前写死 127.0.0.1，容器内会连自己 → <COMMUNICATION LINK ERROR>）
+_IN_CONTAINER = os.path.exists("/.dockerenv")
+TERM = dict(
+    hostname=os.environ.get("TERM_IRIS_HOST", "iris-terminology" if _IN_CONTAINER else "127.0.0.1"),
+    port=int(os.environ.get("TERM_IRIS_PORT", 1972 if _IN_CONTAINER else 51774)),
+    namespace=os.environ.get("TERM_IRIS_NAMESPACE", "TERMINOLOGY"),
+    username="superuser", password="SYS")
+CLINIC = dict(
+    hostname=os.environ.get("CLINIC_IRIS_HOST", "iris" if _IN_CONTAINER else "127.0.0.1"),
+    port=int(os.environ.get("CLINIC_IRIS_PORT", 1972)),
+    namespace="CLINIC",
+    username="superuser", password="SYS")
 ICD_URI = "urn:cn-nhsa:icd10-gbt2016"
 DRUG_URI = {"nrdl": "urn:cn-nhsa:drug-nrdl", "cbih": "urn:cn-nhsa:drug-cbih"}
 
